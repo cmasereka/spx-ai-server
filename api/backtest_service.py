@@ -313,16 +313,46 @@ class BacktestService:
     def _convert_single_trade(self, result: EnhancedBacktestResult,
                               backtest_id: str) -> BacktestResult:
         """Convert engine result to API format"""
-        
+        from enhanced_backtest import StrategyType as ST
+        from delta_strike_selector import IronCondorStrikeSelection
+
+        ss = result.strike_selection
+        is_ic = (result.strategy_type == ST.IRON_CONDOR)
+
+        if is_ic and isinstance(ss, IronCondorStrikeSelection):
+            strikes = {
+                "put_long": ss.put_long_strike,
+                "put_short": ss.put_short_strike,
+                "call_short": ss.call_short_strike,
+                "call_long": ss.call_long_strike,
+            }
+        elif is_ic:
+            # IC but stored as single StrikeSelection (legacy / fallback path)
+            strikes = {
+                "put_long": getattr(ss, 'long_strike', 0) if ss else 0,
+                "put_short": getattr(ss, 'short_strike', 0) if ss else 0,
+                "call_short": getattr(ss, 'short_strike', 0) if ss else 0,
+                "call_long": getattr(ss, 'long_strike', 0) if ss else 0,
+            }
+        elif result.strategy_type == ST.PUT_SPREAD:
+            strikes = {
+                "put_long": getattr(ss, 'long_strike', 0) if ss else 0,
+                "put_short": getattr(ss, 'short_strike', 0) if ss else 0,
+                "call_short": 0,
+                "call_long": 0,
+            }
+        else:  # CALL_SPREAD
+            strikes = {
+                "put_long": 0,
+                "put_short": 0,
+                "call_short": getattr(ss, 'short_strike', 0) if ss else 0,
+                "call_long": getattr(ss, 'long_strike', 0) if ss else 0,
+            }
+
         # Create strategy details
         strategy_details = StrategyDetails(
             strategy_type=result.strategy_type.value if result.strategy_type else "unknown",
-            strikes={
-                "put_long": getattr(result.strike_selection, 'long_strike', 0) if result.strike_selection else 0,
-                "put_short": getattr(result.strike_selection, 'short_strike', 0) if result.strike_selection else 0,
-                "call_short": getattr(result.strike_selection, 'short_strike', 0) if result.strike_selection else 0,
-                "call_long": getattr(result.strike_selection, 'long_strike', 0) if result.strike_selection else 0,
-            },
+            strikes=strikes,
             entry_credit=result.entry_credit or 0,
             max_profit=result.max_profit or 0,
             max_loss=result.max_loss or 0,

@@ -393,31 +393,83 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
         return self._create_failed_result(date, entry_time, FINAL_EXIT_TIME, "No setup found intraday")
 
     def _build_iron_condor_strategy(self, date: str, timestamp: str, strike_selection, quantity: int):
-        """Build Iron Condor using independently delta-selected put and call strikes."""
+        """Build Iron Condor directly from credit-selected put and call strikes."""
+        from src.strategies.options_strategies import IronCondor
+        from datetime import datetime as _dt
+
         spx_price = self.enhanced_query_engine.get_fastest_spx_price(date, timestamp)
         if not spx_price:
             return None
 
         if isinstance(strike_selection, IronCondorStrikeSelection):
-            put_distance = abs(strike_selection.put_short_strike - spx_price)
-            call_distance = abs(strike_selection.call_short_strike - spx_price)
-            # Use the larger of the two spread widths for the builder call
-            spread_width = int(max(strike_selection.put_spread_width, strike_selection.call_spread_width))
+            put_short  = strike_selection.put_short_strike
+            put_long   = strike_selection.put_long_strike
+            call_short = strike_selection.call_short_strike
+            call_long  = strike_selection.call_long_strike
         else:
             # Fallback: symmetric IC from a single-side StrikeSelection
-            put_distance = abs(strike_selection.short_strike - spx_price)
-            call_distance = put_distance
-            spread_width = int(strike_selection.spread_width)
+            put_short  = strike_selection.short_strike
+            put_long   = strike_selection.long_strike
+            call_short = strike_selection.short_strike
+            call_long  = strike_selection.long_strike
 
-        return self.strategy_builder.build_iron_condor_optimized(
-            date=date,
-            timestamp=timestamp,
-            put_distance=put_distance,
-            call_distance=call_distance,
-            spread_width=spread_width,
-            quantity=quantity,
-            use_liquid_options=True
-        )
+        # Fetch options data and build a dict keyed "{strike}_{type}" for the 4 legs
+        options_df = self.enhanced_query_engine.get_options_data(date, timestamp)
+        if options_df is None or len(options_df) == 0:
+            return None
+
+        options_dict = {}
+        for _, row in options_df.iterrows():
+            key = f"{float(row['strike'])}_{row['option_type']}"
+            options_dict[key] = {
+                'mid_price': (float(row['bid']) + float(row['ask'])) / 2.0,
+                'bid': float(row['bid']),
+                'ask': float(row['ask']),
+                'delta': float(row.get('delta', 0)),
+                'gamma': float(row.get('gamma', 0)),
+                'theta': float(row.get('theta', 0)),
+                'vega': float(row.get('vega', 0)),
+                'iv': float(row.get('implied_volatility', 0)),
+            }
+
+        # Verify all 4 strikes are present in the options data
+        required_keys = [
+            f"{put_long}_put", f"{put_short}_put",
+            f"{call_short}_call", f"{call_long}_call",
+        ]
+        missing = [k for k in required_keys if k not in options_dict]
+        if missing:
+            logger.debug(f"IC build: missing options data for {missing}")
+            # Fall back to distance-based builder
+            put_distance  = abs(put_short - spx_price)
+            call_distance = abs(call_short - spx_price)
+            spread_width  = int(max(put_short - put_long, call_long - call_short))
+            return self.strategy_builder.build_iron_condor_optimized(
+                date=date, timestamp=timestamp,
+                put_distance=put_distance, call_distance=call_distance,
+                spread_width=spread_width, quantity=quantity, use_liquid_options=True
+            )
+
+        entry_dt = _dt.strptime(f"{date} {timestamp}", "%Y-%m-%d %H:%M:%S")
+        expiry_dt = _dt.strptime(date, "%Y-%m-%d")
+        try:
+            ic = IronCondor(
+                entry_date=entry_dt,
+                underlying_price=spx_price,
+                put_short_strike=put_short,
+                put_long_strike=put_long,
+                call_short_strike=call_short,
+                call_long_strike=call_long,
+                quantity=quantity,
+                expiration=expiry_dt,
+                options_data=options_dict,
+            )
+            ic.entry_spx_price = spx_price
+            ic.entry_timestamp = timestamp
+            return ic
+        except Exception as e:
+            logger.error(f"Failed to build IC directly: {e}")
+            return None
     
     def _build_put_spread_strategy(self, date: str, timestamp: str, strike_selection: StrikeSelection, quantity: int):
         """Build Put Spread strategy"""
@@ -431,62 +483,50 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
         return self._build_single_spread(date, timestamp, strike_selection, quantity, 'call')
     
     def _build_single_spread(self, date: str, timestamp: str, strike_selection: StrikeSelection, quantity: int, option_type: str):
-        """Build single spread (put or call)"""
+        """Build single spread (put or call) directly from the credit-selected strikes."""
+        from src.strategies.options_strategies import VerticalSpread, OptionType as OT
+        from datetime import datetime as _dt
+
+        spx_price = self.enhanced_query_engine.get_fastest_spx_price(date, timestamp)
+        if not spx_price:
+            return None
+
+        ot = OT.PUT if option_type == 'put' else OT.CALL
+        short_strike = strike_selection.short_strike
+        long_strike  = strike_selection.long_strike
+
+        options_df = self.enhanced_query_engine.get_options_data(date, timestamp)
+        if options_df is None or len(options_df) == 0:
+            return None
+
+        options_dict = {}
+        for _, row in options_df.iterrows():
+            key = f"{float(row['strike'])}_{row['option_type']}"
+            options_dict[key] = {
+                'mid_price': (float(row['bid']) + float(row['ask'])) / 2.0,
+                'bid': float(row['bid']),
+                'ask': float(row['ask']),
+                'delta': float(row.get('delta', 0)),
+                'gamma': float(row.get('gamma', 0)),
+                'theta': float(row.get('theta', 0)),
+                'vega': float(row.get('vega', 0)),
+                'iv': float(row.get('implied_volatility', 0)),
+            }
+
+        entry_dt  = _dt.strptime(f"{date} {timestamp}", "%Y-%m-%d %H:%M:%S")
+        expiry_dt = _dt.strptime(date, "%Y-%m-%d")
         try:
-            # Get options data
-            options_data = self.enhanced_query_engine.get_options_data(date, timestamp)
-            if options_data is None:
-                return None
-            
-            # Filter for the specific option type and strikes
-            options = options_data[
-                (options_data['option_type'] == option_type) &
-                (options_data['expiration'] == date) &
-                (options_data['strike'].isin([strike_selection.short_strike, strike_selection.long_strike]))
-            ]
-            
-            if len(options) < 2:
-                return None
-            
-            # Create a simple strategy object using the existing IronCondor/VerticalSpread classes
-            from src.strategies.options_strategies import VerticalSpread
-            from datetime import datetime
-            
-            short_option = options[options['strike'] == strike_selection.short_strike].iloc[0]
-            long_option = options[options['strike'] == strike_selection.long_strike].iloc[0]
-            
-            # Convert options data to dictionary format expected by strategy classes
-            options_dict = {}
-            for _, row in options.iterrows():
-                key = f"{row['strike']}_{row['option_type']}"
-                options_dict[key] = {
-                    'mid_price': (row['bid'] + row['ask']) / 2,
-                    'bid': row['bid'],
-                    'ask': row['ask'],
-                    'delta': row['delta'],
-                    'gamma': row.get('gamma', 0),
-                    'theta': row.get('theta', 0),
-                    'vega': row.get('vega', 0),
-                    'iv': row.get('implied_volatility', 0)
-                }
-            
-            # Create vertical spread
-            entry_datetime = datetime.strptime(f"{date} {timestamp}", "%Y-%m-%d %H:%M:%S")
-            spx_price = self.enhanced_query_engine.get_fastest_spx_price(date, timestamp)
-            
             strategy = VerticalSpread(
-                entry_date=entry_datetime,
+                entry_date=entry_dt,
                 underlying_price=spx_price,
-                short_strike=strike_selection.short_strike,
-                long_strike=strike_selection.long_strike,
-                option_type=option_type,
+                short_strike=short_strike,
+                long_strike=long_strike,
+                option_type=ot,
                 quantity=quantity,
-                expiration=entry_datetime,  # 0DTE
-                options_data=options_dict
+                expiration=expiry_dt,
+                options_data=options_dict,
             )
-            
             return strategy
-            
         except Exception as e:
             logger.error(f"Failed to build {option_type} spread: {e}")
             return None
