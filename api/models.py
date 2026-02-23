@@ -142,7 +142,32 @@ class SystemStatus(BaseModel):
     active_backtests: int = Field(..., description="Number of active backtests")
 
 
-class WebSocketMessage(BaseModel):
+class TradeCheckpoint(BaseModel):
+    """Single monitoring snapshot recorded at each position check."""
+    time: str = Field(..., description="Bar time HH:MM:SS")
+    spx: float = Field(..., description="SPX price at this bar")
+    cost_per_share: float = Field(..., description="Current cost to close the full position per share")
+    pnl_per_share: float = Field(..., description="Unrealised P&L per share (entry_credit - cost_per_share)")
+    # IC-only fields — absent for single spreads
+    put_cost_per_share: Optional[float] = Field(None, description="Cost to close put side per share (IC only)")
+    call_cost_per_share: Optional[float] = Field(None, description="Cost to close call side per share (IC only)")
+
+
+class TradeCheckpointsResponse(BaseModel):
+    """Checkpoint series for one trade, ready for charting."""
+    trade_id: str
+    trade_date: str
+    strategy_type: str
+    entry_time: str
+    exit_time: Optional[str]
+    entry_credit_per_share: float = Field(..., description="Credit collected at entry per share")
+    take_profit: float = Field(..., description="Take-profit threshold used ($/share)")
+    stop_loss: float = Field(..., description="Stop-loss threshold used ($/share)")
+    checkpoints: List[TradeCheckpoint]
+    checkpoint_count: int
+
+
+
     """WebSocket message format"""
     type: str = Field(..., description="Message type")
     backtest_id: Optional[str] = Field(None, description="Related backtest ID")

@@ -87,13 +87,18 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
         )
 
         # Open position slots
-        open_put_spread  = None   # strategy object or None
+        open_put_spread  = None
         open_call_spread = None
-        open_ic          = None   # strategy object or None
-        ic_leg_status    = None   # IronCondorLegStatus or None
-        ic_entry_meta    = {}     # metadata for building the final IC result
+        open_ic          = None
+        ic_leg_status    = None
+        ic_entry_meta    = {}
         put_spread_meta  = {}
         call_spread_meta = {}
+
+        # Checkpoint lists — built up while a position is open, flushed on close
+        ic_checkpoints        : list = []
+        put_spread_checkpoints: list = []
+        call_spread_checkpoints: list = []
 
         for bar_index, current_time in enumerate(scan_times):
             is_past_entry_cutoff = current_time >= LAST_ENTRY_TIME
@@ -108,13 +113,35 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                 ic_leg_status = monitor.check_ic_leg_decay(
                     open_ic, date, current_time, ic_leg_status
                 )
+
+                # Snapshot this bar (prices already updated by check_ic_leg_decay)
+                ic_entry_credit = getattr(open_ic, 'entry_credit', 0)
+                put_cost_ps, call_cost_ps = 0.0, 0.0
+                try:
+                    _, _, raw_put, raw_call = monitor._check_ic_leg_decay_values(open_ic)
+                    put_cost_ps  = round(raw_put  / 100, 4)
+                    call_cost_ps = round(raw_call / 100, 4)
+                except Exception:
+                    pass
+                total_cost_ps  = round((put_cost_ps + call_cost_ps), 4)
+                entry_credit_ps = round(ic_entry_credit / 100, 4)
+                spx_now = self.enhanced_query_engine.get_fastest_spx_price(date, current_time) or 0
+                ic_checkpoints.append({
+                    "time": current_time,
+                    "spx": round(spx_now, 2),
+                    "cost_per_share": total_cost_ps,
+                    "pnl_per_share": round(entry_credit_ps - total_cost_ps, 4),
+                    "put_cost_per_share": put_cost_ps,
+                    "call_cost_per_share": call_cost_ps,
+                })
+
                 # If both sides closed → finalize IC trade
                 if ic_leg_status.put_side_closed and ic_leg_status.call_side_closed:
                     total_exit_cost = ic_leg_status.put_side_exit_cost + ic_leg_status.call_side_exit_cost
-                    entry_credit = getattr(open_ic, 'entry_credit', 0)
+                    entry_credit = ic_entry_credit
                     pnl = entry_credit - total_exit_cost
                     pnl_pct = (pnl / entry_credit * 100) if entry_credit > 0 else 0
-                    exit_spx = self.enhanced_query_engine.get_fastest_spx_price(date, current_time) or ic_entry_meta.get('entry_spx', 0)
+                    exit_spx = spx_now or ic_entry_meta.get('entry_spx', 0)
                     later_side_time = max(
                         ic_leg_status.put_side_exit_time or "00:00:00",
                         ic_leg_status.call_side_exit_time or "00:00:00"
@@ -136,7 +163,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                         pnl_pct=pnl_pct,
                         max_profit=getattr(open_ic, 'max_profit', entry_credit),
                         max_loss=getattr(open_ic, 'max_loss', -total_exit_cost),
-                        monitoring_points=[],
+                        monitoring_points=ic_checkpoints,
                         success=True,
                         confidence=ic_entry_meta.get('confidence', 0),
                         notes=ic_entry_meta.get('notes', ''),
@@ -145,18 +172,32 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     open_ic = None
                     ic_leg_status = None
                     ic_entry_meta = {}
+                    ic_checkpoints = []
 
             # --- 2. Monitor put spread ---
             if open_put_spread is not None and is_check_bar:
                 should_exit, current_cost, reason = monitor.check_decay_at_time(
                     open_put_spread, StrategyType.PUT_SPREAD, date, current_time
                 )
+
+                # Snapshot this bar
+                ps_entry_credit = getattr(open_put_spread, 'entry_credit', 0)
+                entry_credit_ps = round(ps_entry_credit / 100, 4)
+                cost_ps = round(current_cost / 100, 4)
+                spx_now = self.enhanced_query_engine.get_fastest_spx_price(date, current_time) or 0
+                put_spread_checkpoints.append({
+                    "time": current_time,
+                    "spx": round(spx_now, 2),
+                    "cost_per_share": cost_ps,
+                    "pnl_per_share": round(entry_credit_ps - cost_ps, 4),
+                })
+
                 if should_exit or is_past_final_exit:
                     exit_reason = reason if should_exit else "Force close at expiration"
-                    entry_credit = getattr(open_put_spread, 'entry_credit', 0)
+                    entry_credit = ps_entry_credit
                     pnl = entry_credit - current_cost
                     pnl_pct = (pnl / entry_credit * 100) if entry_credit > 0 else 0
-                    exit_spx = self.enhanced_query_engine.get_fastest_spx_price(date, current_time) or put_spread_meta.get('entry_spx', 0)
+                    exit_spx = spx_now or put_spread_meta.get('entry_spx', 0)
                     trades.append(EnhancedBacktestResult(
                         date=date,
                         strategy_type=StrategyType.PUT_SPREAD,
@@ -174,25 +215,39 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                         pnl_pct=pnl_pct,
                         max_profit=getattr(open_put_spread, 'max_profit', entry_credit),
                         max_loss=getattr(open_put_spread, 'max_loss', -current_cost),
-                        monitoring_points=[],
+                        monitoring_points=put_spread_checkpoints,
                         success=True,
                         confidence=put_spread_meta.get('confidence', 0),
                         notes=put_spread_meta.get('notes', '')
                     ))
                     open_put_spread = None
                     put_spread_meta = {}
+                    put_spread_checkpoints = []
 
             # --- 3. Monitor call spread ---
             if open_call_spread is not None and is_check_bar:
                 should_exit, current_cost, reason = monitor.check_decay_at_time(
                     open_call_spread, StrategyType.CALL_SPREAD, date, current_time
                 )
+
+                # Snapshot this bar
+                cs_entry_credit = getattr(open_call_spread, 'entry_credit', 0)
+                entry_credit_ps = round(cs_entry_credit / 100, 4)
+                cost_ps = round(current_cost / 100, 4)
+                spx_now = self.enhanced_query_engine.get_fastest_spx_price(date, current_time) or 0
+                call_spread_checkpoints.append({
+                    "time": current_time,
+                    "spx": round(spx_now, 2),
+                    "cost_per_share": cost_ps,
+                    "pnl_per_share": round(entry_credit_ps - cost_ps, 4),
+                })
+
                 if should_exit or is_past_final_exit:
                     exit_reason = reason if should_exit else "Force close at expiration"
-                    entry_credit = getattr(open_call_spread, 'entry_credit', 0)
+                    entry_credit = cs_entry_credit
                     pnl = entry_credit - current_cost
                     pnl_pct = (pnl / entry_credit * 100) if entry_credit > 0 else 0
-                    exit_spx = self.enhanced_query_engine.get_fastest_spx_price(date, current_time) or call_spread_meta.get('entry_spx', 0)
+                    exit_spx = spx_now or call_spread_meta.get('entry_spx', 0)
                     trades.append(EnhancedBacktestResult(
                         date=date,
                         strategy_type=StrategyType.CALL_SPREAD,
@@ -210,13 +265,14 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                         pnl_pct=pnl_pct,
                         max_profit=getattr(open_call_spread, 'max_profit', entry_credit),
                         max_loss=getattr(open_call_spread, 'max_loss', -current_cost),
-                        monitoring_points=[],
+                        monitoring_points=call_spread_checkpoints,
                         success=True,
                         confidence=call_spread_meta.get('confidence', 0),
                         notes=call_spread_meta.get('notes', '')
                     ))
                     open_call_spread = None
                     call_spread_meta = {}
+                    call_spread_checkpoints = []
 
             # --- 4. Scan for new entry (only before 3 PM and before final exit) ---
             if not is_past_entry_cutoff and not is_past_final_exit:
@@ -292,10 +348,10 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     continue
 
         # --- 5. Force-close remaining positions at FINAL_EXIT_TIME ---
-        for (open_pos, meta, stype) in [
-            (open_ic,          ic_entry_meta,    StrategyType.IRON_CONDOR),
-            (open_put_spread,  put_spread_meta,  StrategyType.PUT_SPREAD),
-            (open_call_spread, call_spread_meta, StrategyType.CALL_SPREAD),
+        for (open_pos, meta, stype, checkpoints) in [
+            (open_ic,          ic_entry_meta,    StrategyType.IRON_CONDOR, ic_checkpoints),
+            (open_put_spread,  put_spread_meta,  StrategyType.PUT_SPREAD,  put_spread_checkpoints),
+            (open_call_spread, call_spread_meta, StrategyType.CALL_SPREAD, call_spread_checkpoints),
         ]:
             if open_pos is not None:
                 try:
@@ -308,9 +364,26 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                 pnl_pct = (pnl / entry_credit * 100) if entry_credit > 0 else 0
                 exit_spx = self.enhanced_query_engine.get_fastest_spx_price(date, FINAL_EXIT_TIME) or meta.get('entry_spx', 0)
 
+                # Add final force-close checkpoint
+                entry_credit_ps = round(entry_credit / 100, 4)
+                cost_ps = round(exit_cost / 100, 4)
+                force_checkpoint: dict = {
+                    "time": FINAL_EXIT_TIME,
+                    "spx": round(exit_spx, 2),
+                    "cost_per_share": cost_ps,
+                    "pnl_per_share": round(entry_credit_ps - cost_ps, 4),
+                }
+                if stype == StrategyType.IRON_CONDOR:
+                    try:
+                        _, _, raw_put, raw_call = monitor._check_ic_leg_decay_values(open_pos)
+                        force_checkpoint["put_cost_per_share"]  = round(raw_put  / 100, 4)
+                        force_checkpoint["call_cost_per_share"] = round(raw_call / 100, 4)
+                    except Exception:
+                        pass
+                checkpoints.append(force_checkpoint)
+
                 result_ic_leg_status = None
                 if stype == StrategyType.IRON_CONDOR and ic_leg_status is not None:
-                    # Mark any open IC side as force-closed
                     if not ic_leg_status.put_side_closed:
                         ic_leg_status.put_side_closed = True
                         ic_leg_status.put_side_exit_time = FINAL_EXIT_TIME
@@ -338,7 +411,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     pnl_pct=pnl_pct,
                     max_profit=getattr(open_pos, 'max_profit', entry_credit),
                     max_loss=getattr(open_pos, 'max_loss', -exit_cost),
-                    monitoring_points=[],
+                    monitoring_points=checkpoints,
                     success=True,
                     confidence=meta.get('confidence', 0),
                     notes=meta.get('notes', ''),

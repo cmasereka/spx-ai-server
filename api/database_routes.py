@@ -9,7 +9,7 @@ from sqlalchemy import desc, func
 
 from src.database.connection import db_manager
 from src.database.models import BacktestRun, Trade
-from .models import BacktestStatus, BacktestResult
+from .models import BacktestStatus, BacktestResult, TradeCheckpoint, TradeCheckpointsResponse
 
 router = APIRouter(prefix="/api/v1/database", tags=["database"])
 
@@ -153,7 +153,63 @@ async def get_backtest_trades(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-@router.get("/stats/summary")
+@router.get("/backtests/{backtest_id}/trades/{trade_id}/checkpoints",
+            response_model=TradeCheckpointsResponse)
+async def get_trade_checkpoints(backtest_id: str, trade_id: str):
+    """
+    Return the per-bar P&L and cost-to-close snapshots for a single trade.
+    Use these to plot drawdown curves and model alternative stop-loss levels.
+    """
+    try:
+        with db_manager.get_session() as session:
+            backtest = session.query(BacktestRun).filter_by(backtest_id=backtest_id).first()
+            if not backtest:
+                raise HTTPException(status_code=404, detail="Backtest not found")
+
+            trade = (
+                session.query(Trade)
+                .filter_by(trade_id=trade_id, backtest_run_id=backtest.id)
+                .first()
+            )
+            if not trade:
+                raise HTTPException(status_code=404, detail="Trade not found")
+
+            raw_checkpoints: list = trade.monitoring_data or []
+            checkpoints = [
+                TradeCheckpoint(
+                    time=cp.get("time", ""),
+                    spx=cp.get("spx", 0.0),
+                    cost_per_share=cp.get("cost_per_share", 0.0),
+                    pnl_per_share=cp.get("pnl_per_share", 0.0),
+                    put_cost_per_share=cp.get("put_cost_per_share"),
+                    call_cost_per_share=cp.get("call_cost_per_share"),
+                )
+                for cp in raw_checkpoints
+            ]
+
+            params: dict = backtest.parameters or {}
+            entry_credit_ps = round(trade.entry_credit / 100, 4) if trade.entry_credit else 0.0
+
+            return TradeCheckpointsResponse(
+                trade_id=trade.trade_id,
+                trade_date=str(trade.trade_date),
+                strategy_type=trade.strategy_type,
+                entry_time=trade.entry_time,
+                exit_time=trade.exit_time,
+                entry_credit_per_share=entry_credit_ps,
+                take_profit=params.get("take_profit", 0.10),
+                stop_loss=params.get("stop_loss", 2.0),
+                checkpoints=checkpoints,
+                checkpoint_count=len(checkpoints),
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+
 async def get_stats_summary():
     """Get summary statistics across all backtests"""
     try:
