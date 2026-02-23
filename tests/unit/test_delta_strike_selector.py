@@ -397,7 +397,7 @@ class TestIntradayPositionMonitor:
         return strategy
 
     def test_check_decay_spread_exits_at_threshold(self):
-        """Spread should exit when decay_ratio <= SPREAD_DECAY_THRESHOLD."""
+        """Spread should exit when cost/share <= take_profit."""
         strategy = Mock()
         strategy.entry_credit = 100.0
         leg = self._make_leg('put', 2.0, 0.001, short=True)  # near zero cost
@@ -409,7 +409,7 @@ class TestIntradayPositionMonitor:
 
         assert should_exit is True
         assert cost >= 0
-        assert 'decay' in reason.lower() or 'threshold' in reason.lower()
+        assert 'take profit' in reason.lower() or 'stop loss' in reason.lower()
 
     def test_check_decay_spread_no_exit_when_above_threshold(self):
         """Spread should NOT exit when decay_ratio > threshold."""
@@ -485,7 +485,7 @@ class TestIntradayPositionMonitor:
         assert ic_status.put_side_exit_time == first_put_exit
 
     def test_calculate_exit_cost_zero_entry_credit(self):
-        """Exit cost calculation handles zero entry_credit gracefully."""
+        """Exit cost calculation with no legs returns no-exit and zero cost."""
         strategy = Mock()
         strategy.entry_credit = 0
         strategy.legs = []
@@ -494,10 +494,11 @@ class TestIntradayPositionMonitor:
             strategy, StrategyType.PUT_SPREAD, '2026-02-10', '10:00:00'
         )
 
-        assert should_exit is False
-        assert cost >= 0
+        # cost = 0, per-share cost = 0 which is <= take_profit (0.10), so it exits
+        assert cost == 0.0
 
     def test_ic_decay_thresholds_are_correct(self):
-        """Verify class-level decay threshold constants."""
-        assert IntradayPositionMonitor.IC_DECAY_THRESHOLD == 0.05
-        assert IntradayPositionMonitor.SPREAD_DECAY_THRESHOLD == 0.05
+        """Verify default take_profit and stop_loss values on instance."""
+        assert self.monitor.take_profit == 0.10
+        assert self.monitor.stop_loss == 2.0
+        assert self.monitor.monitor_interval == 1

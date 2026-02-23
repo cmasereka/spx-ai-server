@@ -495,49 +495,61 @@ class PositionMonitor:
 class IntradayPositionMonitor:
     """
     Manages multiple concurrent positions intraday.
-    - IC: closes each side independently at 0.05 decay
-    - Spreads: closes at 0.05 decay
-    - Monitors at 1-minute intervals
+    - IC: closes each side independently when take_profit or stop_loss is hit
+    - Spreads: same per-share absolute thresholds
+    - Monitors at monitor_interval-minute intervals
     """
 
-    IC_DECAY_THRESHOLD = 0.05
-    SPREAD_DECAY_THRESHOLD = 0.05
-
-    def __init__(self, query_engine, strategy_builder):
+    def __init__(self, query_engine, strategy_builder,
+                 take_profit: float = 0.10,
+                 stop_loss: float = 2.0,
+                 monitor_interval: int = 1):
         self.query_engine = query_engine
         self.strategy_builder = strategy_builder
+        self.take_profit = take_profit      # close when cost/share <= this
+        self.stop_loss = stop_loss          # close when cost/share >= this
+        self.monitor_interval = monitor_interval
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _should_exit(self, current_cost: float) -> Tuple[bool, str]:
+        """
+        Given the current cost-to-close for a spread (per contract = ×100),
+        return (should_exit, reason) based on per-share absolute thresholds.
+        """
+        cost_per_share = current_cost / 100.0
+
+        if cost_per_share <= self.take_profit:
+            return True, f"Take profit hit (${cost_per_share:.3f}/share <= ${self.take_profit:.2f})"
+        if cost_per_share >= self.stop_loss:
+            return True, f"Stop loss hit (${cost_per_share:.3f}/share >= ${self.stop_loss:.2f})"
+        return False, ""
+
+    def _should_exit_ic_side(self, side_cost: float) -> Tuple[bool, str]:
+        """Same check for a single IC side (put or call spread)."""
+        return self._should_exit(side_cost)
 
     def check_decay(self, strategy, strategy_type: StrategyType) -> Tuple[bool, float, str]:
         """
-        Check if position should exit based on decay.
-        For IC: checks combined decay (use check_ic_leg_decay for independent side management).
-        Returns: (should_exit_full, current_cost, reason)
+        Check if position should exit.
+        Returns: (should_exit, current_cost, reason)
         """
         try:
-            price_update_success = self.strategy_builder.update_strategy_prices_optimized(
-                strategy, None, None
-            )
+            self.strategy_builder.update_strategy_prices_optimized(strategy, None, None)
         except Exception:
             pass
 
         current_cost = self._calculate_exit_cost(strategy)
-        entry_credit = getattr(strategy, 'entry_credit', 0)
-
-        if entry_credit <= 0:
-            return False, current_cost, ""
-
-        decay_ratio = current_cost / entry_credit
-
-        if decay_ratio <= self.SPREAD_DECAY_THRESHOLD:
-            return True, current_cost, f"Decay threshold reached ({decay_ratio:.3f} <= {self.SPREAD_DECAY_THRESHOLD})"
-
-        return False, current_cost, ""
+        should_exit, reason = self._should_exit(current_cost)
+        return should_exit, current_cost, reason
 
     def check_decay_at_time(self, strategy, strategy_type: StrategyType,
                             date: str, current_time: str) -> Tuple[bool, float, str]:
         """
         Check if position should exit, updating prices first.
-        Returns: (should_exit_full, current_cost, reason)
+        Returns: (should_exit, current_cost, reason)
         """
         try:
             self.strategy_builder.update_strategy_prices_optimized(strategy, date, current_time)
@@ -545,24 +557,15 @@ class IntradayPositionMonitor:
             logger.debug(f"Price update failed at {current_time}: {e}")
 
         current_cost = self._calculate_exit_cost(strategy)
-        entry_credit = getattr(strategy, 'entry_credit', 0)
-
-        if entry_credit <= 0:
-            return False, current_cost, ""
-
-        decay_ratio = current_cost / entry_credit
-
-        if decay_ratio <= self.SPREAD_DECAY_THRESHOLD:
-            return True, current_cost, f"Decay threshold reached ({decay_ratio:.3f} <= {self.SPREAD_DECAY_THRESHOLD})"
-
-        return False, current_cost, ""
+        should_exit, reason = self._should_exit(current_cost)
+        return should_exit, current_cost, reason
 
     def check_ic_leg_decay(self, strategy, date: str, current_time: str,
                            ic_leg_status: IronCondorLegStatus) -> IronCondorLegStatus:
         """
         For IC: update prices and check each side independently.
+        Each side exits when its cost/share hits take_profit or stop_loss.
         Updates ic_leg_status in place and returns it.
-        A side is 'done' when its decay_ratio <= IC_DECAY_THRESHOLD.
         """
         try:
             self.strategy_builder.update_strategy_prices_optimized(strategy, date, current_time)
@@ -575,32 +578,32 @@ class IntradayPositionMonitor:
             ic_leg_status.put_side_closed = True
             ic_leg_status.put_side_exit_time = current_time
             ic_leg_status.put_side_exit_cost = put_cost
-            ic_leg_status.put_side_exit_reason = f"Decay threshold reached (put side)"
+            _, reason = self._should_exit_ic_side(put_cost)
+            ic_leg_status.put_side_exit_reason = reason
 
         if call_done and not ic_leg_status.call_side_closed:
             ic_leg_status.call_side_closed = True
             ic_leg_status.call_side_exit_time = current_time
             ic_leg_status.call_side_exit_cost = call_cost
-            ic_leg_status.call_side_exit_reason = f"Decay threshold reached (call side)"
+            _, reason = self._should_exit_ic_side(call_cost)
+            ic_leg_status.call_side_exit_reason = reason
 
         return ic_leg_status
 
     def _check_ic_leg_decay_values(self, strategy) -> Tuple[bool, bool, float, float]:
         """
         For IC: returns (put_side_done, call_side_done, put_cost, call_cost).
-        A side is 'done' when its decay_ratio <= IC_DECAY_THRESHOLD.
+        A side is 'done' when its per-share cost hits take_profit or stop_loss.
         """
         try:
             put_legs = [l for l in strategy.legs if l.option_type.value == 'put']
             call_legs = [l for l in strategy.legs if l.option_type.value == 'call']
         except AttributeError:
-            # Fallback: try string comparison
             put_legs = [l for l in strategy.legs if str(l.option_type).lower() == 'put']
             call_legs = [l for l in strategy.legs if str(l.option_type).lower() == 'call']
 
-        def _side_cost(legs) -> Tuple[float, float]:
-            """Return (entry_credit, current_cost) for a set of legs."""
-            entry_credit = 0.0
+        def _side_cost(legs) -> float:
+            """Return current cost to close for a set of legs."""
             current_cost = 0.0
             for leg in legs:
                 quantity = getattr(leg, 'quantity', 1)
@@ -612,20 +615,16 @@ class IntradayPositionMonitor:
                 except AttributeError:
                     short = str(is_short).upper() == 'SHORT'
                 sign = 1 if short else -1
-                entry_credit += entry_price * quantity * 100 * sign
                 current_cost += curr_price * quantity * 100 * sign
-            return entry_credit, current_cost
+            return max(current_cost, 0.0)
 
-        put_entry_credit, put_current_cost = _side_cost(put_legs)
-        call_entry_credit, call_current_cost = _side_cost(call_legs)
+        put_current_cost  = _side_cost(put_legs)
+        call_current_cost = _side_cost(call_legs)
 
-        put_decay = put_current_cost / put_entry_credit if put_entry_credit > 0 else 1.0
-        call_decay = call_current_cost / call_entry_credit if call_entry_credit > 0 else 1.0
+        put_done,  _ = self._should_exit_ic_side(put_current_cost)
+        call_done, _ = self._should_exit_ic_side(call_current_cost)
 
-        put_done = put_decay <= self.IC_DECAY_THRESHOLD
-        call_done = call_decay <= self.IC_DECAY_THRESHOLD
-
-        return put_done, call_done, max(put_current_cost, 0.0), max(call_current_cost, 0.0)
+        return put_done, call_done, put_current_cost, call_current_cost
 
     def _calculate_exit_cost(self, strategy) -> float:
         """Calculate current cost to close entire position."""

@@ -58,15 +58,17 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                               target_delta: float = 0.15,
                               target_prob_itm: float = 0.15,
                               min_spread_width: int = 10,
-                              decay_threshold: float = 0.05,
+                              take_profit: float = 0.10,
+                              stop_loss: float = 2.0,
+                              monitor_interval: int = 1,
                               quantity: int = 1,
                               target_credit: Optional[float] = 0.50) -> DayBacktestResult:
         """
         Full intraday scan loop for one trading day.
-        Scans every 1-min bar from 09:35 onward.
+        Scans every monitor_interval minutes from 09:35 onward.
         Returns DayBacktestResult containing all trades executed that day.
         """
-        logger.info(f"Intraday scan: {date} | credit={target_credit} delta={target_delta} decay={decay_threshold}")
+        logger.info(f"Intraday scan: {date} | credit={target_credit} tp={take_profit} sl={stop_loss} interval={monitor_interval}m")
 
         scan_times = _build_minute_grid(date, ENTRY_SCAN_START, "15:59:00")
         trades: List[EnhancedBacktestResult] = []
@@ -74,6 +76,15 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
         if date not in self.available_dates:
             return DayBacktestResult(date=date, trades=[], total_pnl=0.0,
                                      trade_count=0, scan_minutes_checked=0)
+
+        # Build a per-run monitor with the request's risk params
+        monitor = IntradayPositionMonitor(
+            self.enhanced_query_engine,
+            self.strategy_builder,
+            take_profit=take_profit,
+            stop_loss=stop_loss,
+            monitor_interval=monitor_interval,
+        )
 
         # Open position slots
         open_put_spread  = None   # strategy object or None
@@ -84,13 +95,17 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
         put_spread_meta  = {}
         call_spread_meta = {}
 
-        for current_time in scan_times:
+        for bar_index, current_time in enumerate(scan_times):
             is_past_entry_cutoff = current_time >= LAST_ENTRY_TIME
             is_past_final_exit   = current_time >= FINAL_EXIT_TIME
 
+            # Respect monitor_interval: only check positions on the correct bars.
+            # Always check on the final exit bar to guarantee force-close.
+            is_check_bar = (bar_index % monitor_interval == 0) or is_past_final_exit
+
             # --- 1. Monitor IC legs independently ---
-            if open_ic is not None and ic_leg_status is not None:
-                ic_leg_status = self.intraday_monitor.check_ic_leg_decay(
+            if open_ic is not None and ic_leg_status is not None and is_check_bar:
+                ic_leg_status = monitor.check_ic_leg_decay(
                     open_ic, date, current_time, ic_leg_status
                 )
                 # If both sides closed → finalize IC trade
@@ -110,7 +125,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                         market_signal=ic_entry_meta.get('market_signal', MarketSignal.NEUTRAL),
                         entry_time=ic_entry_meta.get('entry_time', current_time),
                         exit_time=later_side_time,
-                        exit_reason="IC both sides decayed",
+                        exit_reason="IC both sides closed",
                         entry_spx_price=ic_entry_meta.get('entry_spx', 0),
                         exit_spx_price=exit_spx,
                         technical_indicators=ic_entry_meta.get('indicators', TechnicalIndicators(0,0,0,0,0,0,0,0.5)),
@@ -131,9 +146,9 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     ic_leg_status = None
                     ic_entry_meta = {}
 
-            # --- 2. Monitor put spread decay ---
-            if open_put_spread is not None:
-                should_exit, current_cost, reason = self.intraday_monitor.check_decay_at_time(
+            # --- 2. Monitor put spread ---
+            if open_put_spread is not None and is_check_bar:
+                should_exit, current_cost, reason = monitor.check_decay_at_time(
                     open_put_spread, StrategyType.PUT_SPREAD, date, current_time
                 )
                 if should_exit or is_past_final_exit:
@@ -167,9 +182,9 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     open_put_spread = None
                     put_spread_meta = {}
 
-            # --- 3. Monitor call spread decay ---
-            if open_call_spread is not None:
-                should_exit, current_cost, reason = self.intraday_monitor.check_decay_at_time(
+            # --- 3. Monitor call spread ---
+            if open_call_spread is not None and is_check_bar:
+                should_exit, current_cost, reason = monitor.check_decay_at_time(
                     open_call_spread, StrategyType.CALL_SPREAD, date, current_time
                 )
                 if should_exit or is_past_final_exit:
@@ -287,7 +302,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     self.strategy_builder.update_strategy_prices_optimized(open_pos, date, FINAL_EXIT_TIME)
                 except Exception:
                     pass
-                exit_cost = self.intraday_monitor._calculate_exit_cost(open_pos)
+                exit_cost = monitor._calculate_exit_cost(open_pos)
                 entry_credit = getattr(open_pos, 'entry_credit', 0)
                 pnl = entry_credit - exit_cost
                 pnl_pct = (pnl / entry_credit * 100) if entry_credit > 0 else 0
@@ -375,7 +390,9 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                    target_delta: float = 0.15,
                                    target_prob_itm: float = 0.15,
                                    min_spread_width: int = 10,
-                                   decay_threshold: float = 0.05,
+                                   take_profit: float = 0.10,
+                                   stop_loss: float = 2.0,
+                                   monitor_interval: int = 1,
                                    quantity: int = 1,
                                    target_credit: Optional[float] = 0.50) -> EnhancedBacktestResult:
         """Legacy single-day method — runs intraday scan and returns first trade result."""
@@ -384,7 +401,9 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
             target_delta=target_delta,
             target_prob_itm=target_prob_itm,
             min_spread_width=min_spread_width,
-            decay_threshold=decay_threshold,
+            take_profit=take_profit,
+            stop_loss=stop_loss,
+            monitor_interval=monitor_interval,
             quantity=quantity,
             target_credit=target_credit
         )
@@ -663,7 +682,9 @@ def run_enhanced_backtest():
     parser.add_argument("--target-delta", type=float, default=0.15, help="Target delta for short strikes (used when --target-credit is not set)")
     parser.add_argument("--target-credit", type=float, default=0.50, help="Target net credit per spread per share (default: 0.50)")
     parser.add_argument("--target-prob-itm", type=float, default=0.15, help="Target probability ITM")
-    parser.add_argument("--decay-threshold", type=float, default=0.05, help="Decay threshold for exits")
+    parser.add_argument("--take-profit", type=float, default=0.10, help="Take profit: exit when cost/share drops to this value (default: 0.10)")
+    parser.add_argument("--stop-loss", type=float, default=2.0, help="Stop loss: exit when cost/share reaches this value (default: 2.0)")
+    parser.add_argument("--monitor-interval", type=int, default=1, help="Minutes between position checks (default: 1)")
     parser.add_argument("--min-spread-width", type=int, default=10, help="Minimum spread width")
     parser.add_argument("--show-monitoring", action="store_true", help="Show detailed monitoring")
 
@@ -678,7 +699,9 @@ def run_enhanced_backtest():
             date=args.date,
             target_delta=args.target_delta,
             target_prob_itm=args.target_prob_itm,
-            decay_threshold=args.decay_threshold,
+            take_profit=args.take_profit,
+            stop_loss=args.stop_loss,
+            monitor_interval=args.monitor_interval,
             min_spread_width=args.min_spread_width,
             target_credit=args.target_credit
         )
@@ -703,7 +726,9 @@ def run_enhanced_backtest():
                 date=date,
                 target_delta=args.target_delta,
                 target_prob_itm=args.target_prob_itm,
-                decay_threshold=args.decay_threshold,
+                take_profit=args.take_profit,
+                stop_loss=args.stop_loss,
+                monitor_interval=args.monitor_interval,
                 min_spread_width=args.min_spread_width,
                 target_credit=args.target_credit
             )
@@ -717,12 +742,14 @@ def run_enhanced_backtest():
         print("Available commands:")
         print("  --date YYYY-MM-DD                               # Single day intraday scan")
         print("  --start-date YYYY-MM-DD --end-date YYYY-MM-DD  # Date range intraday scan")
-        print("  --target-delta 0.15                            # Target delta for strikes")
-        print("  --decay-threshold 0.05                         # Exit when position decays to 5%")
+        print("  --target-credit 0.50                           # Target credit per spread/share")
+        print("  --take-profit 0.10                             # Exit when cost/share <= $0.10")
+        print("  --stop-loss 2.0                                # Exit when cost/share >= $2.00")
+        print("  --monitor-interval 1                           # Check every N minutes")
         print("  --show-monitoring                              # Show detailed monitoring")
         print("\nExample:")
-        print("  python enhanced_multi_strategy.py --date 2026-02-09 --target-delta 0.20")
-        print("  python enhanced_multi_strategy.py --start-date 2026-02-09 --end-date 2026-02-13 --show-monitoring")
+        print("  python enhanced_multi_strategy.py --date 2026-02-09 --take-profit 0.10 --stop-loss 2.0")
+        print("  python enhanced_multi_strategy.py --start-date 2026-02-09 --end-date 2026-02-13")
 
 
 if __name__ == "__main__":

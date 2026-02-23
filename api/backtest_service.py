@@ -302,7 +302,9 @@ class BacktestService:
             date_str = test_date.strftime('%Y-%m-%d') if hasattr(test_date, 'strftime') else str(test_date)
             return self.engine.backtest_day_intraday(
                 date=date_str,
-                decay_threshold=request.decay_threshold,
+                take_profit=request.take_profit,
+                stop_loss=request.stop_loss,
+                monitor_interval=request.monitor_interval,
                 min_spread_width=request.spread_width,
                 target_credit=request.target_credit,
             )
@@ -408,11 +410,11 @@ class BacktestService:
                 spread_width=request.spread_width,
 
                 # Risk management
-                decay_threshold=request.decay_threshold,
+                decay_threshold=0.0,
 
-                # Execution parameters (hardcoded by intraday scan)
+                # Execution parameters
                 entry_time="09:35:00",
-                monitor_interval=1,
+                monitor_interval=request.monitor_interval,
 
                 # Status
                 status=status.status.value,
@@ -423,7 +425,9 @@ class BacktestService:
                 parameters={
                     "target_credit": request.target_credit,
                     "spread_width": request.spread_width,
-                    "decay_threshold": request.decay_threshold,
+                    "take_profit": request.take_profit,
+                    "stop_loss": request.stop_loss,
+                    "monitor_interval": request.monitor_interval,
                 }
             )
             
