@@ -40,6 +40,7 @@ class BacktestRequest(BaseModel):
 
     # Risk management
     decay_threshold: float = Field(0.05, ge=0.01, le=0.5, description="Exit when position value decays to this fraction of entry credit")
+    stop_loss: Optional[float] = Field(None, ge=0.01, le=10.0, description="Max loss per spread per share before forced exit. E.g. 1.00 exits when spread costs $1.00 to close.")
 
     @field_validator('start_date', 'end_date', 'single_date')
     @classmethod
