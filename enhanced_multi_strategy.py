@@ -26,8 +26,8 @@ from query_engine_adapter import EnhancedQueryEngineAdapter
 
 # Intraday scan constants
 ENTRY_SCAN_START = "09:35:00"   # 9:30 + first 5-min bar
-LAST_ENTRY_TIME  = "15:00:00"   # No new entries at or after 3 PM
-FINAL_EXIT_TIME  = "15:45:00"   # Hard close all positions
+LAST_ENTRY_TIME  = "14:00:00"   # No new entries at or after 2 PM
+FINAL_EXIT_TIME  = "16:00:00"   # Hold to expiry (market close)
 
 
 def _build_minute_grid(date: str, start_time: str, end_time: str) -> List[str]:
@@ -70,7 +70,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
         """
         logger.info(f"Intraday scan: {date} | credit={target_credit} tp={take_profit} sl={stop_loss} interval={monitor_interval}m")
 
-        scan_times = _build_minute_grid(date, ENTRY_SCAN_START, "15:59:00")
+        scan_times = _build_minute_grid(date, ENTRY_SCAN_START, FINAL_EXIT_TIME)
         trades: List[EnhancedBacktestResult] = []
 
         if date not in self.available_dates:
@@ -102,11 +102,10 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
 
         for bar_index, current_time in enumerate(scan_times):
             is_past_entry_cutoff = current_time >= LAST_ENTRY_TIME
-            is_past_final_exit   = current_time >= FINAL_EXIT_TIME
+            is_final_bar         = current_time >= FINAL_EXIT_TIME
 
-            # Respect monitor_interval: only check positions on the correct bars.
-            # Always check on the final exit bar to guarantee force-close.
-            is_check_bar = (bar_index % monitor_interval == 0) or is_past_final_exit
+            # Respect monitor_interval; always process the final bar for the hard close.
+            is_check_bar = (bar_index % monitor_interval == 0) or is_final_bar
 
             # --- 1. Monitor IC legs independently ---
             if open_ic is not None and ic_leg_status is not None and is_check_bar:
@@ -192,8 +191,8 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     "pnl_per_share": round(entry_credit_ps - cost_ps, 4),
                 })
 
-                if should_exit or is_past_final_exit:
-                    exit_reason = reason if should_exit else "Force close at expiration"
+                if should_exit or is_final_bar:
+                    exit_reason = reason if should_exit else "Expired at market close"
                     entry_credit = ps_entry_credit
                     pnl = entry_credit - current_cost
                     pnl_pct = (pnl / entry_credit * 100) if entry_credit > 0 else 0
@@ -242,8 +241,8 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     "pnl_per_share": round(entry_credit_ps - cost_ps, 4),
                 })
 
-                if should_exit or is_past_final_exit:
-                    exit_reason = reason if should_exit else "Force close at expiration"
+                if should_exit or is_final_bar:
+                    exit_reason = reason if should_exit else "Expired at market close"
                     entry_credit = cs_entry_credit
                     pnl = entry_credit - current_cost
                     pnl_pct = (pnl / entry_credit * 100) if entry_credit > 0 else 0
@@ -275,7 +274,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     call_spread_checkpoints = []
 
             # --- 4. Scan for new entry (only before 3 PM and before final exit) ---
-            if not is_past_entry_cutoff and not is_past_final_exit:
+            if not is_past_entry_cutoff and not is_final_bar:
                 try:
                     spx_history = self.get_spx_price_history(date, current_time, lookback_minutes=60)
                     indicators = self.technical_analyzer.analyze_market_conditions(spx_history)
@@ -387,11 +386,11 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     if not ic_leg_status.put_side_closed:
                         ic_leg_status.put_side_closed = True
                         ic_leg_status.put_side_exit_time = FINAL_EXIT_TIME
-                        ic_leg_status.put_side_exit_reason = "Force close at expiration"
+                        ic_leg_status.put_side_exit_reason = "Expired at market close"
                     if not ic_leg_status.call_side_closed:
                         ic_leg_status.call_side_closed = True
                         ic_leg_status.call_side_exit_time = FINAL_EXIT_TIME
-                        ic_leg_status.call_side_exit_reason = "Force close at expiration"
+                        ic_leg_status.call_side_exit_reason = "Expired at market close"
                     result_ic_leg_status = ic_leg_status
 
                 trades.append(EnhancedBacktestResult(
@@ -400,7 +399,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     market_signal=meta.get('market_signal', MarketSignal.NEUTRAL),
                     entry_time=meta.get('entry_time', FINAL_EXIT_TIME),
                     exit_time=FINAL_EXIT_TIME,
-                    exit_reason="Force close at expiration",
+                    exit_reason="Expired at market close",
                     entry_spx_price=meta.get('entry_spx', 0),
                     exit_spx_price=exit_spx,
                     technical_indicators=meta.get('indicators', TechnicalIndicators(0,0,0,0,0,0,0,0.5)),
