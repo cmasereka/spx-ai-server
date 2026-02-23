@@ -15,7 +15,7 @@ from loguru import logger
 
 from api.models import (
     BacktestRequest, BacktestResponse, BacktestStatus, 
-    BacktestResult, SystemStatus, WebSocketMessage
+    BacktestResult, SystemStatus
 )
 from api.backtest_service import BacktestService
 from api.websocket_manager import WebSocketManager

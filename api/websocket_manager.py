@@ -8,8 +8,6 @@ from typing import Dict, List
 from fastapi import WebSocket
 from loguru import logger
 
-from .models import WebSocketMessage
-
 
 class WebSocketManager:
     """Manages WebSocket connections and real-time messaging"""
