@@ -25,9 +25,15 @@ from query_engine_adapter import EnhancedQueryEngineAdapter
 
 
 # Intraday scan constants
-ENTRY_SCAN_START = "09:35:00"   # 9:30 + first 5-min bar
-LAST_ENTRY_TIME  = "14:00:00"   # No new entries at or after 2 PM
-FINAL_EXIT_TIME  = "16:00:00"   # Hold to expiry (market close)
+ENTRY_SCAN_START    = "09:35:00"   # 9:30 + first 5-min bar
+LAST_ENTRY_TIME     = "14:00:00"   # No new entries at or after 2 PM
+FINAL_EXIT_TIME     = "16:00:00"   # Hold to expiry (market close)
+MIN_DISTANCE_FROM_SPX = 50.0       # Short strike must be >= $50 away from SPX
+
+# Strategy mode constants (match BacktestStrategyEnum values)
+STRATEGY_IRON_CONDOR     = "iron_condor"
+STRATEGY_CREDIT_SPREADS  = "credit_spreads"
+STRATEGY_IC_CREDIT_SPREADS = "ic_credit_spreads"
 
 
 def _build_minute_grid(date: str, start_time: str, end_time: str) -> List[str]:
@@ -62,13 +68,19 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                               stop_loss: float = 2.0,
                               monitor_interval: int = 1,
                               quantity: int = 1,
-                              target_credit: Optional[float] = 0.50) -> DayBacktestResult:
+                              target_credit: Optional[float] = 0.50,
+                              strategy_mode: str = STRATEGY_IRON_CONDOR) -> DayBacktestResult:
         """
         Full intraday scan loop for one trading day.
-        Scans every monitor_interval minutes from 09:35 onward.
-        Returns DayBacktestResult containing all trades executed that day.
+        strategy_mode controls which entry types are allowed:
+          iron_condor       — IC only
+          credit_spreads    — put/call spreads only
+          ic_credit_spreads — all types
         """
-        logger.info(f"Intraday scan: {date} | credit={target_credit} tp={take_profit} sl={stop_loss} interval={monitor_interval}m")
+        logger.info(
+            f"Intraday scan: {date} | mode={strategy_mode} credit={target_credit} "
+            f"contracts={quantity} tp={take_profit} sl={stop_loss} interval={monitor_interval}m"
+        )
 
         scan_times = _build_minute_grid(date, ENTRY_SCAN_START, FINAL_EXIT_TIME)
         trades: List[EnhancedBacktestResult] = []
@@ -273,7 +285,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     call_spread_meta = {}
                     call_spread_checkpoints = []
 
-            # --- 4. Scan for new entry (only before 3 PM and before final exit) ---
+            # --- 4. Scan for new entry (only before 2 PM and before final bar) ---
             if not is_past_entry_cutoff and not is_final_bar:
                 try:
                     spx_history = self.get_spx_price_history(date, current_time, lookback_minutes=60)
@@ -281,7 +293,11 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     selection = self.strategy_selector.select_strategy(indicators)
                     entry_spx = self.enhanced_query_engine.get_fastest_spx_price(date, current_time) or 0
 
-                    if selection.strategy_type == StrategyType.IRON_CONDOR:
+                    # Determine which entry types are permitted by this strategy mode
+                    allow_ic      = strategy_mode in (STRATEGY_IRON_CONDOR, STRATEGY_IC_CREDIT_SPREADS)
+                    allow_spreads = strategy_mode in (STRATEGY_CREDIT_SPREADS, STRATEGY_IC_CREDIT_SPREADS)
+
+                    if selection.strategy_type == StrategyType.IRON_CONDOR and allow_ic:
                         if open_ic is None and open_put_spread is None and open_call_spread is None:
                             strategy = self._try_open_strategy(
                                 date, current_time, StrategyType.IRON_CONDOR,
@@ -302,7 +318,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                 }
                                 logger.info(f"Opened IC at {current_time}")
 
-                    elif selection.strategy_type == StrategyType.PUT_SPREAD:
+                    elif selection.strategy_type == StrategyType.PUT_SPREAD and allow_spreads:
                         if open_put_spread is None and open_ic is None:
                             strategy = self._try_open_strategy(
                                 date, current_time, StrategyType.PUT_SPREAD,
@@ -322,7 +338,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                 }
                                 logger.info(f"Opened put spread at {current_time}")
 
-                    elif selection.strategy_type == StrategyType.CALL_SPREAD:
+                    elif selection.strategy_type == StrategyType.CALL_SPREAD and allow_spreads:
                         if open_call_spread is None and open_ic is None:
                             strategy = self._try_open_strategy(
                                 date, current_time, StrategyType.CALL_SPREAD,
@@ -429,7 +445,12 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                            target_delta: float, target_prob_itm: float,
                            min_spread_width: int, quantity: int,
                            target_credit: Optional[float] = None):
-        """Attempt to build a strategy at the given timestamp. Returns strategy or None."""
+        """
+        Attempt to build a strategy at the given timestamp.
+        Returns the strategy object, or None if:
+          - no suitable strikes found
+          - any short strike is closer than MIN_DISTANCE_FROM_SPX to the current SPX price
+        """
         self._last_strike_selection = None
         try:
             strike_selection = self.delta_selector.select_strikes_by_delta(
@@ -443,6 +464,29 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
             )
             if not strike_selection:
                 return None
+
+            # --- Minimum distance guard ---
+            spx_price = self.enhanced_query_engine.get_fastest_spx_price(date, timestamp) or 0
+            if spx_price > 0:
+                from delta_strike_selector import IronCondorStrikeSelection
+                if isinstance(strike_selection, IronCondorStrikeSelection):
+                    put_dist  = abs(strike_selection.put_short_strike  - spx_price)
+                    call_dist = abs(strike_selection.call_short_strike - spx_price)
+                    if put_dist < MIN_DISTANCE_FROM_SPX or call_dist < MIN_DISTANCE_FROM_SPX:
+                        logger.debug(
+                            f"Skipping IC at {timestamp}: put_dist={put_dist:.1f} "
+                            f"call_dist={call_dist:.1f} (min={MIN_DISTANCE_FROM_SPX})"
+                        )
+                        return None
+                else:
+                    short_dist = abs(strike_selection.short_strike - spx_price)
+                    if short_dist < MIN_DISTANCE_FROM_SPX:
+                        logger.debug(
+                            f"Skipping {strategy_type.value} at {timestamp}: "
+                            f"short_dist={short_dist:.1f} (min={MIN_DISTANCE_FROM_SPX})"
+                        )
+                        return None
+
             self._last_strike_selection = strike_selection
 
             if strategy_type == StrategyType.IRON_CONDOR:
@@ -466,7 +510,8 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                    stop_loss: float = 2.0,
                                    monitor_interval: int = 1,
                                    quantity: int = 1,
-                                   target_credit: Optional[float] = 0.50) -> EnhancedBacktestResult:
+                                   target_credit: Optional[float] = 0.50,
+                                   strategy_mode: str = STRATEGY_IRON_CONDOR) -> EnhancedBacktestResult:
         """Legacy single-day method — runs intraday scan and returns first trade result."""
         day_result = self.backtest_day_intraday(
             date=date,
@@ -477,7 +522,8 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
             stop_loss=stop_loss,
             monitor_interval=monitor_interval,
             quantity=quantity,
-            target_credit=target_credit
+            target_credit=target_credit,
+            strategy_mode=strategy_mode,
         )
         if day_result.trades:
             return day_result.trades[0]
@@ -751,7 +797,11 @@ def run_enhanced_backtest():
     parser.add_argument("--date", "-d", help="Date to backtest (YYYY-MM-DD)")
     parser.add_argument("--start-date", help="Start date for range (YYYY-MM-DD)")
     parser.add_argument("--end-date", help="End date for range (YYYY-MM-DD)")
-    parser.add_argument("--target-delta", type=float, default=0.15, help="Target delta for short strikes (used when --target-credit is not set)")
+    parser.add_argument("--strategy", default=STRATEGY_IRON_CONDOR,
+                        choices=[STRATEGY_IRON_CONDOR, STRATEGY_CREDIT_SPREADS, STRATEGY_IC_CREDIT_SPREADS],
+                        help="Strategy mode (default: iron_condor)")
+    parser.add_argument("--contracts", type=int, default=1, help="Number of contracts per position (default: 1)")
+    parser.add_argument("--target-delta", type=float, default=0.15, help="Target delta for short strikes")
     parser.add_argument("--target-credit", type=float, default=0.50, help="Target net credit per spread per share (default: 0.50)")
     parser.add_argument("--target-prob-itm", type=float, default=0.15, help="Target probability ITM")
     parser.add_argument("--take-profit", type=float, default=0.10, help="Take profit: exit when cost/share drops to this value (default: 0.10)")
@@ -775,7 +825,9 @@ def run_enhanced_backtest():
             stop_loss=args.stop_loss,
             monitor_interval=args.monitor_interval,
             min_spread_width=args.min_spread_width,
-            target_credit=args.target_credit
+            target_credit=args.target_credit,
+            strategy_mode=args.strategy,
+            quantity=args.contracts,
         )
         print(f"\nDate: {day_result.date} | Trades: {day_result.trade_count} | Total P&L: ${day_result.total_pnl:.2f} | Bars scanned: {day_result.scan_minutes_checked}")
         if day_result.trades:
@@ -802,7 +854,9 @@ def run_enhanced_backtest():
                 stop_loss=args.stop_loss,
                 monitor_interval=args.monitor_interval,
                 min_spread_width=args.min_spread_width,
-                target_credit=args.target_credit
+                target_credit=args.target_credit,
+                strategy_mode=args.strategy,
+                quantity=args.contracts,
             )
             all_trades.extend(day_result.trades)
             logger.info(f"  {date}: {day_result.trade_count} trades, P&L=${day_result.total_pnl:.2f}")

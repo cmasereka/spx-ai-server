@@ -307,6 +307,8 @@ class BacktestService:
                 monitor_interval=request.monitor_interval,
                 min_spread_width=request.spread_width,
                 target_credit=request.target_credit,
+                strategy_mode=request.strategy.value,
+                quantity=request.contracts,
             )
         except Exception as e:
             logger.error(f"Single day backtest failed for {test_date}: {e}")
@@ -396,7 +398,7 @@ class BacktestService:
             backtest_run = BacktestRun(
                 backtest_id=backtest_id,
                 mode=request.mode.value,
-                strategy_type="dynamic",  # strategy selected dynamically per bar
+                strategy_type=request.strategy.value,
 
                 # Date configuration
                 start_date=request.start_date,
@@ -423,6 +425,8 @@ class BacktestService:
 
                 # Active parameters
                 parameters={
+                    "strategy": request.strategy.value,
+                    "contracts": request.contracts,
                     "target_credit": request.target_credit,
                     "spread_width": request.spread_width,
                     "take_profit": request.take_profit,

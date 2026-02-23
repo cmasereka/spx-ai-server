@@ -16,6 +16,13 @@ class BacktestModeEnum(str, Enum):
     LIVE_SIMULATION = "live_simulation"
 
 
+class BacktestStrategyEnum(str, Enum):
+    """Strategy mode controlling which trade types are considered"""
+    IRON_CONDOR     = "iron_condor"       # IC entries only
+    CREDIT_SPREADS  = "credit_spreads"    # Put / call spreads only, no IC
+    IC_CREDIT_SPREADS = "ic_credit_spreads"  # All entry types (current behaviour)
+
+
 class BacktestStatusEnum(str, Enum):
     """Backtest status values"""
     PENDING = "pending"
@@ -29,6 +36,12 @@ class BacktestRequest(BaseModel):
     """Request model for starting a backtest"""
     mode: BacktestModeEnum = Field(..., description="Backtest execution mode")
 
+    # Strategy mode
+    strategy: BacktestStrategyEnum = Field(
+        BacktestStrategyEnum.IRON_CONDOR,
+        description="Which trade types to consider: iron_condor, credit_spreads, or ic_credit_spreads"
+    )
+
     # Date configuration
     start_date: Optional[date] = Field(None, description="Start date for backtesting")
     end_date: Optional[date] = Field(None, description="End date for backtesting")
@@ -37,6 +50,9 @@ class BacktestRequest(BaseModel):
     # Strike selection
     target_credit: float = Field(0.50, ge=0.05, le=5.0, description="Target net credit per spread per share. IC total will be 2x this value.")
     spread_width: int = Field(10, ge=5, le=100, description="Width of each spread in strike points")
+
+    # Position sizing
+    contracts: int = Field(1, ge=1, le=100, description="Number of contracts per position")
 
     # Risk management
     take_profit: float = Field(0.10, ge=0.01, le=10.0, description="Take profit: exit when cost-to-close per spread per share drops to or below this absolute value. E.g. 0.10 exits when closing costs $0.10/share.")
