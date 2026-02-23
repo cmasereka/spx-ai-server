@@ -133,34 +133,36 @@ class DeltaStrikeSelector:
             logger.error(f"Strike selection failed: {e}")
             return None
     
-    def _select_put_spread_strikes(self, options_data: pd.DataFrame, spx_price: float, 
-                                 target_delta: float, target_prob_itm: float, 
+    def _select_put_spread_strikes(self, options_data: pd.DataFrame, spx_price: float,
+                                 target_delta: float, target_prob_itm: float,
                                  min_spread_width: int) -> Optional[StrikeSelection]:
         """Select put spread strikes"""
-        
-        # Filter for puts
-        puts = options_data[options_data['option_type'] == 'put'].copy()
+
+        # Only consider OTM puts (strike < SPX) — ITM puts have no place as short strikes
+        puts = options_data[
+            (options_data['option_type'] == 'put') &
+            (options_data['strike'] < spx_price)
+        ].copy()
         if len(puts) == 0:
             return None
-        
-        # Find puts with delta close to target (puts have negative delta)
+
+        # Find puts with delta magnitude closest to target (puts have negative delta)
         puts['abs_delta_diff'] = abs(abs(puts['delta']) - target_delta)
         puts = puts.sort_values('abs_delta_diff')
-        
+
         # Select short strike (sell this)
         short_candidates = puts.head(5)  # Top 5 closest to target delta
-        
+
         for _, short_option in short_candidates.iterrows():
             short_strike = short_option['strike']
             short_delta = abs(short_option['delta'])
-            
-            # Estimate probability ITM (approximation)
-            short_prob_itm = short_delta  # Rough approximation for 0DTE
-            
-            # Find long strike (buy this) - further OTM
+
+            short_prob_itm = short_delta  # delta ≈ prob ITM for 0DTE
+
+            # Long strike is further OTM (lower for puts)
             long_strike = short_strike - min_spread_width
             long_options = puts[puts['strike'] == long_strike]
-            
+
             if len(long_options) > 0:
                 return StrikeSelection(
                     short_strike=short_strike,
@@ -169,37 +171,39 @@ class DeltaStrikeSelector:
                     short_prob_itm=short_prob_itm,
                     spread_width=short_strike - long_strike
                 )
-        
+
         return None
-    
+
     def _select_call_spread_strikes(self, options_data: pd.DataFrame, spx_price: float,
                                   target_delta: float, target_prob_itm: float,
                                   min_spread_width: int) -> Optional[StrikeSelection]:
         """Select call spread strikes"""
-        
-        # Filter for calls
-        calls = options_data[options_data['option_type'] == 'call'].copy()
+
+        # Only consider OTM calls (strike > SPX) — ITM calls have no place as short strikes
+        calls = options_data[
+            (options_data['option_type'] == 'call') &
+            (options_data['strike'] > spx_price)
+        ].copy()
         if len(calls) == 0:
             return None
-        
-        # Find calls with delta close to target
+
+        # Find calls with delta closest to target
         calls['abs_delta_diff'] = abs(calls['delta'] - target_delta)
         calls = calls.sort_values('abs_delta_diff')
-        
+
         # Select short strike (sell this)
         short_candidates = calls.head(5)
-        
+
         for _, short_option in short_candidates.iterrows():
             short_strike = short_option['strike']
             short_delta = short_option['delta']
-            
-            # Estimate probability ITM
-            short_prob_itm = short_delta
-            
-            # Find long strike (buy this) - further OTM
+
+            short_prob_itm = short_delta  # delta ≈ prob ITM for 0DTE
+
+            # Long strike is further OTM (higher for calls)
             long_strike = short_strike + min_spread_width
             long_options = calls[calls['strike'] == long_strike]
-            
+
             if len(long_options) > 0:
                 return StrikeSelection(
                     short_strike=short_strike,
@@ -208,7 +212,7 @@ class DeltaStrikeSelector:
                     short_prob_itm=short_prob_itm,
                     spread_width=long_strike - short_strike
                 )
-        
+
         return None
 
 

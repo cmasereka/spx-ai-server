@@ -203,8 +203,8 @@ class EnhancedQueryEngineAdapter:
                 bid = float(row.get('bid', 0))
                 ask = float(row.get('ask', 0))
 
-                # Skip illiquid / pre-open rows
-                if bid <= 0 or ask <= 0:
+                # Skip rows with no valid ask (completely illiquid / pre-open)
+                if ask <= 0:
                     continue
 
                 right_value = str(row.get('right', 'C')).upper()
