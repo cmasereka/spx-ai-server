@@ -5,7 +5,7 @@ echo "======================================"
 
 # Check if required packages are installed
 echo "📦 Checking dependencies..."
-python -c "
+python3 -c "
 try:
     import fastapi, uvicorn, websockets, pydantic, psutil
     print('✅ All required packages are installed')
@@ -13,13 +13,13 @@ except ImportError as e:
     print(f'❌ Missing dependency: {e}')
     print('Installing dependencies...')
     import subprocess
-    subprocess.check_call(['pip', 'install', '-r', 'requirements.txt'])
+    subprocess.check_call(['pip3', 'install', '-r', 'requirements.txt'])
     print('✅ Dependencies installed')
 "
 
 echo ""
 echo "🔍 Running quick API test..."
-python -c "
+python3 -c "
 from main import app
 print('✅ FastAPI app loads successfully')
 print('✅ Ready to start server')
@@ -40,4 +40,4 @@ echo ""
 echo "Press Ctrl+C to stop the server"
 echo "======================================"
 
-python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+python3 -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
