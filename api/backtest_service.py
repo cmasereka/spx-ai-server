@@ -365,39 +365,36 @@ class BacktestService:
             backtest_run = BacktestRun(
                 backtest_id=backtest_id,
                 mode=request.mode.value,
-                strategy_type=request.strategy_type.value,
-                
+                strategy_type="dynamic",  # strategy selected dynamically per bar
+
                 # Date configuration
                 start_date=request.start_date,
                 end_date=request.end_date,
                 single_date=request.single_date,
-                
+
                 # Strategy parameters
-                target_delta=request.target_delta,
-                put_distance=request.put_distance,
-                call_distance=request.call_distance,
+                target_delta=0.0,
+                put_distance=0,
+                call_distance=0,
                 spread_width=request.spread_width,
-                
+
                 # Risk management
                 decay_threshold=request.decay_threshold,
-                profit_target=request.profit_target,
-                stop_loss=request.stop_loss,
-                
-                # Execution parameters
-                entry_time=request.entry_time,
-                monitor_interval=request.monitor_interval,
-                
+
+                # Execution parameters (hardcoded by intraday scan)
+                entry_time="09:35:00",
+                monitor_interval=1,
+
                 # Status
                 status=status.status.value,
                 created_at=status.created_at,
                 started_at=status.started_at,
-                
-                # Additional parameters
+
+                # Active parameters
                 parameters={
-                    "target_delta": request.target_delta,
+                    "target_credit": request.target_credit,
+                    "spread_width": request.spread_width,
                     "decay_threshold": request.decay_threshold,
-                    "entry_time": request.entry_time,
-                    "monitor_interval": request.monitor_interval
                 }
             )
             

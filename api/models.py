@@ -9,13 +9,6 @@ from typing import Dict, List, Optional, Any, Union
 from pydantic import BaseModel, Field, field_validator
 
 
-class StrategyTypeEnum(str, Enum):
-    """Available strategy types"""
-    IRON_CONDOR = "iron_condor"
-    PUT_SPREAD = "put_spread"
-    CALL_SPREAD = "call_spread"
-
-
 class BacktestModeEnum(str, Enum):
     """Backtest execution modes"""
     SINGLE_DAY = "single_day"
@@ -35,38 +28,26 @@ class BacktestStatusEnum(str, Enum):
 class BacktestRequest(BaseModel):
     """Request model for starting a backtest"""
     mode: BacktestModeEnum = Field(..., description="Backtest execution mode")
-    
+
     # Date configuration
     start_date: Optional[date] = Field(None, description="Start date for backtesting")
     end_date: Optional[date] = Field(None, description="End date for backtesting")
     single_date: Optional[date] = Field(None, description="Single date for backtesting")
-    
-    # Strategy configuration
-    strategy_type: StrategyTypeEnum = Field(StrategyTypeEnum.IRON_CONDOR, description="Options strategy type")
-    
-    # Strike selection parameters
-    target_delta: float = Field(0.15, ge=0.05, le=0.45, description="Target delta for short strikes (used when target_credit is None)")
-    target_credit: Optional[float] = Field(0.50, ge=0.05, le=5.0, description="Target net credit per spread (per share). IC total will be 2x this value.")
-    put_distance: int = Field(50, ge=10, le=200, description="Distance for put strikes from underlying")
-    call_distance: int = Field(50, ge=10, le=200, description="Distance for call strikes from underlying")
-    spread_width: int = Field(10, ge=5, le=100, description="Width of spreads")
-    
+
+    # Strike selection
+    target_credit: float = Field(0.50, ge=0.05, le=5.0, description="Target net credit per spread per share. IC total will be 2x this value.")
+    spread_width: int = Field(10, ge=5, le=100, description="Width of each spread in strike points")
+
     # Risk management
-    decay_threshold: float = Field(0.1, ge=0.05, le=0.5, description="Decay threshold for early exit")
-    profit_target: Optional[float] = Field(None, ge=0.1, le=0.9, description="Profit target percentage")
-    stop_loss: Optional[float] = Field(None, ge=0.1, le=1.0, description="Stop loss percentage")
-    
-    # Execution parameters
-    entry_time: str = Field("10:00:00", description="Entry time for trades")
-    monitor_interval: int = Field(5, ge=1, le=60, description="Monitoring interval in minutes")
-    
+    decay_threshold: float = Field(0.05, ge=0.01, le=0.5, description="Exit when position value decays to this fraction of entry credit")
+
     @field_validator('start_date', 'end_date', 'single_date')
     @classmethod
     def validate_dates(cls, v):
         if v and v > date.today():
             raise ValueError("Date cannot be in the future")
         return v
-    
+
     @field_validator('end_date')
     @classmethod
     def validate_date_range(cls, v, info):
