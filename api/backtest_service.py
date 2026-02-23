@@ -302,7 +302,6 @@ class BacktestService:
             date_str = test_date.strftime('%Y-%m-%d') if hasattr(test_date, 'strftime') else str(test_date)
             return self.engine.backtest_day_intraday(
                 date=date_str,
-                target_delta=request.target_delta,
                 decay_threshold=request.decay_threshold,
                 min_spread_width=request.spread_width,
                 target_credit=request.target_credit,
