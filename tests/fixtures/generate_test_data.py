@@ -162,7 +162,7 @@ def create_test_configuration():
         "DEFAULT_STRATEGY_PARAMS": {
             "target_delta": 0.15,
             "target_prob_itm": 0.15,
-            "min_spread_width": 25,
+            "min_spread_width": 10,
             "decay_threshold": 0.1,
             "entry_time": "10:00:00",
             "exit_time": "15:45:00"

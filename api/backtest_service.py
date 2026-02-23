@@ -304,6 +304,7 @@ class BacktestService:
                 date=date_str,
                 target_delta=request.target_delta,
                 decay_threshold=request.decay_threshold,
+                min_spread_width=request.spread_width,
             )
         except Exception as e:
             logger.error(f"Single day backtest failed for {test_date}: {e}")

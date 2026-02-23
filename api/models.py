@@ -48,7 +48,7 @@ class BacktestRequest(BaseModel):
     target_delta: float = Field(0.15, ge=0.05, le=0.45, description="Target delta for short strikes")
     put_distance: int = Field(50, ge=10, le=200, description="Distance for put strikes from underlying")
     call_distance: int = Field(50, ge=10, le=200, description="Distance for call strikes from underlying")
-    spread_width: int = Field(25, ge=5, le=100, description="Width of spreads")
+    spread_width: int = Field(10, ge=5, le=100, description="Width of spreads")
     
     # Risk management
     decay_threshold: float = Field(0.1, ge=0.05, le=0.5, description="Decay threshold for early exit")

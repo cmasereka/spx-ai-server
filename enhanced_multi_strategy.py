@@ -57,7 +57,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                               date: str,
                               target_delta: float = 0.15,
                               target_prob_itm: float = 0.15,
-                              min_spread_width: int = 25,
+                              min_spread_width: int = 10,
                               decay_threshold: float = 0.05,
                               quantity: int = 1) -> DayBacktestResult:
         """
@@ -368,7 +368,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                    exit_time: str = "15:45:00",
                                    target_delta: float = 0.15,
                                    target_prob_itm: float = 0.15,
-                                   min_spread_width: int = 25,
+                                   min_spread_width: int = 10,
                                    decay_threshold: float = 0.05,
                                    quantity: int = 1) -> EnhancedBacktestResult:
         """Legacy single-day method — runs intraday scan and returns first trade result."""
@@ -615,7 +615,7 @@ def run_enhanced_backtest():
     parser.add_argument("--target-delta", type=float, default=0.15, help="Target delta for short strikes")
     parser.add_argument("--target-prob-itm", type=float, default=0.15, help="Target probability ITM")
     parser.add_argument("--decay-threshold", type=float, default=0.05, help="Decay threshold for exits")
-    parser.add_argument("--min-spread-width", type=int, default=25, help="Minimum spread width")
+    parser.add_argument("--min-spread-width", type=int, default=10, help="Minimum spread width")
     parser.add_argument("--show-monitoring", action="store_true", help="Show detailed monitoring")
 
     args = parser.parse_args()

@@ -73,7 +73,7 @@ class DeltaStrikeSelector:
                               strategy_type: StrategyType,
                               target_delta: float = 0.15,
                               target_prob_itm: float = 0.15,
-                              min_spread_width: int = 25) -> Optional[StrikeSelection]:
+                              min_spread_width: int = 10) -> Optional[StrikeSelection]:
         """
         Select strikes based on target delta or probability ITM
         

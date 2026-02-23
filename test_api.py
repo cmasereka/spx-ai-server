@@ -57,7 +57,7 @@ def test_start_backtest():
         "target_delta": 0.15,
         "put_distance": 50,
         "call_distance": 50,
-        "spread_width": 25,
+        "spread_width": 10,
         "decay_threshold": 0.1,
         "entry_time": "10:00:00"
     }

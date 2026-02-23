@@ -72,7 +72,7 @@ class SimpleBacktester:
                            exit_time: str = "15:45:00",
                            put_distance: int = 50,
                            call_distance: int = 50,
-                           spread_width: int = 25,
+                           spread_width: int = 10,
                            min_credit: float = 0.50) -> SimpleBacktestResult:
         """
         Run a simple Iron Condor backtest for a single day.
@@ -404,7 +404,7 @@ def run_single_day_example():
         exit_time="15:45:00",
         put_distance=50,
         call_distance=50,
-        spread_width=25,
+        spread_width=10,
         min_credit=0.50
     )
     
@@ -427,7 +427,7 @@ def run_date_range_example():
         exit_time="15:45:00",
         put_distance=50,
         call_distance=50,
-        spread_width=25,
+        spread_width=10,
         min_credit=0.50
     )
     
