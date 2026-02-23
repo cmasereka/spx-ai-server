@@ -167,7 +167,7 @@ class TradeCheckpointsResponse(BaseModel):
     checkpoint_count: int
 
 
-
+class WebSocketMessage(BaseModel):
     """WebSocket message format"""
     type: str = Field(..., description="Message type")
     backtest_id: Optional[str] = Field(None, description="Related backtest ID")
