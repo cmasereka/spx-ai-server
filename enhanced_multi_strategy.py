@@ -59,13 +59,14 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                               target_prob_itm: float = 0.15,
                               min_spread_width: int = 10,
                               decay_threshold: float = 0.05,
-                              quantity: int = 1) -> DayBacktestResult:
+                              quantity: int = 1,
+                              target_credit: Optional[float] = 0.50) -> DayBacktestResult:
         """
         Full intraday scan loop for one trading day.
         Scans every 1-min bar from 09:35 onward.
         Returns DayBacktestResult containing all trades executed that day.
         """
-        logger.info(f"Intraday scan: {date} | delta={target_delta} decay={decay_threshold}")
+        logger.info(f"Intraday scan: {date} | credit={target_credit} delta={target_delta} decay={decay_threshold}")
 
         scan_times = _build_minute_grid(date, ENTRY_SCAN_START, "15:59:00")
         trades: List[EnhancedBacktestResult] = []
@@ -214,7 +215,8 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                         if open_ic is None and open_put_spread is None and open_call_spread is None:
                             strategy = self._try_open_strategy(
                                 date, current_time, StrategyType.IRON_CONDOR,
-                                target_delta, target_prob_itm, min_spread_width, quantity
+                                target_delta, target_prob_itm, min_spread_width, quantity,
+                                target_credit=target_credit
                             )
                             if strategy:
                                 open_ic = strategy
@@ -234,7 +236,8 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                         if open_put_spread is None and open_ic is None:
                             strategy = self._try_open_strategy(
                                 date, current_time, StrategyType.PUT_SPREAD,
-                                target_delta, target_prob_itm, min_spread_width, quantity
+                                target_delta, target_prob_itm, min_spread_width, quantity,
+                                target_credit=target_credit
                             )
                             if strategy:
                                 open_put_spread = strategy
@@ -253,7 +256,8 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                         if open_call_spread is None and open_ic is None:
                             strategy = self._try_open_strategy(
                                 date, current_time, StrategyType.CALL_SPREAD,
-                                target_delta, target_prob_itm, min_spread_width, quantity
+                                target_delta, target_prob_itm, min_spread_width, quantity,
+                                target_credit=target_credit
                             )
                             if strategy:
                                 open_call_spread = strategy
@@ -336,7 +340,8 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
 
     def _try_open_strategy(self, date: str, timestamp: str, strategy_type: StrategyType,
                            target_delta: float, target_prob_itm: float,
-                           min_spread_width: int, quantity: int):
+                           min_spread_width: int, quantity: int,
+                           target_credit: Optional[float] = None):
         """Attempt to build a strategy at the given timestamp. Returns strategy or None."""
         self._last_strike_selection = None
         try:
@@ -346,7 +351,8 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                 strategy_type=strategy_type,
                 target_delta=target_delta,
                 target_prob_itm=target_prob_itm,
-                min_spread_width=min_spread_width
+                min_spread_width=min_spread_width,
+                target_credit=target_credit
             )
             if not strike_selection:
                 return None
@@ -370,7 +376,8 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                    target_prob_itm: float = 0.15,
                                    min_spread_width: int = 10,
                                    decay_threshold: float = 0.05,
-                                   quantity: int = 1) -> EnhancedBacktestResult:
+                                   quantity: int = 1,
+                                   target_credit: Optional[float] = 0.50) -> EnhancedBacktestResult:
         """Legacy single-day method — runs intraday scan and returns first trade result."""
         day_result = self.backtest_day_intraday(
             date=date,
@@ -378,7 +385,8 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
             target_prob_itm=target_prob_itm,
             min_spread_width=min_spread_width,
             decay_threshold=decay_threshold,
-            quantity=quantity
+            quantity=quantity,
+            target_credit=target_credit
         )
         if day_result.trades:
             return day_result.trades[0]
@@ -612,7 +620,8 @@ def run_enhanced_backtest():
     parser.add_argument("--date", "-d", help="Date to backtest (YYYY-MM-DD)")
     parser.add_argument("--start-date", help="Start date for range (YYYY-MM-DD)")
     parser.add_argument("--end-date", help="End date for range (YYYY-MM-DD)")
-    parser.add_argument("--target-delta", type=float, default=0.15, help="Target delta for short strikes")
+    parser.add_argument("--target-delta", type=float, default=0.15, help="Target delta for short strikes (used when --target-credit is not set)")
+    parser.add_argument("--target-credit", type=float, default=0.50, help="Target net credit per spread per share (default: 0.50)")
     parser.add_argument("--target-prob-itm", type=float, default=0.15, help="Target probability ITM")
     parser.add_argument("--decay-threshold", type=float, default=0.05, help="Decay threshold for exits")
     parser.add_argument("--min-spread-width", type=int, default=10, help="Minimum spread width")
@@ -630,7 +639,8 @@ def run_enhanced_backtest():
             target_delta=args.target_delta,
             target_prob_itm=args.target_prob_itm,
             decay_threshold=args.decay_threshold,
-            min_spread_width=args.min_spread_width
+            min_spread_width=args.min_spread_width,
+            target_credit=args.target_credit
         )
         print(f"\nDate: {day_result.date} | Trades: {day_result.trade_count} | Total P&L: ${day_result.total_pnl:.2f} | Bars scanned: {day_result.scan_minutes_checked}")
         if day_result.trades:
@@ -654,7 +664,8 @@ def run_enhanced_backtest():
                 target_delta=args.target_delta,
                 target_prob_itm=args.target_prob_itm,
                 decay_threshold=args.decay_threshold,
-                min_spread_width=args.min_spread_width
+                min_spread_width=args.min_spread_width,
+                target_credit=args.target_credit
             )
             all_trades.extend(day_result.trades)
             logger.info(f"  {date}: {day_result.trade_count} trades, P&L=${day_result.total_pnl:.2f}")

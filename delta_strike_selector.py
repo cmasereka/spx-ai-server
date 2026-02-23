@@ -67,20 +67,23 @@ class DeltaStrikeSelector:
         self.query_engine = query_engine
         self.ic_loader = ic_loader
     
-    def select_strikes_by_delta(self, 
+    def select_strikes_by_delta(self,
                               date: str,
                               timestamp: str,
                               strategy_type: StrategyType,
                               target_delta: float = 0.15,
                               target_prob_itm: float = 0.15,
-                              min_spread_width: int = 10) -> Optional[StrikeSelection]:
+                              min_spread_width: int = 10,
+                              target_credit: Optional[float] = None) -> Optional[StrikeSelection]:
         """
-        Select strikes based on target delta or probability ITM
-        
+        Select strikes based on target credit per spread (preferred) or target delta.
+
         Args:
-            target_delta: Target delta for short strike (0.10-0.30)
-            target_prob_itm: Target probability ITM for short strike (0.10-0.30) 
-            min_spread_width: Minimum spread width
+            target_delta: Target delta for short strike — used only when target_credit is None
+            target_prob_itm: Target probability ITM — used only when target_credit is None
+            min_spread_width: Spread width in strike points
+            target_credit: Desired net credit per spread per share (e.g. 0.50).
+                           Primary selection mode when provided.
         """
         
         try:
@@ -88,30 +91,30 @@ class DeltaStrikeSelector:
             spx_price = self.query_engine.get_fastest_spx_price(date, timestamp)
             if not spx_price:
                 return None
-            
+
             # Get options data
             options_data = self.query_engine.get_options_data(date, timestamp)
             if options_data is None or len(options_data) == 0:
                 return None
-            
+
             # Filter for 0DTE options
             options_data = options_data[options_data['expiration'] == date]
-            
+
+            # Choose selection method
+            if target_credit is not None:
+                put_selector  = lambda od, sp: self._select_put_spread_by_credit(od, sp, min_spread_width, target_credit)
+                call_selector = lambda od, sp: self._select_call_spread_by_credit(od, sp, min_spread_width, target_credit)
+            else:
+                put_selector  = lambda od, sp: self._select_put_spread_strikes(od, sp, target_delta, target_prob_itm, min_spread_width)
+                call_selector = lambda od, sp: self._select_call_spread_strikes(od, sp, target_delta, target_prob_itm, min_spread_width)
+
             if strategy_type == StrategyType.PUT_SPREAD:
-                return self._select_put_spread_strikes(
-                    options_data, spx_price, target_delta, target_prob_itm, min_spread_width
-                )
+                return put_selector(options_data, spx_price)
             elif strategy_type == StrategyType.CALL_SPREAD:
-                return self._select_call_spread_strikes(
-                    options_data, spx_price, target_delta, target_prob_itm, min_spread_width
-                )
+                return call_selector(options_data, spx_price)
             else:  # IRON_CONDOR — select both sides independently
-                put_strikes = self._select_put_spread_strikes(
-                    options_data, spx_price, target_delta, target_prob_itm, min_spread_width
-                )
-                call_strikes = self._select_call_spread_strikes(
-                    options_data, spx_price, target_delta, target_prob_itm, min_spread_width
-                )
+                put_strikes  = put_selector(options_data, spx_price)
+                call_strikes = call_selector(options_data, spx_price)
 
                 if put_strikes is None or call_strikes is None:
                     return None
@@ -133,6 +136,132 @@ class DeltaStrikeSelector:
             logger.error(f"Strike selection failed: {e}")
             return None
     
+    # ------------------------------------------------------------------
+    # Credit-based selection (primary)
+    # ------------------------------------------------------------------
+
+    def _select_put_spread_by_credit(self, options_data: pd.DataFrame, spx_price: float,
+                                     spread_width: int,
+                                     target_credit: float) -> Optional[StrikeSelection]:
+        """
+        Select OTM put spread whose net credit (short_mid - long_mid) is closest
+        to target_credit.  Tolerance: ±0.10 first, widened to ±0.20 if no match.
+        """
+        puts = options_data[
+            (options_data['option_type'] == 'put') &
+            (options_data['strike'] < spx_price) &
+            (options_data['ask'] > 0)
+        ].copy()
+        if len(puts) == 0:
+            return None
+
+        puts['mid'] = (puts['bid'] + puts['ask']) / 2.0
+
+        candidates = []
+        for _, short_row in puts.iterrows():
+            short_strike = float(short_row['strike'])
+            long_strike  = short_strike - spread_width
+            long_rows    = puts[puts['strike'] == long_strike]
+            if len(long_rows) == 0:
+                continue
+            long_mid   = float(long_rows.iloc[0]['mid'])
+            short_mid  = float(short_row['mid'])
+            net_credit = short_mid - long_mid
+            candidates.append((abs(net_credit - target_credit), short_strike, long_strike,
+                                short_mid, long_mid, net_credit))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda x: x[0])
+
+        # Try ±0.10 first, fall back to ±0.20
+        for tolerance in (0.10, 0.20):
+            valid = [c for c in candidates if c[0] <= tolerance]
+            if valid:
+                _, short_strike, long_strike, short_mid, long_mid, net_credit = valid[0]
+                logger.debug(f"Put spread: {short_strike:.0f}/{long_strike:.0f} credit=${net_credit:.3f} (target=${target_credit:.2f})")
+                return StrikeSelection(
+                    short_strike=short_strike,
+                    long_strike=long_strike,
+                    short_delta=abs(puts[puts['strike'] == short_strike].iloc[0]['delta']),
+                    short_prob_itm=abs(puts[puts['strike'] == short_strike].iloc[0]['delta']),
+                    spread_width=short_strike - long_strike
+                )
+
+        # Outside both tolerances — return best available
+        _, short_strike, long_strike, short_mid, long_mid, net_credit = candidates[0]
+        logger.debug(f"Put spread (outside tolerance): {short_strike:.0f}/{long_strike:.0f} credit=${net_credit:.3f}")
+        return StrikeSelection(
+            short_strike=short_strike,
+            long_strike=long_strike,
+            short_delta=abs(puts[puts['strike'] == short_strike].iloc[0]['delta']),
+            short_prob_itm=abs(puts[puts['strike'] == short_strike].iloc[0]['delta']),
+            spread_width=short_strike - long_strike
+        )
+
+    def _select_call_spread_by_credit(self, options_data: pd.DataFrame, spx_price: float,
+                                      spread_width: int,
+                                      target_credit: float) -> Optional[StrikeSelection]:
+        """
+        Select OTM call spread whose net credit (short_mid - long_mid) is closest
+        to target_credit.  Tolerance: ±0.10 first, widened to ±0.20 if no match.
+        """
+        calls = options_data[
+            (options_data['option_type'] == 'call') &
+            (options_data['strike'] > spx_price) &
+            (options_data['ask'] > 0)
+        ].copy()
+        if len(calls) == 0:
+            return None
+
+        calls['mid'] = (calls['bid'] + calls['ask']) / 2.0
+
+        candidates = []
+        for _, short_row in calls.iterrows():
+            short_strike = float(short_row['strike'])
+            long_strike  = short_strike + spread_width
+            long_rows    = calls[calls['strike'] == long_strike]
+            if len(long_rows) == 0:
+                continue
+            long_mid   = float(long_rows.iloc[0]['mid'])
+            short_mid  = float(short_row['mid'])
+            net_credit = short_mid - long_mid
+            candidates.append((abs(net_credit - target_credit), short_strike, long_strike,
+                                short_mid, long_mid, net_credit))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda x: x[0])
+
+        for tolerance in (0.10, 0.20):
+            valid = [c for c in candidates if c[0] <= tolerance]
+            if valid:
+                _, short_strike, long_strike, short_mid, long_mid, net_credit = valid[0]
+                logger.debug(f"Call spread: {short_strike:.0f}/{long_strike:.0f} credit=${net_credit:.3f} (target=${target_credit:.2f})")
+                return StrikeSelection(
+                    short_strike=short_strike,
+                    long_strike=long_strike,
+                    short_delta=calls[calls['strike'] == short_strike].iloc[0]['delta'],
+                    short_prob_itm=calls[calls['strike'] == short_strike].iloc[0]['delta'],
+                    spread_width=long_strike - short_strike
+                )
+
+        _, short_strike, long_strike, short_mid, long_mid, net_credit = candidates[0]
+        logger.debug(f"Call spread (outside tolerance): {short_strike:.0f}/{long_strike:.0f} credit=${net_credit:.3f}")
+        return StrikeSelection(
+            short_strike=short_strike,
+            long_strike=long_strike,
+            short_delta=calls[calls['strike'] == short_strike].iloc[0]['delta'],
+            short_prob_itm=calls[calls['strike'] == short_strike].iloc[0]['delta'],
+            spread_width=long_strike - short_strike
+        )
+
+    # ------------------------------------------------------------------
+    # Delta-based selection (legacy fallback)
+    # ------------------------------------------------------------------
+
     def _select_put_spread_strikes(self, options_data: pd.DataFrame, spx_price: float,
                                  target_delta: float, target_prob_itm: float,
                                  min_spread_width: int) -> Optional[StrikeSelection]:

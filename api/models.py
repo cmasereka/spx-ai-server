@@ -45,7 +45,8 @@ class BacktestRequest(BaseModel):
     strategy_type: StrategyTypeEnum = Field(StrategyTypeEnum.IRON_CONDOR, description="Options strategy type")
     
     # Strike selection parameters
-    target_delta: float = Field(0.15, ge=0.05, le=0.45, description="Target delta for short strikes")
+    target_delta: float = Field(0.15, ge=0.05, le=0.45, description="Target delta for short strikes (used when target_credit is None)")
+    target_credit: Optional[float] = Field(0.50, ge=0.05, le=5.0, description="Target net credit per spread (per share). IC total will be 2x this value.")
     put_distance: int = Field(50, ge=10, le=200, description="Distance for put strikes from underlying")
     call_distance: int = Field(50, ge=10, le=200, description="Distance for call strikes from underlying")
     spread_width: int = Field(10, ge=5, le=100, description="Width of spreads")
