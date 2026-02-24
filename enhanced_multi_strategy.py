@@ -36,6 +36,11 @@ TREND_FILTER_POINTS           = 30  # SPX points moved → market is trending; b
 TREND_TIGHTEN_CONSECUTIVE     = 3   # Consecutive adverse bars before SL tightens
 TREND_TIGHTEN_FACTOR          = 0.5 # SL tightens to this fraction of configured stop_loss
 
+# IC daily-drift guards
+IC_DAILY_DRIFT_BLOCK    = 40.0      # Block IC entirely if SPX already down >= this many pts from 9:31 open
+IC_MIN_DRIFT_FOR_DELAY  = 30.0      # If drifted >= this, no IC before IC_MIN_ENTRY_HOUR
+IC_MIN_ENTRY_HOUR       = "12:00:00"  # Earliest IC entry allowed on a drifted day
+
 # Strategy mode constants (match BacktestStrategyEnum values)
 STRATEGY_IRON_CONDOR     = "iron_condor"
 STRATEGY_CREDIT_SPREADS  = "credit_spreads"
@@ -119,6 +124,11 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
         if date not in self.available_dates:
             return DayBacktestResult(date=date, trades=[], total_pnl=0.0,
                                      trade_count=0, scan_minutes_checked=0)
+
+        # Fetch the opening SPX price once for daily-drift IC guards.
+        # 09:31 is the first real bar; fall back to 0 (guard is disabled) if unavailable.
+        spx_open = self.enhanced_query_engine.get_fastest_spx_price(date, "09:31:00") or 0.0
+        logger.debug(f"Daily drift guard: SPX open @ 09:31 = {spx_open}")
 
         # Build a per-run monitor with the request's risk params
         monitor = IntradayPositionMonitor(
@@ -425,11 +435,28 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                             f"({TREND_FILTER_POINTS}+ pts over {TREND_FILTER_LOOKBACK_MINUTES}m)"
                         )
 
+                    # --- IC daily-drift guards ---
+                    # Guard 1: absolute drift block — if SPX has fallen >= IC_DAILY_DRIFT_BLOCK
+                    #          from the opening price, no IC for the rest of the day.
+                    # Guard 2: time-of-day delay — if SPX has fallen >= IC_MIN_DRIFT_FOR_DELAY
+                    #          from open AND it is still before IC_MIN_ENTRY_HOUR, skip IC
+                    #          (allow re-entry after noon if market has stabilised).
+                    day_drift = (entry_spx - spx_open) if spx_open > 0 else 0.0
+                    ic_blocked_by_drift = (
+                        day_drift <= -IC_DAILY_DRIFT_BLOCK or
+                        (day_drift <= -IC_MIN_DRIFT_FOR_DELAY and current_time < IC_MIN_ENTRY_HOUR)
+                    )
+                    if ic_blocked_by_drift:
+                        logger.debug(
+                            f"IC drift guard active at {current_time}: "
+                            f"drift={day_drift:+.1f} pts from open ({spx_open:.1f})"
+                        )
+
                     # Determine which entry types are permitted by this strategy mode.
                     # On trend days, IC is blocked; asymmetric spread is used instead
                     # (call spread on down-trend — sell premium above a falling market;
                     #  put spread on up-trend — sell premium below a rising market).
-                    allow_ic      = strategy_mode in (STRATEGY_IRON_CONDOR, STRATEGY_IC_CREDIT_SPREADS) and not is_trending
+                    allow_ic      = strategy_mode in (STRATEGY_IRON_CONDOR, STRATEGY_IC_CREDIT_SPREADS) and not is_trending and not ic_blocked_by_drift
                     allow_spreads = strategy_mode in (STRATEGY_CREDIT_SPREADS, STRATEGY_IC_CREDIT_SPREADS)
 
                     # Asymmetric override: in iron_condor or ic_credit_spreads mode,
