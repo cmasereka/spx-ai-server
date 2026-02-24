@@ -36,11 +36,6 @@ TREND_FILTER_POINTS           = 30  # SPX points moved → market is trending; b
 TREND_TIGHTEN_CONSECUTIVE     = 3   # Consecutive adverse bars before SL tightens
 TREND_TIGHTEN_FACTOR          = 0.5 # SL tightens to this fraction of configured stop_loss
 
-# IC daily-drift guards
-IC_DAILY_DRIFT_BLOCK    = 25.0      # Block IC/put-spread/call-spread on large drift days (>= 25pts from open)
-IC_MIN_DRIFT_FOR_DELAY  = 20.0      # If drifted >= this, no IC before IC_MIN_ENTRY_HOUR
-IC_MIN_ENTRY_HOUR       = "12:00:00"  # Earliest IC entry allowed on a drifted day
-
 # Strategy mode constants (match BacktestStrategyEnum values)
 STRATEGY_IRON_CONDOR     = "iron_condor"
 STRATEGY_CREDIT_SPREADS  = "credit_spreads"
@@ -124,18 +119,6 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
         if date not in self.available_dates:
             return DayBacktestResult(date=date, trades=[], total_pnl=0.0,
                                      trade_count=0, scan_minutes_checked=0)
-
-        # Fetch the opening SPX price once for daily-drift guards.
-        # Try progressively later times so we always get a real price even if
-        # the 09:30 bar is missing. spx_open stays None until confirmed; the
-        # guard is applied lazily on the first bar where we have a valid open.
-        spx_open: Optional[float] = None
-        for _open_time in ("09:30:00", "09:31:00", "09:32:00", "09:35:00"):
-            _p = self.enhanced_query_engine.get_fastest_spx_price(date, _open_time)
-            if _p and _p > 0:
-                spx_open = float(_p)
-                break
-        logger.debug(f"Daily drift guard: SPX open = {spx_open}")
 
         # Build a per-run monitor with the request's risk params
         monitor = IntradayPositionMonitor(
@@ -442,44 +425,11 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                             f"({TREND_FILTER_POINTS}+ pts over {TREND_FILTER_LOOKBACK_MINUTES}m)"
                         )
 
-                    # --- Daily-drift guards ---
-                    # day_drift > 0 means SPX is above the open; < 0 means below.
-                    #
-                    # IC guards:
-                    #   Guard 1: absolute block — SPX already down >= IC_DAILY_DRIFT_BLOCK → no IC
-                    #   Guard 2: time-delay   — SPX down >= IC_MIN_DRIFT_FOR_DELAY before noon → no IC
-                    #
-                    # Spread directional guards:
-                    #   On a significant down day (drift <= -IC_DAILY_DRIFT_BLOCK) block put
-                    #   spreads — the most dangerous trade on an already-fallen market.
-                    #   On a significant up day (drift >= +IC_DAILY_DRIFT_BLOCK) block call
-                    #   spreads symmetrically.
-                    #   The safe side (call spread on down days, put spread on up days) remains open.
-                    #
-                    # If spx_open was not available at startup, latch the first valid
-                    # entry_spx we see as the reference open price.
-                    if spx_open is None and entry_spx > 0:
-                        spx_open = entry_spx
-                        logger.debug(f"Daily drift guard: latched SPX open = {spx_open} at {current_time}")
-                    day_drift = (entry_spx - spx_open) if (spx_open is not None and spx_open > 0) else 0.0
-                    ic_blocked_by_drift = (
-                        day_drift <= -IC_DAILY_DRIFT_BLOCK or
-                        (day_drift <= -IC_MIN_DRIFT_FOR_DELAY and current_time < IC_MIN_ENTRY_HOUR)
-                    )
-                    put_spread_blocked_by_drift  = day_drift <= -IC_DAILY_DRIFT_BLOCK
-                    call_spread_blocked_by_drift = day_drift >= +IC_DAILY_DRIFT_BLOCK
-                    if ic_blocked_by_drift or put_spread_blocked_by_drift or call_spread_blocked_by_drift:
-                        logger.debug(
-                            f"Drift guard at {current_time}: drift={day_drift:+.1f} pts from open "
-                            f"({spx_open:.1f}) | ic_blocked={ic_blocked_by_drift} "
-                            f"put_blocked={put_spread_blocked_by_drift} call_blocked={call_spread_blocked_by_drift}"
-                        )
-
                     # Determine which entry types are permitted by this strategy mode.
                     # On trend days, IC is blocked; asymmetric spread is used instead
                     # (call spread on down-trend — sell premium above a falling market;
                     #  put spread on up-trend — sell premium below a rising market).
-                    allow_ic      = strategy_mode in (STRATEGY_IRON_CONDOR, STRATEGY_IC_CREDIT_SPREADS) and not is_trending and not ic_blocked_by_drift
+                    allow_ic      = strategy_mode in (STRATEGY_IRON_CONDOR, STRATEGY_IC_CREDIT_SPREADS) and not is_trending
                     allow_spreads = strategy_mode in (STRATEGY_CREDIT_SPREADS, STRATEGY_IC_CREDIT_SPREADS)
 
                     # Asymmetric override: in iron_condor or ic_credit_spreads mode,
@@ -525,7 +475,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                 }
                                 logger.info(f"Opened IC at {current_time}")
 
-                    elif selection.strategy_type == StrategyType.PUT_SPREAD and allow_spreads and not put_spread_blocked_by_drift:
+                    elif selection.strategy_type == StrategyType.PUT_SPREAD and allow_spreads:
                         if open_put_spread is None and open_ic is None:
                             strategy = self._try_open_strategy(
                                 date, current_time, StrategyType.PUT_SPREAD,
@@ -547,7 +497,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                 }
                                 logger.info(f"Opened put spread at {current_time}")
 
-                    elif selection.strategy_type == StrategyType.CALL_SPREAD and allow_spreads and not call_spread_blocked_by_drift:
+                    elif selection.strategy_type == StrategyType.CALL_SPREAD and allow_spreads:
                         if open_call_spread is None and open_ic is None:
                             strategy = self._try_open_strategy(
                                 date, current_time, StrategyType.CALL_SPREAD,
