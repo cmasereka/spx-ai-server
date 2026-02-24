@@ -48,16 +48,16 @@ class BacktestRequest(BaseModel):
     single_date: Optional[date] = Field(None, description="Single date for backtesting")
 
     # Strike selection
-    target_credit: float = Field(0.50, ge=0.05, le=5.0, description="Target net credit per spread per share. IC total will be 2x this value.")
+    target_credit: float = Field(0.40, ge=0.05, le=5.0, description="Target net credit per spread per share. IC total will be 2x this value.")
     spread_width: int = Field(10, ge=5, le=100, description="Width of each spread in strike points")
 
     # Position sizing
     contracts: int = Field(1, ge=1, le=100, description="Number of contracts per position")
 
     # Risk management
-    take_profit: float = Field(0.10, ge=0.01, le=10.0, description="Take profit: exit when cost-to-close per spread per share drops to or below this absolute value. E.g. 0.10 exits when closing costs $0.10/share.")
-    stop_loss: float = Field(2.0, ge=0.10, le=20.0, description="Stop loss: exit when cost-to-close per spread per share reaches this absolute value. E.g. 2.0 exits when closing costs $2.00/share.")
-    monitor_interval: int = Field(1, ge=1, le=15, description="Minutes between position checks. 1 = every bar, 5 = every 5 minutes.")
+    take_profit: float = Field(0.05, ge=0.01, le=10.0, description="Take profit: exit when cost-to-close per spread per share drops to or below this absolute value. E.g. 0.10 exits when closing costs $0.10/share.")
+    stop_loss: float = Field(6.0, ge=0.10, le=20.0, description="Stop loss: exit when cost-to-close per spread per share reaches this absolute value. E.g. 2.0 exits when closing costs $2.00/share.")
+    monitor_interval: int = Field(5, ge=1, le=15, description="Minutes between position checks. 1 = every bar, 5 = every 5 minutes.")
 
     @field_validator('start_date', 'end_date', 'single_date')
     @classmethod
