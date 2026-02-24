@@ -37,8 +37,8 @@ TREND_TIGHTEN_CONSECUTIVE     = 3   # Consecutive adverse bars before SL tighten
 TREND_TIGHTEN_FACTOR          = 0.5 # SL tightens to this fraction of configured stop_loss
 
 # IC daily-drift guards
-IC_DAILY_DRIFT_BLOCK    = 40.0      # Block IC entirely if SPX already down >= this many pts from 9:31 open
-IC_MIN_DRIFT_FOR_DELAY  = 30.0      # If drifted >= this, no IC before IC_MIN_ENTRY_HOUR
+IC_DAILY_DRIFT_BLOCK    = 25.0      # Block IC/put-spread/call-spread on large drift days (>= 25pts from open)
+IC_MIN_DRIFT_FOR_DELAY  = 20.0      # If drifted >= this, no IC before IC_MIN_ENTRY_HOUR
 IC_MIN_ENTRY_HOUR       = "12:00:00"  # Earliest IC entry allowed on a drifted day
 
 # Strategy mode constants (match BacktestStrategyEnum values)
