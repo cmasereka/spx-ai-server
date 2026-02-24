@@ -381,7 +381,7 @@ class TestIntradayPositionMonitor:
         return leg
 
     def _make_ic_strategy(self, put_entry=2.0, put_current=1.5,
-                          call_entry=2.0, call_current=1.5):
+                          call_entry=2.0, call_current=1.5, quantity=1):
         """Create a mock IC strategy with 4 legs."""
         strategy = Mock()
         # Put spread: 1 short put, 1 long put
@@ -394,12 +394,14 @@ class TestIntradayPositionMonitor:
         # entry_credit = net credit for both sides combined
         strategy.entry_credit = (put_entry * 100 - put_entry * 0.5 * 100 +
                                  call_entry * 100 - call_entry * 0.5 * 100)
+        strategy.quantity = quantity
         return strategy
 
     def test_check_decay_spread_exits_at_threshold(self):
         """Spread should exit when cost/share <= take_profit."""
         strategy = Mock()
         strategy.entry_credit = 100.0
+        strategy.quantity = 1
         leg = self._make_leg('put', 2.0, 0.001, short=True)  # near zero cost
         strategy.legs = [leg]
 
@@ -415,6 +417,7 @@ class TestIntradayPositionMonitor:
         """Spread should NOT exit when decay_ratio > threshold."""
         strategy = Mock()
         strategy.entry_credit = 100.0
+        strategy.quantity = 1
         leg = self._make_leg('put', 2.0, 1.0, short=True)  # 50% remaining
         strategy.legs = [leg]
 
@@ -488,6 +491,7 @@ class TestIntradayPositionMonitor:
         """Exit cost calculation with no legs returns no-exit and zero cost."""
         strategy = Mock()
         strategy.entry_credit = 0
+        strategy.quantity = 1
         strategy.legs = []
 
         should_exit, cost, reason = self.monitor.check_decay_at_time(
@@ -502,3 +506,52 @@ class TestIntradayPositionMonitor:
         assert self.monitor.take_profit == 0.10
         assert self.monitor.stop_loss == 2.0
         assert self.monitor.monitor_interval == 1
+
+    def test_multi_contract_tp_sl_same_as_single_contract(self):
+        """
+        TP/SL fires at the same per-share cost regardless of quantity.
+        1 contract at $0.05/share and 2 contracts at $0.05/share should both hit take_profit.
+        """
+        # 1 contract: cost = $0.05/share × 100 = $5 total
+        single = Mock()
+        single.quantity = 1
+        single.legs = [self._make_leg('put', 2.0, 0.05, short=True)]
+
+        # 2 contracts: same $0.05/share, but total cost = $5 × 2 = $10
+        double = Mock()
+        double.quantity = 2
+        leg_a = self._make_leg('put', 2.0, 0.05, short=True)
+        leg_a.quantity = 2
+        double.legs = [leg_a]
+
+        exit1, cost1, reason1 = self.monitor.check_decay_at_time(
+            single, StrategyType.PUT_SPREAD, '2026-02-10', '10:30:00'
+        )
+        exit2, cost2, reason2 = self.monitor.check_decay_at_time(
+            double, StrategyType.PUT_SPREAD, '2026-02-10', '10:30:00'
+        )
+
+        # Both should exit (take profit) at the same per-share threshold
+        assert exit1 is True
+        assert exit2 is True
+        assert 'take profit' in reason1.lower()
+        assert 'take profit' in reason2.lower()
+        # Dollar cost is 2× for double contracts
+        assert cost2 == pytest.approx(cost1 * 2, rel=1e-6)
+
+    def test_multi_contract_no_exit_matches_single_contract(self):
+        """
+        A position that does NOT exit on 1 contract should also NOT exit on 10 contracts,
+        because the per-share cost is the same.
+        """
+        for qty in (1, 2, 5, 10):
+            strategy = Mock()
+            strategy.quantity = qty
+            leg = self._make_leg('put', 2.0, 1.0, short=True)  # $1/share — above TP, below SL
+            leg.quantity = qty
+            strategy.legs = [leg]
+
+            should_exit, _, _ = self.monitor.check_decay_at_time(
+                strategy, StrategyType.PUT_SPREAD, '2026-02-10', '10:30:00'
+            )
+            assert should_exit is False, f"Should not exit at quantity={qty}"

@@ -514,12 +514,13 @@ class IntradayPositionMonitor:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _should_exit(self, current_cost: float) -> Tuple[bool, str]:
+    def _should_exit(self, current_cost: float, quantity: int = 1) -> Tuple[bool, str]:
         """
-        Given the current cost-to-close for a spread (per contract = ×100),
+        Given the current cost-to-close for a spread (already scaled by quantity × 100),
         return (should_exit, reason) based on per-share absolute thresholds.
+        Divides by (100 × quantity) to get the per-share cost for a single contract.
         """
-        cost_per_share = current_cost / 100.0
+        cost_per_share = current_cost / (100.0 * max(quantity, 1))
 
         if cost_per_share <= self.take_profit:
             return True, f"Take profit hit (${cost_per_share:.3f}/share <= ${self.take_profit:.2f})"
@@ -527,9 +528,9 @@ class IntradayPositionMonitor:
             return True, f"Stop loss hit (${cost_per_share:.3f}/share >= ${self.stop_loss:.2f})"
         return False, ""
 
-    def _should_exit_ic_side(self, side_cost: float) -> Tuple[bool, str]:
+    def _should_exit_ic_side(self, side_cost: float, quantity: int = 1) -> Tuple[bool, str]:
         """Same check for a single IC side (put or call spread)."""
-        return self._should_exit(side_cost)
+        return self._should_exit(side_cost, quantity)
 
     def check_decay(self, strategy, strategy_type: StrategyType) -> Tuple[bool, float, str]:
         """
@@ -541,8 +542,9 @@ class IntradayPositionMonitor:
         except Exception:
             pass
 
+        quantity = getattr(strategy, 'quantity', 1)
         current_cost = self._calculate_exit_cost(strategy)
-        should_exit, reason = self._should_exit(current_cost)
+        should_exit, reason = self._should_exit(current_cost, quantity)
         return should_exit, current_cost, reason
 
     def check_decay_at_time(self, strategy, strategy_type: StrategyType,
@@ -556,8 +558,9 @@ class IntradayPositionMonitor:
         except Exception as e:
             logger.debug(f"Price update failed at {current_time}: {e}")
 
+        quantity = getattr(strategy, 'quantity', 1)
         current_cost = self._calculate_exit_cost(strategy)
-        should_exit, reason = self._should_exit(current_cost)
+        should_exit, reason = self._should_exit(current_cost, quantity)
         return should_exit, current_cost, reason
 
     def check_ic_leg_decay(self, strategy, date: str, current_time: str,
@@ -573,19 +576,20 @@ class IntradayPositionMonitor:
             logger.debug(f"IC price update failed at {current_time}: {e}")
 
         put_done, call_done, put_cost, call_cost = self._check_ic_leg_decay_values(strategy)
+        quantity = getattr(strategy, 'quantity', 1)
 
         if put_done and not ic_leg_status.put_side_closed:
             ic_leg_status.put_side_closed = True
             ic_leg_status.put_side_exit_time = current_time
             ic_leg_status.put_side_exit_cost = put_cost
-            _, reason = self._should_exit_ic_side(put_cost)
+            _, reason = self._should_exit_ic_side(put_cost, quantity)
             ic_leg_status.put_side_exit_reason = reason
 
         if call_done and not ic_leg_status.call_side_closed:
             ic_leg_status.call_side_closed = True
             ic_leg_status.call_side_exit_time = current_time
             ic_leg_status.call_side_exit_cost = call_cost
-            _, reason = self._should_exit_ic_side(call_cost)
+            _, reason = self._should_exit_ic_side(call_cost, quantity)
             ic_leg_status.call_side_exit_reason = reason
 
         return ic_leg_status
@@ -594,6 +598,7 @@ class IntradayPositionMonitor:
         """
         For IC: returns (put_side_done, call_side_done, put_cost, call_cost).
         A side is 'done' when its per-share cost hits take_profit or stop_loss.
+        Costs are already scaled by quantity; quantity is extracted from the strategy.
         """
         try:
             put_legs = [l for l in strategy.legs if l.option_type.value == 'put']
@@ -602,11 +607,13 @@ class IntradayPositionMonitor:
             put_legs = [l for l in strategy.legs if str(l.option_type).lower() == 'put']
             call_legs = [l for l in strategy.legs if str(l.option_type).lower() == 'call']
 
+        quantity = getattr(strategy, 'quantity', 1)
+
         def _side_cost(legs) -> float:
             """Return current cost to close for a set of legs."""
             current_cost = 0.0
             for leg in legs:
-                quantity = getattr(leg, 'quantity', 1)
+                leg_qty = getattr(leg, 'quantity', 1)
                 entry_price = getattr(leg, 'entry_price', 0)
                 curr_price = getattr(leg, 'current_price', 0) or entry_price
                 is_short = getattr(leg, 'position_side', None)
@@ -615,14 +622,14 @@ class IntradayPositionMonitor:
                 except AttributeError:
                     short = str(is_short).upper() == 'SHORT'
                 sign = 1 if short else -1
-                current_cost += curr_price * quantity * 100 * sign
+                current_cost += curr_price * leg_qty * 100 * sign
             return max(current_cost, 0.0)
 
         put_current_cost  = _side_cost(put_legs)
         call_current_cost = _side_cost(call_legs)
 
-        put_done,  _ = self._should_exit_ic_side(put_current_cost)
-        call_done, _ = self._should_exit_ic_side(call_current_cost)
+        put_done,  _ = self._should_exit_ic_side(put_current_cost,  quantity)
+        call_done, _ = self._should_exit_ic_side(call_current_cost, quantity)
 
         return put_done, call_done, put_current_cost, call_current_cost
 

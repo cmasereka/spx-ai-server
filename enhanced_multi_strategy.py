@@ -127,15 +127,16 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
 
                 # Snapshot this bar (prices already updated by check_ic_leg_decay)
                 ic_entry_credit = getattr(open_ic, 'entry_credit', 0)
+                ic_quantity = getattr(open_ic, 'quantity', 1)
                 put_cost_ps, call_cost_ps = 0.0, 0.0
                 try:
                     _, _, raw_put, raw_call = monitor._check_ic_leg_decay_values(open_ic)
-                    put_cost_ps  = round(raw_put  / 100, 4)
-                    call_cost_ps = round(raw_call / 100, 4)
+                    put_cost_ps  = round(raw_put  / (100.0 * ic_quantity), 4)
+                    call_cost_ps = round(raw_call / (100.0 * ic_quantity), 4)
                 except Exception:
                     pass
-                total_cost_ps  = round((put_cost_ps + call_cost_ps), 4)
-                entry_credit_ps = round(ic_entry_credit / 100, 4)
+                total_cost_ps   = round((put_cost_ps + call_cost_ps), 4)
+                entry_credit_ps = round(ic_entry_credit / (100.0 * ic_quantity), 4)
                 spx_now = self.enhanced_query_engine.get_fastest_spx_price(date, current_time) or 0
                 ic_checkpoints.append({
                     "time": current_time,
@@ -193,8 +194,9 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
 
                 # Snapshot this bar
                 ps_entry_credit = getattr(open_put_spread, 'entry_credit', 0)
-                entry_credit_ps = round(ps_entry_credit / 100, 4)
-                cost_ps = round(current_cost / 100, 4)
+                ps_quantity = getattr(open_put_spread, 'quantity', 1)
+                entry_credit_ps = round(ps_entry_credit / (100.0 * ps_quantity), 4)
+                cost_ps = round(current_cost / (100.0 * ps_quantity), 4)
                 spx_now = self.enhanced_query_engine.get_fastest_spx_price(date, current_time) or 0
                 put_spread_checkpoints.append({
                     "time": current_time,
@@ -243,8 +245,9 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
 
                 # Snapshot this bar
                 cs_entry_credit = getattr(open_call_spread, 'entry_credit', 0)
-                entry_credit_ps = round(cs_entry_credit / 100, 4)
-                cost_ps = round(current_cost / 100, 4)
+                cs_quantity = getattr(open_call_spread, 'quantity', 1)
+                entry_credit_ps = round(cs_entry_credit / (100.0 * cs_quantity), 4)
+                cost_ps = round(current_cost / (100.0 * cs_quantity), 4)
                 spx_now = self.enhanced_query_engine.get_fastest_spx_price(date, current_time) or 0
                 call_spread_checkpoints.append({
                     "time": current_time,
@@ -380,8 +383,9 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                 exit_spx = self.enhanced_query_engine.get_fastest_spx_price(date, FINAL_EXIT_TIME) or meta.get('entry_spx', 0)
 
                 # Add final force-close checkpoint
-                entry_credit_ps = round(entry_credit / 100, 4)
-                cost_ps = round(exit_cost / 100, 4)
+                pos_quantity = getattr(open_pos, 'quantity', 1)
+                entry_credit_ps = round(entry_credit / (100.0 * pos_quantity), 4)
+                cost_ps = round(exit_cost / (100.0 * pos_quantity), 4)
                 force_checkpoint: dict = {
                     "time": FINAL_EXIT_TIME,
                     "spx": round(exit_spx, 2),
