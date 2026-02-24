@@ -30,6 +30,12 @@ LAST_ENTRY_TIME     = "14:00:00"   # No new entries at or after 2 PM
 FINAL_EXIT_TIME     = "16:00:00"   # Hold to expiry (market close)
 MIN_DISTANCE_FROM_SPX = 50.0       # Short strike must be >= $50 away from SPX
 
+# Trend filter
+TREND_FILTER_LOOKBACK_MINUTES = 30  # How far back to measure trend
+TREND_FILTER_POINTS           = 30  # SPX points moved → market is trending; block IC, use asymmetric spread
+TREND_TIGHTEN_CONSECUTIVE     = 3   # Consecutive adverse bars before SL tightens
+TREND_TIGHTEN_FACTOR          = 0.5 # SL tightens to this fraction of configured stop_loss
+
 # Strategy mode constants (match BacktestStrategyEnum values)
 STRATEGY_IRON_CONDOR     = "iron_condor"
 STRATEGY_CREDIT_SPREADS  = "credit_spreads"
@@ -54,6 +60,31 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
         self.delta_selector = DeltaStrikeSelector(self.enhanced_query_engine, self.ic_loader)
         self.position_monitor = PositionMonitor(self.enhanced_query_engine, self.strategy_builder)
         self.intraday_monitor = IntradayPositionMonitor(self.enhanced_query_engine, self.strategy_builder)
+
+    # ------------------------------------------------------------------
+    # Trend detection helpers
+    # ------------------------------------------------------------------
+
+    def _get_trend_state(self, date: str, current_time: str,
+                         spx_history: pd.Series) -> Tuple[bool, str]:
+        """
+        Return (is_trending, direction) based on the net SPX move over the last
+        TREND_FILTER_LOOKBACK_MINUTES bars.
+
+        direction: 'down' | 'up' | 'flat'
+        is_trending is True when |net_move| >= TREND_FILTER_POINTS.
+        """
+        if len(spx_history) < TREND_FILTER_LOOKBACK_MINUTES:
+            return False, 'flat'
+
+        lookback = spx_history.tail(TREND_FILTER_LOOKBACK_MINUTES)
+        net_move = lookback.iloc[-1] - lookback.iloc[0]
+
+        if net_move <= -TREND_FILTER_POINTS:
+            return True, 'down'
+        elif net_move >= TREND_FILTER_POINTS:
+            return True, 'up'
+        return False, 'flat'
 
     # ------------------------------------------------------------------
     # Intraday multi-trade scan loop
@@ -112,6 +143,16 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
         put_spread_checkpoints: list = []
         call_spread_checkpoints: list = []
 
+        # Adverse-bar counters for dynamic SL tightening (Recommendation 5).
+        # Incremented each check bar where cost increased vs. previous bar;
+        # reset to 0 when cost decreases or a new position is opened.
+        _ic_adverse_bars   = 0
+        _ps_adverse_bars   = 0
+        _cs_adverse_bars   = 0
+        _ic_prev_cost      = 0.0
+        _ps_prev_cost      = 0.0
+        _cs_prev_cost      = 0.0
+
         for bar_index, current_time in enumerate(scan_times):
             is_past_entry_cutoff = current_time >= LAST_ENTRY_TIME
             is_final_bar         = current_time >= FINAL_EXIT_TIME
@@ -121,6 +162,29 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
 
             # --- 1. Monitor IC legs independently ---
             if open_ic is not None and ic_leg_status is not None and is_check_bar:
+                # Dynamic SL tightening: after N consecutive adverse bars,
+                # tighten stop_loss to TREND_TIGHTEN_FACTOR × configured value
+                ic_total_cost = (ic_leg_status.put_side_exit_cost if ic_leg_status.put_side_closed else 0) + \
+                                (ic_leg_status.call_side_exit_cost if ic_leg_status.call_side_closed else 0)
+                if not ic_leg_status.put_side_closed or not ic_leg_status.call_side_closed:
+                    try:
+                        _, _, _rp, _rc = monitor._check_ic_leg_decay_values(open_ic)
+                        ic_total_cost = (_rp if not ic_leg_status.put_side_closed else 0) + \
+                                        (_rc if not ic_leg_status.call_side_closed else 0)
+                    except Exception:
+                        pass
+                if ic_total_cost > _ic_prev_cost and _ic_prev_cost > 0:
+                    _ic_adverse_bars += 1
+                else:
+                    _ic_adverse_bars = 0
+                _ic_prev_cost = ic_total_cost
+
+                if _ic_adverse_bars >= TREND_TIGHTEN_CONSECUTIVE:
+                    monitor.stop_loss = stop_loss * TREND_TIGHTEN_FACTOR
+                    logger.debug(f"IC SL tightened to {monitor.stop_loss:.2f} after {_ic_adverse_bars} adverse bars at {current_time}")
+                else:
+                    monitor.stop_loss = stop_loss
+
                 ic_leg_status = monitor.check_ic_leg_decay(
                     open_ic, date, current_time, ic_leg_status
                 )
@@ -205,9 +269,23 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
 
             # --- 2. Monitor put spread ---
             if open_put_spread is not None and is_check_bar:
+                # Dynamic SL tightening for put spread
+                if current_time != FINAL_EXIT_TIME:
+                    try:
+                        _ps_current = monitor._calculate_exit_cost(open_put_spread)
+                    except Exception:
+                        _ps_current = _ps_prev_cost
+                    if _ps_current > _ps_prev_cost and _ps_prev_cost > 0:
+                        _ps_adverse_bars += 1
+                    else:
+                        _ps_adverse_bars = 0
+                    _ps_prev_cost = _ps_current
+                    monitor.stop_loss = stop_loss * TREND_TIGHTEN_FACTOR if _ps_adverse_bars >= TREND_TIGHTEN_CONSECUTIVE else stop_loss
+
                 should_exit, current_cost, reason = monitor.check_decay_at_time(
                     open_put_spread, StrategyType.PUT_SPREAD, date, current_time
                 )
+                monitor.stop_loss = stop_loss  # restore after check
 
                 # At final bar use intrinsic settlement value, not stale market price
                 spx_now = self.enhanced_query_engine.get_fastest_spx_price(date, current_time) or 0
@@ -262,9 +340,23 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
 
             # --- 3. Monitor call spread ---
             if open_call_spread is not None and is_check_bar:
+                # Dynamic SL tightening for call spread
+                if current_time != FINAL_EXIT_TIME:
+                    try:
+                        _cs_current = monitor._calculate_exit_cost(open_call_spread)
+                    except Exception:
+                        _cs_current = _cs_prev_cost
+                    if _cs_current > _cs_prev_cost and _cs_prev_cost > 0:
+                        _cs_adverse_bars += 1
+                    else:
+                        _cs_adverse_bars = 0
+                    _cs_prev_cost = _cs_current
+                    monitor.stop_loss = stop_loss * TREND_TIGHTEN_FACTOR if _cs_adverse_bars >= TREND_TIGHTEN_CONSECUTIVE else stop_loss
+
                 should_exit, current_cost, reason = monitor.check_decay_at_time(
                     open_call_spread, StrategyType.CALL_SPREAD, date, current_time
                 )
+                monitor.stop_loss = stop_loss  # restore after check
 
                 # At final bar use intrinsic settlement value, not stale market price
                 spx_now = self.enhanced_query_engine.get_fastest_spx_price(date, current_time) or 0
@@ -325,20 +417,53 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     selection = self.strategy_selector.select_strategy(indicators)
                     entry_spx = self.enhanced_query_engine.get_fastest_spx_price(date, current_time) or 0
 
-                    # Determine which entry types are permitted by this strategy mode
-                    allow_ic      = strategy_mode in (STRATEGY_IRON_CONDOR, STRATEGY_IC_CREDIT_SPREADS)
+                    # --- Trend filter ---
+                    is_trending, trend_dir = self._get_trend_state(date, current_time, spx_history)
+                    if is_trending:
+                        logger.debug(
+                            f"Trend detected at {current_time}: {trend_dir} "
+                            f"({TREND_FILTER_POINTS}+ pts over {TREND_FILTER_LOOKBACK_MINUTES}m)"
+                        )
+
+                    # Determine which entry types are permitted by this strategy mode.
+                    # On trend days, IC is blocked; asymmetric spread is used instead
+                    # (call spread on down-trend — sell premium above a falling market;
+                    #  put spread on up-trend — sell premium below a rising market).
+                    allow_ic      = strategy_mode in (STRATEGY_IRON_CONDOR, STRATEGY_IC_CREDIT_SPREADS) and not is_trending
                     allow_spreads = strategy_mode in (STRATEGY_CREDIT_SPREADS, STRATEGY_IC_CREDIT_SPREADS)
+
+                    # Asymmetric override: in iron_condor or ic_credit_spreads mode,
+                    # when trending, allow the safe-side spread only
+                    if is_trending and strategy_mode in (STRATEGY_IRON_CONDOR, STRATEGY_IC_CREDIT_SPREADS):
+                        allow_spreads = True
+                        # Override selection to the safe-side spread
+                        if trend_dir == 'down':
+                            selection = StrategySelection(
+                                strategy_type=StrategyType.CALL_SPREAD,
+                                market_signal=MarketSignal.BEARISH,
+                                confidence=selection.confidence,
+                                reason=f"Trend override (down {trend_dir}) → Call Credit Spread only"
+                            )
+                        else:
+                            selection = StrategySelection(
+                                strategy_type=StrategyType.PUT_SPREAD,
+                                market_signal=MarketSignal.BULLISH,
+                                confidence=selection.confidence,
+                                reason=f"Trend override (up {trend_dir}) → Put Credit Spread only"
+                            )
 
                     if selection.strategy_type == StrategyType.IRON_CONDOR and allow_ic:
                         if open_ic is None and open_put_spread is None and open_call_spread is None:
                             strategy = self._try_open_strategy(
                                 date, current_time, StrategyType.IRON_CONDOR,
                                 target_delta, target_prob_itm, min_spread_width, quantity,
-                                target_credit=target_credit
+                                target_credit=target_credit, spx_history=spx_history
                             )
                             if strategy:
                                 open_ic = strategy
                                 ic_leg_status = IronCondorLegStatus()
+                                _ic_adverse_bars = 0
+                                _ic_prev_cost    = 0.0
                                 ic_entry_meta = {
                                     'entry_time': current_time,
                                     'entry_spx': entry_spx,
@@ -355,10 +480,12 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                             strategy = self._try_open_strategy(
                                 date, current_time, StrategyType.PUT_SPREAD,
                                 target_delta, target_prob_itm, min_spread_width, quantity,
-                                target_credit=target_credit
+                                target_credit=target_credit, spx_history=spx_history
                             )
                             if strategy:
                                 open_put_spread = strategy
+                                _ps_adverse_bars = 0
+                                _ps_prev_cost    = 0.0
                                 put_spread_meta = {
                                     'entry_time': current_time,
                                     'entry_spx': entry_spx,
@@ -375,10 +502,12 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                             strategy = self._try_open_strategy(
                                 date, current_time, StrategyType.CALL_SPREAD,
                                 target_delta, target_prob_itm, min_spread_width, quantity,
-                                target_credit=target_credit
+                                target_credit=target_credit, spx_history=spx_history
                             )
                             if strategy:
                                 open_call_spread = strategy
+                                _cs_adverse_bars = 0
+                                _cs_prev_cost    = 0.0
                                 call_spread_meta = {
                                     'entry_time': current_time,
                                     'entry_spx': entry_spx,
@@ -472,12 +601,15 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
     def _try_open_strategy(self, date: str, timestamp: str, strategy_type: StrategyType,
                            target_delta: float, target_prob_itm: float,
                            min_spread_width: int, quantity: int,
-                           target_credit: Optional[float] = None):
+                           target_credit: Optional[float] = None,
+                           spx_history: Optional[pd.Series] = None):
         """
         Attempt to build a strategy at the given timestamp.
-        Returns the strategy object, or None if:
-          - no suitable strikes found
-          - any short strike is closer than MIN_DISTANCE_FROM_SPX to the current SPX price
+        Returns the strategy object, or None if any guard fails:
+          1. No suitable strikes found
+          2. Dynamic minimum distance: short strike too close to SPX
+             (distance = max(MIN_DISTANCE_FROM_SPX, morning_range * 0.75))
+          3. Circuit breaker: short strike within 1 × spread_width of SPX
         """
         self._last_strike_selection = None
         try:
@@ -493,25 +625,48 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
             if not strike_selection:
                 return None
 
-            # --- Minimum distance guard ---
             spx_price = self.enhanced_query_engine.get_fastest_spx_price(date, timestamp) or 0
             if spx_price > 0:
                 from delta_strike_selector import IronCondorStrikeSelection
+
+                # --- Dynamic minimum distance (Recommendation 2) ---
+                # Base distance scales with the morning's actual range so far
+                dynamic_min_dist = MIN_DISTANCE_FROM_SPX
+                if spx_history is not None and len(spx_history) >= 2:
+                    morning_range = spx_history.max() - spx_history.min()
+                    dynamic_min_dist = max(MIN_DISTANCE_FROM_SPX, morning_range * 0.75)
+
+                # --- Distance guard ---
                 if isinstance(strike_selection, IronCondorStrikeSelection):
                     put_dist  = abs(strike_selection.put_short_strike  - spx_price)
                     call_dist = abs(strike_selection.call_short_strike - spx_price)
-                    if put_dist < MIN_DISTANCE_FROM_SPX or call_dist < MIN_DISTANCE_FROM_SPX:
+                    if put_dist < dynamic_min_dist or call_dist < dynamic_min_dist:
                         logger.debug(
                             f"Skipping IC at {timestamp}: put_dist={put_dist:.1f} "
-                            f"call_dist={call_dist:.1f} (min={MIN_DISTANCE_FROM_SPX})"
+                            f"call_dist={call_dist:.1f} (min={dynamic_min_dist:.1f})"
+                        )
+                        return None
+                    # --- Circuit breaker: within 1 × spread_width (Recommendation 4) ---
+                    if put_dist < min_spread_width or call_dist < min_spread_width:
+                        logger.debug(
+                            f"Circuit breaker IC at {timestamp}: "
+                            f"put_dist={put_dist:.1f} call_dist={call_dist:.1f} "
+                            f"(spread_width={min_spread_width})"
                         )
                         return None
                 else:
                     short_dist = abs(strike_selection.short_strike - spx_price)
-                    if short_dist < MIN_DISTANCE_FROM_SPX:
+                    if short_dist < dynamic_min_dist:
                         logger.debug(
                             f"Skipping {strategy_type.value} at {timestamp}: "
-                            f"short_dist={short_dist:.1f} (min={MIN_DISTANCE_FROM_SPX})"
+                            f"short_dist={short_dist:.1f} (min={dynamic_min_dist:.1f})"
+                        )
+                        return None
+                    # --- Circuit breaker ---
+                    if short_dist < min_spread_width:
+                        logger.debug(
+                            f"Circuit breaker {strategy_type.value} at {timestamp}: "
+                            f"short_dist={short_dist:.1f} (spread_width={min_spread_width})"
                         )
                         return None
 
