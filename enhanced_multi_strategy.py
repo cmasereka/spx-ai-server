@@ -28,7 +28,8 @@ from query_engine_adapter import EnhancedQueryEngineAdapter
 ENTRY_SCAN_START    = "09:35:00"   # 9:30 + first 5-min bar
 LAST_ENTRY_TIME     = "14:00:00"   # No new entries at or after 2 PM
 FINAL_EXIT_TIME     = "16:00:00"   # Hold to expiry (market close)
-MIN_DISTANCE_FROM_SPX = 50.0       # Short strike must be >= $50 away from SPX
+MIN_DISTANCE_IC     = 50.0         # IC short strike must be >= $50 away from SPX
+MIN_DISTANCE_SPREAD = 25.0         # Single spread short strike must be >= $25 away from SPX
 
 # Trend filter
 TREND_FILTER_LOOKBACK_MINUTES = 30  # How far back to measure trend
@@ -146,9 +147,17 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
         # Sticky drift flags — once set True they stay True for the whole day.
         # This prevents a temporary bounce from re-enabling a dangerous entry
         # after the market has already shown its direction.
-        _put_spread_ever_blocked  = False   # day drifted down >= DRIFT_BLOCK_POINTS at some point
-        _call_spread_ever_blocked = False   # day drifted up   >= DRIFT_BLOCK_POINTS at some point
-        _ic_ever_blocked          = False   # IC blocked for this day
+        #
+        # Dangerous-side logic:
+        #   Down day → put spreads are dangerous (selling below a falling market)
+        #   Up day   → put spreads are also dangerous (selling below a rising market
+        #              that could reverse, and IC has the put side exposed)
+        #   Either large drift → IC is too risky (both sides exposed)
+        #
+        # Call spreads are NEVER blocked by drift — selling above the market is
+        # always the safe side regardless of direction.
+        _put_spread_ever_blocked = False   # latched True on significant drift either direction
+        _ic_ever_blocked         = False   # latched True on any significant drift
 
         # Build a per-run monitor with the request's risk params
         monitor = IntradayPositionMonitor(
@@ -465,23 +474,21 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
 
                     # Once the dangerous threshold is crossed, latch the flag for the day.
                     # A temporary bounce does NOT re-enable the dangerous-side spread.
-                    if day_drift <= -DRIFT_BLOCK_POINTS:
-                        _put_spread_ever_blocked  = True
-                        _ic_ever_blocked          = True
-                    if day_drift >= +DRIFT_BLOCK_POINTS:
-                        _call_spread_ever_blocked = True
-                        _ic_ever_blocked          = True
+                    # Both down AND up large drifts block put spreads and IC — on an up
+                    # day the put is still exposed to a reversal and IC has both legs at risk.
+                    # Call spreads are never blocked — selling above the market is always safe.
+                    if abs(day_drift) >= DRIFT_BLOCK_POINTS:
+                        _put_spread_ever_blocked = True
+                        _ic_ever_blocked         = True
                     if abs(day_drift) >= DRIFT_DELAY_POINTS and current_time < DRIFT_MIN_ENTRY_HOUR:
                         _ic_ever_blocked = True
 
-                    ic_blocked_by_drift   = _ic_ever_blocked
-                    put_spread_blocked    = _put_spread_ever_blocked
-                    call_spread_blocked   = _call_spread_ever_blocked
-                    if ic_blocked_by_drift or put_spread_blocked or call_spread_blocked:
+                    ic_blocked_by_drift = _ic_ever_blocked
+                    put_spread_blocked  = _put_spread_ever_blocked
+                    if ic_blocked_by_drift or put_spread_blocked:
                         logger.debug(
                             f"Drift guard at {current_time}: drift={day_drift:+.1f} "
-                            f"ic_blocked={ic_blocked_by_drift} "
-                            f"put_blocked={put_spread_blocked} call_blocked={call_spread_blocked}"
+                            f"ic_blocked={ic_blocked_by_drift} put_blocked={put_spread_blocked}"
                         )
 
                     # Determine which entry types are permitted by this strategy mode.
@@ -556,7 +563,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                 }
                                 logger.info(f"Opened put spread at {current_time}")
 
-                    elif selection.strategy_type == StrategyType.CALL_SPREAD and allow_spreads and not call_spread_blocked:
+                    elif selection.strategy_type == StrategyType.CALL_SPREAD and allow_spreads:
                         if open_call_spread is None and open_ic is None:
                             strategy = self._try_open_strategy(
                                 date, current_time, StrategyType.CALL_SPREAD,
@@ -689,11 +696,14 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                 from delta_strike_selector import IronCondorStrikeSelection
 
                 # --- Dynamic minimum distance (Recommendation 2) ---
-                # Base distance scales with the morning's actual range so far
-                dynamic_min_dist = MIN_DISTANCE_FROM_SPX
-                if spx_history is not None and len(spx_history) >= 2:
+                # IC: scale base distance with morning range (both sides exposed).
+                # Single spreads: use flat base only — the morning range scaling
+                # would push the threshold too far OTM and block valid entries.
+                base_min_dist = MIN_DISTANCE_IC if strategy_type == StrategyType.IRON_CONDOR else MIN_DISTANCE_SPREAD
+                dynamic_min_dist = base_min_dist
+                if strategy_type == StrategyType.IRON_CONDOR and spx_history is not None and len(spx_history) >= 2:
                     morning_range = spx_history.max() - spx_history.min()
-                    dynamic_min_dist = max(MIN_DISTANCE_FROM_SPX, morning_range * 0.75)
+                    dynamic_min_dist = max(base_min_dist, morning_range * 0.75)
 
                 # --- Distance guard ---
                 if isinstance(strike_selection, IronCondorStrikeSelection):
