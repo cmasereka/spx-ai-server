@@ -125,10 +125,17 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
             return DayBacktestResult(date=date, trades=[], total_pnl=0.0,
                                      trade_count=0, scan_minutes_checked=0)
 
-        # Fetch the opening SPX price once for daily-drift IC guards.
-        # 09:31 is the first real bar; fall back to 0 (guard is disabled) if unavailable.
-        spx_open = self.enhanced_query_engine.get_fastest_spx_price(date, "09:31:00") or 0.0
-        logger.debug(f"Daily drift guard: SPX open @ 09:31 = {spx_open}")
+        # Fetch the opening SPX price once for daily-drift guards.
+        # Try progressively later times so we always get a real price even if
+        # the 09:30 bar is missing. spx_open stays None until confirmed; the
+        # guard is applied lazily on the first bar where we have a valid open.
+        spx_open: Optional[float] = None
+        for _open_time in ("09:30:00", "09:31:00", "09:32:00", "09:35:00"):
+            _p = self.enhanced_query_engine.get_fastest_spx_price(date, _open_time)
+            if _p and _p > 0:
+                spx_open = float(_p)
+                break
+        logger.debug(f"Daily drift guard: SPX open = {spx_open}")
 
         # Build a per-run monitor with the request's risk params
         monitor = IntradayPositionMonitor(
@@ -448,7 +455,13 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     #   On a significant up day (drift >= +IC_DAILY_DRIFT_BLOCK) block call
                     #   spreads symmetrically.
                     #   The safe side (call spread on down days, put spread on up days) remains open.
-                    day_drift = (entry_spx - spx_open) if spx_open > 0 else 0.0
+                    #
+                    # If spx_open was not available at startup, latch the first valid
+                    # entry_spx we see as the reference open price.
+                    if spx_open is None and entry_spx > 0:
+                        spx_open = entry_spx
+                        logger.debug(f"Daily drift guard: latched SPX open = {spx_open} at {current_time}")
+                    day_drift = (entry_spx - spx_open) if (spx_open is not None and spx_open > 0) else 0.0
                     ic_blocked_by_drift = (
                         day_drift <= -IC_DAILY_DRIFT_BLOCK or
                         (day_drift <= -IC_MIN_DRIFT_FOR_DELAY and current_time < IC_MIN_ENTRY_HOUR)
