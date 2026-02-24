@@ -435,21 +435,31 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                             f"({TREND_FILTER_POINTS}+ pts over {TREND_FILTER_LOOKBACK_MINUTES}m)"
                         )
 
-                    # --- IC daily-drift guards ---
-                    # Guard 1: absolute drift block — if SPX has fallen >= IC_DAILY_DRIFT_BLOCK
-                    #          from the opening price, no IC for the rest of the day.
-                    # Guard 2: time-of-day delay — if SPX has fallen >= IC_MIN_DRIFT_FOR_DELAY
-                    #          from open AND it is still before IC_MIN_ENTRY_HOUR, skip IC
-                    #          (allow re-entry after noon if market has stabilised).
+                    # --- Daily-drift guards ---
+                    # day_drift > 0 means SPX is above the open; < 0 means below.
+                    #
+                    # IC guards:
+                    #   Guard 1: absolute block — SPX already down >= IC_DAILY_DRIFT_BLOCK → no IC
+                    #   Guard 2: time-delay   — SPX down >= IC_MIN_DRIFT_FOR_DELAY before noon → no IC
+                    #
+                    # Spread directional guards:
+                    #   On a significant down day (drift <= -IC_DAILY_DRIFT_BLOCK) block put
+                    #   spreads — the most dangerous trade on an already-fallen market.
+                    #   On a significant up day (drift >= +IC_DAILY_DRIFT_BLOCK) block call
+                    #   spreads symmetrically.
+                    #   The safe side (call spread on down days, put spread on up days) remains open.
                     day_drift = (entry_spx - spx_open) if spx_open > 0 else 0.0
                     ic_blocked_by_drift = (
                         day_drift <= -IC_DAILY_DRIFT_BLOCK or
                         (day_drift <= -IC_MIN_DRIFT_FOR_DELAY and current_time < IC_MIN_ENTRY_HOUR)
                     )
-                    if ic_blocked_by_drift:
+                    put_spread_blocked_by_drift  = day_drift <= -IC_DAILY_DRIFT_BLOCK
+                    call_spread_blocked_by_drift = day_drift >= +IC_DAILY_DRIFT_BLOCK
+                    if ic_blocked_by_drift or put_spread_blocked_by_drift or call_spread_blocked_by_drift:
                         logger.debug(
-                            f"IC drift guard active at {current_time}: "
-                            f"drift={day_drift:+.1f} pts from open ({spx_open:.1f})"
+                            f"Drift guard at {current_time}: drift={day_drift:+.1f} pts from open "
+                            f"({spx_open:.1f}) | ic_blocked={ic_blocked_by_drift} "
+                            f"put_blocked={put_spread_blocked_by_drift} call_blocked={call_spread_blocked_by_drift}"
                         )
 
                     # Determine which entry types are permitted by this strategy mode.
@@ -502,7 +512,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                 }
                                 logger.info(f"Opened IC at {current_time}")
 
-                    elif selection.strategy_type == StrategyType.PUT_SPREAD and allow_spreads:
+                    elif selection.strategy_type == StrategyType.PUT_SPREAD and allow_spreads and not put_spread_blocked_by_drift:
                         if open_put_spread is None and open_ic is None:
                             strategy = self._try_open_strategy(
                                 date, current_time, StrategyType.PUT_SPREAD,
@@ -524,7 +534,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                 }
                                 logger.info(f"Opened put spread at {current_time}")
 
-                    elif selection.strategy_type == StrategyType.CALL_SPREAD and allow_spreads:
+                    elif selection.strategy_type == StrategyType.CALL_SPREAD and allow_spreads and not call_spread_blocked_by_drift:
                         if open_call_spread is None and open_ic is None:
                             strategy = self._try_open_strategy(
                                 date, current_time, StrategyType.CALL_SPREAD,
