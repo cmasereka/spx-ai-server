@@ -125,19 +125,36 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     open_ic, date, current_time, ic_leg_status
                 )
 
-                # Snapshot this bar (prices already updated by check_ic_leg_decay)
+                # Snapshot this bar
                 ic_entry_credit = getattr(open_ic, 'entry_credit', 0)
                 ic_quantity = getattr(open_ic, 'quantity', 1)
-                put_cost_ps, call_cost_ps = 0.0, 0.0
-                try:
-                    _, _, raw_put, raw_call = monitor._check_ic_leg_decay_values(open_ic)
-                    put_cost_ps  = round(raw_put  / (100.0 * ic_quantity), 4)
-                    call_cost_ps = round(raw_call / (100.0 * ic_quantity), 4)
-                except Exception:
-                    pass
+                spx_now = self.enhanced_query_engine.get_fastest_spx_price(date, current_time) or 0
+
+                if is_final_bar:
+                    # Use intrinsic settlement values at expiry
+                    raw_put  = self._expiry_exit_cost(open_ic, StrategyType.PUT_SPREAD,  spx_now)
+                    raw_call = self._expiry_exit_cost(open_ic, StrategyType.CALL_SPREAD, spx_now)
+                    # Force both sides closed at intrinsic cost
+                    if not ic_leg_status.put_side_closed:
+                        ic_leg_status.put_side_closed = True
+                        ic_leg_status.put_side_exit_time = current_time
+                        ic_leg_status.put_side_exit_cost = raw_put
+                        ic_leg_status.put_side_exit_reason = "Expired at market close"
+                    if not ic_leg_status.call_side_closed:
+                        ic_leg_status.call_side_closed = True
+                        ic_leg_status.call_side_exit_time = current_time
+                        ic_leg_status.call_side_exit_cost = raw_call
+                        ic_leg_status.call_side_exit_reason = "Expired at market close"
+                else:
+                    try:
+                        _, _, raw_put, raw_call = monitor._check_ic_leg_decay_values(open_ic)
+                    except Exception:
+                        raw_put, raw_call = 0.0, 0.0
+
+                put_cost_ps  = round(raw_put  / (100.0 * ic_quantity), 4)
+                call_cost_ps = round(raw_call / (100.0 * ic_quantity), 4)
                 total_cost_ps   = round((put_cost_ps + call_cost_ps), 4)
                 entry_credit_ps = round(ic_entry_credit / (100.0 * ic_quantity), 4)
-                spx_now = self.enhanced_query_engine.get_fastest_spx_price(date, current_time) or 0
                 ic_checkpoints.append({
                     "time": current_time,
                     "spx": round(spx_now, 2),
@@ -192,12 +209,18 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     open_put_spread, StrategyType.PUT_SPREAD, date, current_time
                 )
 
+                # At final bar use intrinsic settlement value, not stale market price
+                spx_now = self.enhanced_query_engine.get_fastest_spx_price(date, current_time) or 0
+                if is_final_bar:
+                    current_cost = self._expiry_exit_cost(open_put_spread, StrategyType.PUT_SPREAD, spx_now)
+                    should_exit = True
+                    reason = "Expired at market close"
+
                 # Snapshot this bar
                 ps_entry_credit = getattr(open_put_spread, 'entry_credit', 0)
                 ps_quantity = getattr(open_put_spread, 'quantity', 1)
                 entry_credit_ps = round(ps_entry_credit / (100.0 * ps_quantity), 4)
                 cost_ps = round(current_cost / (100.0 * ps_quantity), 4)
-                spx_now = self.enhanced_query_engine.get_fastest_spx_price(date, current_time) or 0
                 put_spread_checkpoints.append({
                     "time": current_time,
                     "spx": round(spx_now, 2),
@@ -243,12 +266,18 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     open_call_spread, StrategyType.CALL_SPREAD, date, current_time
                 )
 
+                # At final bar use intrinsic settlement value, not stale market price
+                spx_now = self.enhanced_query_engine.get_fastest_spx_price(date, current_time) or 0
+                if is_final_bar:
+                    current_cost = self._expiry_exit_cost(open_call_spread, StrategyType.CALL_SPREAD, spx_now)
+                    should_exit = True
+                    reason = "Expired at market close"
+
                 # Snapshot this bar
                 cs_entry_credit = getattr(open_call_spread, 'entry_credit', 0)
                 cs_quantity = getattr(open_call_spread, 'quantity', 1)
                 entry_credit_ps = round(cs_entry_credit / (100.0 * cs_quantity), 4)
                 cost_ps = round(current_cost / (100.0 * cs_quantity), 4)
-                spx_now = self.enhanced_query_engine.get_fastest_spx_price(date, current_time) or 0
                 call_spread_checkpoints.append({
                     "time": current_time,
                     "spx": round(spx_now, 2),
@@ -372,15 +401,12 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
             (open_call_spread, call_spread_meta, StrategyType.CALL_SPREAD, call_spread_checkpoints),
         ]:
             if open_pos is not None:
-                try:
-                    self.strategy_builder.update_strategy_prices_optimized(open_pos, date, FINAL_EXIT_TIME)
-                except Exception:
-                    pass
-                exit_cost = monitor._calculate_exit_cost(open_pos)
+                exit_spx = self.enhanced_query_engine.get_fastest_spx_price(date, FINAL_EXIT_TIME) or meta.get('entry_spx', 0)
+                # Use intrinsic value at expiry — options settle to $0 if OTM
+                exit_cost = self._expiry_exit_cost(open_pos, stype, exit_spx)
                 entry_credit = getattr(open_pos, 'entry_credit', 0)
                 pnl = entry_credit - exit_cost
                 pnl_pct = (pnl / entry_credit * 100) if entry_credit > 0 else 0
-                exit_spx = self.enhanced_query_engine.get_fastest_spx_price(date, FINAL_EXIT_TIME) or meta.get('entry_spx', 0)
 
                 # Add final force-close checkpoint
                 pos_quantity = getattr(open_pos, 'quantity', 1)
@@ -393,12 +419,10 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     "pnl_per_share": round(entry_credit_ps - cost_ps, 4),
                 }
                 if stype == StrategyType.IRON_CONDOR:
-                    try:
-                        _, _, raw_put, raw_call = monitor._check_ic_leg_decay_values(open_pos)
-                        force_checkpoint["put_cost_per_share"]  = round(raw_put  / 100, 4)
-                        force_checkpoint["call_cost_per_share"] = round(raw_call / 100, 4)
-                    except Exception:
-                        pass
+                    put_cost  = self._expiry_exit_cost(open_pos, StrategyType.PUT_SPREAD,  exit_spx)
+                    call_cost = self._expiry_exit_cost(open_pos, StrategyType.CALL_SPREAD, exit_spx)
+                    force_checkpoint["put_cost_per_share"]  = round(put_cost  / (100.0 * pos_quantity), 4)
+                    force_checkpoint["call_cost_per_share"] = round(call_cost / (100.0 * pos_quantity), 4)
                 checkpoints.append(force_checkpoint)
 
                 result_ic_leg_status = None
@@ -502,6 +526,56 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
         except Exception as e:
             logger.debug(f"Failed to open {strategy_type.value} at {timestamp}: {e}")
             return None
+
+    def _expiry_exit_cost(self, strategy, strategy_type: StrategyType, spx_price: float) -> float:
+        """
+        Compute the true settlement cost at expiry from intrinsic value alone.
+        0DTE options expire at intrinsic value; time value is zero.
+        OTM options expire worthless (cost = 0).
+        """
+        try:
+            quantity = getattr(strategy, 'quantity', 1)
+            if strategy_type == StrategyType.IRON_CONDOR:
+                # Find put/call strikes from legs
+                put_legs  = [l for l in strategy.legs if l.option_type.value == 'put']
+                call_legs = [l for l in strategy.legs if l.option_type.value == 'call']
+                put_short_strike  = max((l.strike for l in put_legs  if l.position_side.name == 'SHORT'), default=0)
+                put_long_strike   = min((l.strike for l in put_legs  if l.position_side.name == 'LONG'),  default=0)
+                call_short_strike = min((l.strike for l in call_legs if l.position_side.name == 'SHORT'), default=0)
+                call_long_strike  = max((l.strike for l in call_legs if l.position_side.name == 'LONG'),  default=0)
+
+                put_intrinsic  = max(0.0, put_short_strike  - spx_price)   # put spread cost if SPX < put_short
+                call_intrinsic = max(0.0, spx_price - call_short_strike)   # call spread cost if SPX > call_short
+
+                put_spread_width  = put_short_strike  - put_long_strike
+                call_spread_width = call_long_strike  - call_short_strike
+
+                put_cost  = min(put_intrinsic,  put_spread_width  if put_spread_width  > 0 else put_intrinsic)
+                call_cost = min(call_intrinsic, call_spread_width if call_spread_width > 0 else call_intrinsic)
+
+                return (put_cost + call_cost) * 100 * quantity
+
+            elif strategy_type == StrategyType.PUT_SPREAD:
+                short_leg = next((l for l in strategy.legs if l.position_side.name == 'SHORT'), None)
+                long_leg  = next((l for l in strategy.legs if l.position_side.name == 'LONG'),  None)
+                if not short_leg or not long_leg:
+                    return 0.0
+                intrinsic    = max(0.0, short_leg.strike - spx_price)
+                spread_width = short_leg.strike - long_leg.strike
+                return min(intrinsic, spread_width) * 100 * quantity
+
+            elif strategy_type == StrategyType.CALL_SPREAD:
+                short_leg = next((l for l in strategy.legs if l.position_side.name == 'SHORT'), None)
+                long_leg  = next((l for l in strategy.legs if l.position_side.name == 'LONG'),  None)
+                if not short_leg or not long_leg:
+                    return 0.0
+                intrinsic    = max(0.0, spx_price - short_leg.strike)
+                spread_width = long_leg.strike - short_leg.strike
+                return min(intrinsic, spread_width) * 100 * quantity
+
+        except Exception as e:
+            logger.warning(f"Expiry cost calculation failed ({strategy_type}): {e}")
+        return 0.0
 
     def enhanced_backtest_single_day(self,
                                    date: str,
