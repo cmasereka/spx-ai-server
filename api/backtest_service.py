@@ -166,12 +166,9 @@ class BacktestService:
                 backtest_id, request, websocket_manager, loop
             )
             
-            # Store results in memory and database
+            # Store results in memory (trades already persisted per-trade during the run)
             self.backtest_results[backtest_id] = results
-            
-            # Save all trades to database
-            await self._save_trades_to_db(backtest_id, results)
-            
+
             # Calculate final statistics
             total_pnl = sum(r.pnl for r in results)
             max_drawdown = self._calculate_max_drawdown(results)
@@ -276,11 +273,19 @@ class BacktestService:
                     request
                 )
 
-                # Convert each trade in the day result to API format
+                # Convert each trade in the day result to API format and persist immediately
                 if day_result and day_result.trades:
                     for trade in day_result.trades:
                         api_result = self._convert_single_trade(trade, backtest_id)
                         results.append(api_result)
+
+                        # Persist trade to DB as soon as it closes
+                        await loop.run_in_executor(
+                            self.executor,
+                            self._save_single_trade_sync,
+                            backtest_id,
+                            api_result,
+                        )
 
                         # Send individual trade result
                         await websocket_manager.send_trade_result(
@@ -483,6 +488,46 @@ class BacktestService:
                 backtest_run.win_rate = win_rate
                 session.commit()
     
+    def _save_single_trade_sync(self, backtest_id: str, result: BacktestResult):
+        """Persist one trade to the database immediately after it closes."""
+        with db_manager.get_session() as session:
+            backtest_run = session.query(BacktestRun).filter_by(backtest_id=backtest_id).first()
+            if not backtest_run:
+                logger.error(f"Backtest run {backtest_id} not found — cannot save trade {result.trade_id}")
+                return
+
+            trade = Trade(
+                trade_id=result.trade_id,
+                backtest_run_id=backtest_run.id,
+                trade_date=result.trade_date,
+                entry_time=result.entry_time,
+                exit_time=result.exit_time,
+                entry_spx_price=result.entry_spx_price,
+                exit_spx_price=result.exit_spx_price,
+                strategy_type=result.strategy.strategy_type,
+                strikes=result.strategy.strikes,
+                entry_credit=result.entry_credit,
+                exit_cost=result.exit_cost,
+                pnl=result.pnl,
+                pnl_percentage=result.pnl_percentage,
+                exit_reason=result.exit_reason,
+                is_winner=result.is_winner,
+                max_profit=result.strategy.max_profit,
+                max_loss=result.strategy.max_loss,
+                strategy_details={
+                    "strategy_type": result.strategy.strategy_type,
+                    "strikes": result.strategy.strikes,
+                    "entry_credit": result.strategy.entry_credit,
+                    "max_profit": result.strategy.max_profit,
+                    "max_loss": result.strategy.max_loss,
+                    "breakeven_points": result.strategy.breakeven_points,
+                },
+                monitoring_data=result.monitoring_points,
+            )
+            session.add(trade)
+            session.commit()
+            logger.debug(f"Persisted trade {result.trade_id} for backtest {backtest_id}")
+
     async def _save_trades_to_db(self, backtest_id: str, results: List[BacktestResult]):
         """Save individual trades to database"""
         try:
