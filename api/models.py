@@ -13,6 +13,7 @@ class BacktestModeEnum(str, Enum):
     """Backtest execution modes"""
     SINGLE_DAY = "single_day"
     DATE_RANGE = "date_range"
+    SPECIFIC_DATES = "specific_dates"
     LIVE_SIMULATION = "live_simulation"
 
 
@@ -46,6 +47,7 @@ class BacktestRequest(BaseModel):
     start_date: Optional[date] = Field(None, description="Start date for backtesting")
     end_date: Optional[date] = Field(None, description="End date for backtesting")
     single_date: Optional[date] = Field(None, description="Single date for backtesting")
+    specific_dates: Optional[List[date]] = Field(None, description="List of specific dates for backtesting")
 
     # Strike selection
     target_credit: float = Field(0.40, ge=0.05, le=5.0, description="Target net credit per spread per share. IC total will be 2x this value.")

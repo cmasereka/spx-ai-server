@@ -234,6 +234,8 @@ class BacktestService:
         # Determine dates to test
         if request.mode.value == "single_day":
             test_dates = [request.single_date] if request.single_date else []
+        elif request.mode.value == "specific_dates":
+            test_dates = sorted(request.specific_dates) if request.specific_dates else []
         else:
             # Filter available dates by range
             available_dates = self.engine.available_dates or []
