@@ -303,6 +303,22 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                         ic_leg_status.put_side_exit_time or "00:00:00",
                         ic_leg_status.call_side_exit_time or "00:00:00"
                     )
+                    _ic_entry_spx = ic_entry_meta.get('entry_spx', 0)
+                    ic_exit_rationale = {
+                        'exit_trigger': 'IC both sides closed (decay threshold)',
+                        'put_side_exit_time': ic_leg_status.put_side_exit_time,
+                        'put_side_exit_reason': ic_leg_status.put_side_exit_reason,
+                        'call_side_exit_time': ic_leg_status.call_side_exit_time,
+                        'call_side_exit_reason': ic_leg_status.call_side_exit_reason,
+                        'put_side_exit_cost': round(ic_leg_status.put_side_exit_cost, 2),
+                        'call_side_exit_cost': round(ic_leg_status.call_side_exit_cost, 2),
+                        'total_exit_cost': round(total_exit_cost, 2),
+                        'entry_credit': round(entry_credit, 2),
+                        'spx_at_exit': round(exit_spx, 2),
+                        'spx_move_since_entry': round(exit_spx - _ic_entry_spx, 2) if _ic_entry_spx else None,
+                        'pnl': round(pnl, 2),
+                        'pnl_pct': round(pnl_pct, 2),
+                    }
                     trades.append(EnhancedBacktestResult(
                         date=date,
                         strategy_type=StrategyType.IRON_CONDOR,
@@ -310,7 +326,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                         entry_time=ic_entry_meta.get('entry_time', current_time),
                         exit_time=later_side_time,
                         exit_reason="IC both sides closed",
-                        entry_spx_price=ic_entry_meta.get('entry_spx', 0),
+                        entry_spx_price=_ic_entry_spx,
                         exit_spx_price=exit_spx,
                         technical_indicators=ic_entry_meta.get('indicators', TechnicalIndicators(0,0,0,0,0,0,0,0.5)),
                         strike_selection=ic_entry_meta.get('strike_selection', StrikeSelection(0,0,0,0,0)),
@@ -324,6 +340,8 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                         success=True,
                         confidence=ic_entry_meta.get('confidence', 0),
                         notes=ic_entry_meta.get('notes', ''),
+                        entry_rationale=ic_entry_meta.get('entry_rationale'),
+                        exit_rationale=ic_exit_rationale,
                         ic_leg_status=ic_leg_status
                     ))
                     open_ic = None
@@ -376,6 +394,17 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     pnl = entry_credit - current_cost
                     pnl_pct = (pnl / entry_credit * 100) if entry_credit > 0 else 0
                     exit_spx = spx_now or put_spread_meta.get('entry_spx', 0)
+                    _ps_entry_spx = put_spread_meta.get('entry_spx', 0)
+                    ps_exit_rationale = {
+                        'exit_trigger': exit_reason,
+                        'exit_cost': round(current_cost, 2),
+                        'entry_credit': round(entry_credit, 2),
+                        'spx_at_exit': round(exit_spx, 2),
+                        'spx_move_since_entry': round(exit_spx - _ps_entry_spx, 2) if _ps_entry_spx else None,
+                        'pnl': round(pnl, 2),
+                        'pnl_pct': round(pnl_pct, 2),
+                        'adverse_bars_before_exit': _ps_adverse_bars,
+                    }
                     trades.append(EnhancedBacktestResult(
                         date=date,
                         strategy_type=StrategyType.PUT_SPREAD,
@@ -383,7 +412,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                         entry_time=put_spread_meta.get('entry_time', current_time),
                         exit_time=current_time,
                         exit_reason=exit_reason,
-                        entry_spx_price=put_spread_meta.get('entry_spx', 0),
+                        entry_spx_price=_ps_entry_spx,
                         exit_spx_price=exit_spx,
                         technical_indicators=put_spread_meta.get('indicators', TechnicalIndicators(0,0,0,0,0,0,0,0.5)),
                         strike_selection=put_spread_meta.get('strike_selection', StrikeSelection(0,0,0,0,0)),
@@ -396,7 +425,9 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                         monitoring_points=put_spread_checkpoints,
                         success=True,
                         confidence=put_spread_meta.get('confidence', 0),
-                        notes=put_spread_meta.get('notes', '')
+                        notes=put_spread_meta.get('notes', ''),
+                        entry_rationale=put_spread_meta.get('entry_rationale'),
+                        exit_rationale=ps_exit_rationale,
                     ))
                     open_put_spread = None
                     put_spread_meta = {}
@@ -447,6 +478,17 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     pnl = entry_credit - current_cost
                     pnl_pct = (pnl / entry_credit * 100) if entry_credit > 0 else 0
                     exit_spx = spx_now or call_spread_meta.get('entry_spx', 0)
+                    _cs_entry_spx = call_spread_meta.get('entry_spx', 0)
+                    cs_exit_rationale = {
+                        'exit_trigger': exit_reason,
+                        'exit_cost': round(current_cost, 2),
+                        'entry_credit': round(entry_credit, 2),
+                        'spx_at_exit': round(exit_spx, 2),
+                        'spx_move_since_entry': round(exit_spx - _cs_entry_spx, 2) if _cs_entry_spx else None,
+                        'pnl': round(pnl, 2),
+                        'pnl_pct': round(pnl_pct, 2),
+                        'adverse_bars_before_exit': _cs_adverse_bars,
+                    }
                     trades.append(EnhancedBacktestResult(
                         date=date,
                         strategy_type=StrategyType.CALL_SPREAD,
@@ -454,7 +496,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                         entry_time=call_spread_meta.get('entry_time', current_time),
                         exit_time=current_time,
                         exit_reason=exit_reason,
-                        entry_spx_price=call_spread_meta.get('entry_spx', 0),
+                        entry_spx_price=_cs_entry_spx,
                         exit_spx_price=exit_spx,
                         technical_indicators=call_spread_meta.get('indicators', TechnicalIndicators(0,0,0,0,0,0,0,0.5)),
                         strike_selection=call_spread_meta.get('strike_selection', StrikeSelection(0,0,0,0,0)),
@@ -467,7 +509,9 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                         monitoring_points=call_spread_checkpoints,
                         success=True,
                         confidence=call_spread_meta.get('confidence', 0),
-                        notes=call_spread_meta.get('notes', '')
+                        notes=call_spread_meta.get('notes', ''),
+                        entry_rationale=call_spread_meta.get('entry_rationale'),
+                        exit_rationale=cs_exit_rationale,
                     ))
                     open_call_spread = None
                     call_spread_meta = {}
@@ -562,7 +606,26 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                     'strike_selection': self._last_strike_selection or StrikeSelection(0,0,0,0,0),
                                     'market_signal': selection.market_signal,
                                     'confidence': selection.confidence,
-                                    'notes': selection.reason
+                                    'notes': selection.reason,
+                                    'entry_rationale': {
+                                        'strategy_selected': 'iron_condor',
+                                        'selection_reason': selection.reason,
+                                        'confidence': round(selection.confidence, 3),
+                                        'market_signal': selection.market_signal.value,
+                                        'spx_open': round(spx_open, 2) if spx_open else None,
+                                        'spx_at_entry': round(entry_spx, 2),
+                                        'day_drift_pts': round(day_drift, 2),
+                                        'is_trending': is_trending,
+                                        'trend_direction': trend_dir,
+                                        'trend_override': False,
+                                        'ic_blocked_by_drift': ic_blocked_by_drift,
+                                        'put_spread_blocked': put_spread_blocked,
+                                        'rsi': round(indicators.rsi, 2),
+                                        'bb_position': round(indicators.bb_position, 3),
+                                        'bb_upper': round(indicators.bb_upper, 2),
+                                        'bb_lower': round(indicators.bb_lower, 2),
+                                        'macd_histogram': round(indicators.macd_histogram, 4),
+                                    }
                                 }
                                 logger.info(f"Opened IC at {current_time}")
 
@@ -584,7 +647,26 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                     'strike_selection': self._last_strike_selection or StrikeSelection(0,0,0,0,0),
                                     'market_signal': selection.market_signal,
                                     'confidence': selection.confidence,
-                                    'notes': selection.reason
+                                    'notes': selection.reason,
+                                    'entry_rationale': {
+                                        'strategy_selected': 'put_spread',
+                                        'selection_reason': selection.reason,
+                                        'confidence': round(selection.confidence, 3),
+                                        'market_signal': selection.market_signal.value,
+                                        'spx_open': round(spx_open, 2) if spx_open else None,
+                                        'spx_at_entry': round(entry_spx, 2),
+                                        'day_drift_pts': round(day_drift, 2),
+                                        'is_trending': is_trending,
+                                        'trend_direction': trend_dir,
+                                        'trend_override': 'trend override' in selection.reason.lower(),
+                                        'ic_blocked_by_drift': ic_blocked_by_drift,
+                                        'put_spread_blocked': put_spread_blocked,
+                                        'rsi': round(indicators.rsi, 2),
+                                        'bb_position': round(indicators.bb_position, 3),
+                                        'bb_upper': round(indicators.bb_upper, 2),
+                                        'bb_lower': round(indicators.bb_lower, 2),
+                                        'macd_histogram': round(indicators.macd_histogram, 4),
+                                    }
                                 }
                                 logger.info(f"Opened put spread at {current_time}")
 
@@ -606,7 +688,26 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                     'strike_selection': self._last_strike_selection or StrikeSelection(0,0,0,0,0),
                                     'market_signal': selection.market_signal,
                                     'confidence': selection.confidence,
-                                    'notes': selection.reason
+                                    'notes': selection.reason,
+                                    'entry_rationale': {
+                                        'strategy_selected': 'call_spread',
+                                        'selection_reason': selection.reason,
+                                        'confidence': round(selection.confidence, 3),
+                                        'market_signal': selection.market_signal.value,
+                                        'spx_open': round(spx_open, 2) if spx_open else None,
+                                        'spx_at_entry': round(entry_spx, 2),
+                                        'day_drift_pts': round(day_drift, 2),
+                                        'is_trending': is_trending,
+                                        'trend_direction': trend_dir,
+                                        'trend_override': 'trend override' in selection.reason.lower(),
+                                        'ic_blocked_by_drift': ic_blocked_by_drift,
+                                        'put_spread_blocked': put_spread_blocked,
+                                        'rsi': round(indicators.rsi, 2),
+                                        'bb_position': round(indicators.bb_position, 3),
+                                        'bb_upper': round(indicators.bb_upper, 2),
+                                        'bb_lower': round(indicators.bb_lower, 2),
+                                        'macd_histogram': round(indicators.macd_histogram, 4),
+                                    }
                                 }
                                 logger.info(f"Opened call spread at {current_time}")
 
@@ -678,6 +779,16 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     success=True,
                     confidence=meta.get('confidence', 0),
                     notes=meta.get('notes', ''),
+                    entry_rationale=meta.get('entry_rationale'),
+                    exit_rationale={
+                        'exit_trigger': 'Expired at market close',
+                        'exit_cost': round(exit_cost, 2),
+                        'entry_credit': round(entry_credit, 2),
+                        'spx_at_exit': round(exit_spx, 2),
+                        'spx_move_since_entry': round(exit_spx - meta.get('entry_spx', 0), 2) if meta.get('entry_spx') else None,
+                        'pnl': round(pnl, 2),
+                        'pnl_pct': round(pnl_pct, 2),
+                    },
                     ic_leg_status=result_ic_leg_status
                 ))
 

@@ -384,7 +384,9 @@ class BacktestService:
             pnl_percentage=result.pnl_pct or 0,
             exit_reason=result.exit_reason or "Unknown",
             is_winner=(result.pnl or 0) > 0,
-            monitoring_points=result.monitoring_points or []
+            monitoring_points=result.monitoring_points or [],
+            entry_rationale=result.entry_rationale,
+            exit_rationale=result.exit_rationale,
         )
 
     # Backward-compatible alias
@@ -524,6 +526,8 @@ class BacktestService:
                     "max_profit": result.strategy.max_profit,
                     "max_loss": result.strategy.max_loss,
                     "breakeven_points": result.strategy.breakeven_points,
+                    "entry_rationale": result.entry_rationale,
+                    "exit_rationale": result.exit_rationale,
                 },
                 monitoring_data=result.monitoring_points,
             )
@@ -585,7 +589,9 @@ class BacktestService:
                         "entry_credit": result.strategy.entry_credit,
                         "max_profit": result.strategy.max_profit,
                         "max_loss": result.strategy.max_loss,
-                        "breakeven_points": result.strategy.breakeven_points
+                        "breakeven_points": result.strategy.breakeven_points,
+                        "entry_rationale": result.entry_rationale,
+                        "exit_rationale": result.exit_rationale,
                     },
                     monitoring_data=result.monitoring_points
                 )

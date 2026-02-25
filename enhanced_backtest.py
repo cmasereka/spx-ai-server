@@ -106,6 +106,12 @@ class EnhancedBacktestResult:
     confidence: float
     notes: str
 
+    # Full decision audit trail
+    # entry_rationale: snapshot of every factor that led to this trade being opened
+    # exit_rationale:  snapshot of every factor that triggered the close
+    entry_rationale: Optional[Dict[str, Any]] = None
+    exit_rationale:  Optional[Dict[str, Any]] = None
+
     # IC independent leg tracking (only populated for IC trades)
     ic_leg_status: Optional['IronCondorLegStatus'] = None
 

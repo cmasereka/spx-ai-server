@@ -143,6 +143,10 @@ class BacktestResult(BaseModel):
     is_winner: bool = Field(..., description="Whether trade was profitable")
     monitoring_points: List[Dict[str, Any]] = Field(default_factory=list, description="Monitoring data points")
 
+    # Decision audit trail
+    entry_rationale: Optional[Dict[str, Any]] = Field(None, description="All factors that led to this trade being opened")
+    exit_rationale: Optional[Dict[str, Any]] = Field(None, description="All factors that triggered the close")
+
 
 class SystemStatus(BaseModel):
     """System status information"""
