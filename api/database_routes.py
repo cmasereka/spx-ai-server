@@ -140,6 +140,8 @@ async def get_backtest_trades(
                     "max_loss": trade.max_loss,
                     "strategy_details": trade.strategy_details,
                     "monitoring_data": trade.monitoring_data,
+                    "entry_rationale": (trade.strategy_details or {}).get("entry_rationale"),
+                    "exit_rationale": (trade.strategy_details or {}).get("exit_rationale"),
                     "created_at": trade.created_at
                 })
             
