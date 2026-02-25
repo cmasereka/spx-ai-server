@@ -49,7 +49,8 @@ async def list_backtests(
                     "total_pnl": backtest.total_pnl,
                     "max_drawdown": backtest.max_drawdown,
                     "win_rate": backtest.win_rate,
-                    "error_message": backtest.error_message
+                    "error_message": backtest.error_message,
+                    "parameters": backtest.parameters
                 })
             
             return results
