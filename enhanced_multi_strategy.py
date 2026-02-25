@@ -25,7 +25,7 @@ from query_engine_adapter import EnhancedQueryEngineAdapter
 
 
 # Intraday scan constants
-ENTRY_SCAN_START    = "09:35:00"   # 9:30 + first 5-min bar
+ENTRY_SCAN_START    = "10:00:00"   # Wait 30 min for opening volatility to settle
 LAST_ENTRY_TIME     = "14:00:00"   # No new entries at or after 2 PM
 FINAL_EXIT_TIME     = "16:00:00"   # Hold to expiry (market close)
 MIN_DISTANCE_IC     = 50.0         # IC short strike must be >= $50 away from SPX
@@ -158,6 +158,31 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
         # always the safe side regardless of direction.
         _put_spread_ever_blocked = False   # latched True on significant drift either direction
         _ic_ever_blocked         = False   # latched True on any significant drift
+
+        # Pre-scan drift check: evaluate every bar from 09:31 up to (but not
+        # including) ENTRY_SCAN_START so that the sticky flags are already
+        # latched correctly when the first entry bar is evaluated.
+        # This matters when ENTRY_SCAN_START > 09:35 — without this, a large
+        # opening move that crosses the threshold before 10:00 would be invisible
+        # to the guards at the first entry bar.
+        if spx_open and spx_open > 0:
+            pre_scan_times = _build_minute_grid(date, "09:31:00", ENTRY_SCAN_START)
+            # Exclude the first bar of the actual scan to avoid double-counting
+            pre_scan_times = [t for t in pre_scan_times if t < ENTRY_SCAN_START]
+            for _pt in pre_scan_times:
+                _pp = self.enhanced_query_engine.get_fastest_spx_price(date, _pt)
+                if not _pp or _pp <= 0:
+                    continue
+                _pre_drift = float(_pp) - spx_open
+                if abs(_pre_drift) >= DRIFT_BLOCK_POINTS:
+                    _put_spread_ever_blocked = True
+                    _ic_ever_blocked         = True
+                if abs(_pre_drift) >= DRIFT_DELAY_POINTS and _pt < DRIFT_MIN_ENTRY_HOUR:
+                    _ic_ever_blocked = True
+            logger.debug(
+                f"Pre-scan drift check complete: put_blocked={_put_spread_ever_blocked} "
+                f"ic_blocked={_ic_ever_blocked}"
+            )
 
         # Build a per-run monitor with the request's risk params
         monitor = IntradayPositionMonitor(
