@@ -439,6 +439,7 @@ class BacktestService:
                     "take_profit": request.take_profit,
                     "stop_loss": request.stop_loss,
                     "monitor_interval": request.monitor_interval,
+                    "specific_dates": [str(d) for d in request.specific_dates] if request.specific_dates else None,
                 }
             )
             
