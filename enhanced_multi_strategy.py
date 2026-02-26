@@ -34,8 +34,6 @@ MIN_DISTANCE_SPREAD = 25.0         # Single spread short strike must be >= $25 a
 # Trend filter
 TREND_FILTER_LOOKBACK_MINUTES = 30  # How far back to measure trend
 TREND_FILTER_POINTS           = 30  # SPX points moved → market is trending; block IC, use asymmetric spread
-TREND_TIGHTEN_CONSECUTIVE     = 3   # Consecutive adverse bars before SL tightens
-TREND_TIGHTEN_FACTOR          = 0.5 # SL tightens to this fraction of configured stop_loss
 
 # Daily-drift guards — anchored to the day's opening price
 # Block the directionally-dangerous spread on large drift days:
@@ -207,16 +205,6 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
         put_spread_checkpoints: list = []
         call_spread_checkpoints: list = []
 
-        # Adverse-bar counters for dynamic SL tightening (Recommendation 5).
-        # Incremented each check bar where cost increased vs. previous bar;
-        # reset to 0 when cost decreases or a new position is opened.
-        _ic_adverse_bars   = 0
-        _ps_adverse_bars   = 0
-        _cs_adverse_bars   = 0
-        _ic_prev_cost      = 0.0
-        _ps_prev_cost      = 0.0
-        _cs_prev_cost      = 0.0
-
         for bar_index, current_time in enumerate(scan_times):
             is_past_entry_cutoff = current_time >= LAST_ENTRY_TIME
             is_final_bar         = current_time >= FINAL_EXIT_TIME
@@ -226,29 +214,6 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
 
             # --- 1. Monitor IC legs independently ---
             if open_ic is not None and ic_leg_status is not None and is_check_bar:
-                # Dynamic SL tightening: after N consecutive adverse bars,
-                # tighten stop_loss to TREND_TIGHTEN_FACTOR × configured value
-                ic_total_cost = (ic_leg_status.put_side_exit_cost if ic_leg_status.put_side_closed else 0) + \
-                                (ic_leg_status.call_side_exit_cost if ic_leg_status.call_side_closed else 0)
-                if not ic_leg_status.put_side_closed or not ic_leg_status.call_side_closed:
-                    try:
-                        _, _, _rp, _rc = monitor._check_ic_leg_decay_values(open_ic)
-                        ic_total_cost = (_rp if not ic_leg_status.put_side_closed else 0) + \
-                                        (_rc if not ic_leg_status.call_side_closed else 0)
-                    except Exception:
-                        pass
-                if ic_total_cost > _ic_prev_cost and _ic_prev_cost > 0:
-                    _ic_adverse_bars += 1
-                else:
-                    _ic_adverse_bars = 0
-                _ic_prev_cost = ic_total_cost
-
-                if _ic_adverse_bars >= TREND_TIGHTEN_CONSECUTIVE:
-                    monitor.stop_loss = stop_loss * TREND_TIGHTEN_FACTOR
-                    logger.debug(f"IC SL tightened to {monitor.stop_loss:.2f} after {_ic_adverse_bars} adverse bars at {current_time}")
-                else:
-                    monitor.stop_loss = stop_loss
-
                 ic_leg_status = monitor.check_ic_leg_decay(
                     open_ic, date, current_time, ic_leg_status
                 )
@@ -351,23 +316,9 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
 
             # --- 2. Monitor put spread ---
             if open_put_spread is not None and is_check_bar:
-                # Dynamic SL tightening for put spread
-                if current_time != FINAL_EXIT_TIME:
-                    try:
-                        _ps_current = monitor._calculate_exit_cost(open_put_spread)
-                    except Exception:
-                        _ps_current = _ps_prev_cost
-                    if _ps_current > _ps_prev_cost and _ps_prev_cost > 0:
-                        _ps_adverse_bars += 1
-                    else:
-                        _ps_adverse_bars = 0
-                    _ps_prev_cost = _ps_current
-                    monitor.stop_loss = stop_loss * TREND_TIGHTEN_FACTOR if _ps_adverse_bars >= TREND_TIGHTEN_CONSECUTIVE else stop_loss
-
                 should_exit, current_cost, reason = monitor.check_decay_at_time(
                     open_put_spread, StrategyType.PUT_SPREAD, date, current_time
                 )
-                monitor.stop_loss = stop_loss  # restore after check
 
                 # At final bar use intrinsic settlement value, not stale market price
                 spx_now = self.enhanced_query_engine.get_fastest_spx_price(date, current_time) or 0
@@ -403,7 +354,6 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                         'spx_move_since_entry': round(exit_spx - _ps_entry_spx, 2) if _ps_entry_spx else None,
                         'pnl': round(pnl, 2),
                         'pnl_pct': round(pnl_pct, 2),
-                        'adverse_bars_before_exit': _ps_adverse_bars,
                     }
                     trades.append(EnhancedBacktestResult(
                         date=date,
@@ -435,23 +385,9 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
 
             # --- 3. Monitor call spread ---
             if open_call_spread is not None and is_check_bar:
-                # Dynamic SL tightening for call spread
-                if current_time != FINAL_EXIT_TIME:
-                    try:
-                        _cs_current = monitor._calculate_exit_cost(open_call_spread)
-                    except Exception:
-                        _cs_current = _cs_prev_cost
-                    if _cs_current > _cs_prev_cost and _cs_prev_cost > 0:
-                        _cs_adverse_bars += 1
-                    else:
-                        _cs_adverse_bars = 0
-                    _cs_prev_cost = _cs_current
-                    monitor.stop_loss = stop_loss * TREND_TIGHTEN_FACTOR if _cs_adverse_bars >= TREND_TIGHTEN_CONSECUTIVE else stop_loss
-
                 should_exit, current_cost, reason = monitor.check_decay_at_time(
                     open_call_spread, StrategyType.CALL_SPREAD, date, current_time
                 )
-                monitor.stop_loss = stop_loss  # restore after check
 
                 # At final bar use intrinsic settlement value, not stale market price
                 spx_now = self.enhanced_query_engine.get_fastest_spx_price(date, current_time) or 0
@@ -487,7 +423,6 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                         'spx_move_since_entry': round(exit_spx - _cs_entry_spx, 2) if _cs_entry_spx else None,
                         'pnl': round(pnl, 2),
                         'pnl_pct': round(pnl_pct, 2),
-                        'adverse_bars_before_exit': _cs_adverse_bars,
                     }
                     trades.append(EnhancedBacktestResult(
                         date=date,
@@ -597,8 +532,6 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                             if strategy:
                                 open_ic = strategy
                                 ic_leg_status = IronCondorLegStatus()
-                                _ic_adverse_bars = 0
-                                _ic_prev_cost    = 0.0
                                 ic_entry_meta = {
                                     'entry_time': current_time,
                                     'entry_spx': entry_spx,
@@ -638,8 +571,6 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                             )
                             if strategy:
                                 open_put_spread = strategy
-                                _ps_adverse_bars = 0
-                                _ps_prev_cost    = 0.0
                                 put_spread_meta = {
                                     'entry_time': current_time,
                                     'entry_spx': entry_spx,
@@ -679,8 +610,6 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                             )
                             if strategy:
                                 open_call_spread = strategy
-                                _cs_adverse_bars = 0
-                                _cs_prev_cost    = 0.0
                                 call_spread_meta = {
                                     'entry_time': current_time,
                                     'entry_spx': entry_spx,
