@@ -529,8 +529,19 @@ class IntradayPositionMonitor:
         return False, ""
 
     def _should_exit_ic_side(self, side_cost: float, quantity: int = 1) -> Tuple[bool, str]:
-        """Same check for a single IC side (put or call spread)."""
-        return self._should_exit(side_cost, quantity)
+        """
+        Check exit for a single IC leg (put or call side).
+        stop_loss is specified by the user as a per-spread value for the whole IC,
+        so each individual leg's threshold is half of that (IC = 2 spreads).
+        take_profit threshold is the same per leg as per spread.
+        """
+        cost_per_share = side_cost / (100.0 * max(quantity, 1))
+        if cost_per_share <= self.take_profit:
+            return True, f"Take profit hit (${cost_per_share:.3f}/share <= ${self.take_profit:.2f})"
+        leg_stop = self.stop_loss / 2.0
+        if cost_per_share >= leg_stop:
+            return True, f"Stop loss hit (${cost_per_share:.3f}/share >= ${leg_stop:.2f})"
+        return False, ""
 
     def check_decay(self, strategy, strategy_type: StrategyType) -> Tuple[bool, float, str]:
         """
@@ -567,7 +578,8 @@ class IntradayPositionMonitor:
                            ic_leg_status: IronCondorLegStatus) -> IronCondorLegStatus:
         """
         For IC: update prices and check each side independently.
-        Each side exits when its cost/share hits take_profit or stop_loss.
+        Each side exits when its cost/share hits take_profit or stop_loss/2
+        (since stop_loss is per-spread for the whole IC, each leg gets half).
         Updates ic_leg_status in place and returns it.
         """
         try:
@@ -597,7 +609,8 @@ class IntradayPositionMonitor:
     def _check_ic_leg_decay_values(self, strategy) -> Tuple[bool, bool, float, float]:
         """
         For IC: returns (put_side_done, call_side_done, put_cost, call_cost).
-        A side is 'done' when its per-share cost hits take_profit or stop_loss.
+        A side is 'done' when its per-share cost hits take_profit or stop_loss/2
+        (stop_loss is user-specified per whole IC; each leg gets half).
         Costs are already scaled by quantity; quantity is extracted from the strategy.
         """
         try:
