@@ -36,15 +36,22 @@ TREND_FILTER_LOOKBACK_MINUTES = 30  # How far back to measure trend
 TREND_FILTER_POINTS           = 30  # SPX points moved → market is trending; block IC, use asymmetric spread
 
 # Daily-drift guards — anchored to the day's opening price
-# Block the directionally-dangerous spread on large drift days:
-#   down day → block put spreads   (selling puts into a falling market)
-#   up day   → block call spreads  (selling calls into a rising market)
-# IC is also blocked on any significant drift day.
-# Threshold 15 pts chosen from 2/12 data: SPX dropped ~19 pts from open
-# by the first bad put spread entry at 09:59 (~29 mins after open).
-DRIFT_BLOCK_POINTS   = 15.0      # Hard block for IC + dangerous-side spread
-DRIFT_DELAY_POINTS   = 12.0      # Pre-noon IC delay threshold
-DRIFT_MIN_ENTRY_HOUR = "12:00:00"  # No IC before this time on a drifted day
+# Block the DANGEROUS-SIDE spread when the market has moved significantly:
+#   Large DOWN move (≤ -DRIFT_BLOCK_POINTS)  → block call spreads
+#     (mean-reversion bounce through the short call is the risk)
+#   Large UP move   (≥ +DRIFT_BLOCK_POINTS)  → block put spreads
+#     (mean-reversion pullback through the short put is the risk)
+#   IC: blocked only on extreme moves (≥ DRIFT_IC_BLOCK_POINTS)
+#
+# Indicator conviction guard: when day_drift is already negative, require RSI < 50
+# before opening a put spread (indicators must confirm the bullish thesis, not just
+# drift into a falling market on neutral readings).
+DRIFT_BLOCK_POINTS      = 20.0   # Hard block: dangerous-side spread beyond this abs drift
+DRIFT_IC_BLOCK_POINTS   = 50.0   # Hard block: IC entirely on extreme moves
+PUT_SPREAD_MAX_RSI_ON_NEG_DRIFT = 45.0  # Max RSI allowed for put spread when day drift is negative
+# After the call-spread block latches, wait this many minutes before allowing put spreads.
+# Prevents entering into a "dead-cat bounce" immediately after a sharp drop is confirmed.
+PUT_SPREAD_DRIFT_CONFIRM_MINUTES = 30
 
 # Strategy mode constants (match BacktestStrategyEnum values)
 STRATEGY_IRON_CONDOR     = "iron_condor"
@@ -143,19 +150,14 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
         logger.debug(f"Drift guard: SPX open = {spx_open}")
 
         # Sticky drift flags — once set True they stay True for the whole day.
-        # This prevents a temporary bounce from re-enabling a dangerous entry
-        # after the market has already shown its direction.
-        #
-        # Dangerous-side logic:
-        #   Down day → put spreads are dangerous (selling below a falling market)
-        #   Up day   → put spreads are also dangerous (selling below a rising market
-        #              that could reverse, and IC has the put side exposed)
-        #   Either large drift → IC is too risky (both sides exposed)
-        #
-        # Call spreads are NEVER blocked by drift — selling above the market is
-        # always the safe side regardless of direction.
-        _put_spread_ever_blocked = False   # latched True on significant drift either direction
-        _ic_ever_blocked         = False   # latched True on any significant drift
+        # Only the dangerous-side spread is blocked; the safe side stays open.
+        #   Large DOWN move → block call spreads (mean-reversion bounce risk)
+        #   Large UP move   → block put spreads  (mean-reversion pullback risk)
+        #   Extreme move (either dir) → block IC
+        _put_spread_ever_blocked  = False   # latched True on large UP drift
+        _call_spread_ever_blocked = False   # latched True on large DOWN drift
+        _ic_ever_blocked          = False   # latched True on extreme drift (either direction)
+        _call_blocked_latch_time  = None    # HH:MM:SS when call_spread block first latched
 
         # Pre-scan drift check: evaluate every bar from 09:31 up to (but not
         # including) ENTRY_SCAN_START so that the sticky flags are already
@@ -172,14 +174,17 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                 if not _pp or _pp <= 0:
                     continue
                 _pre_drift = float(_pp) - spx_open
-                if abs(_pre_drift) >= DRIFT_BLOCK_POINTS:
+                if _pre_drift >= DRIFT_BLOCK_POINTS:         # large UP → block put spreads
                     _put_spread_ever_blocked = True
-                    _ic_ever_blocked         = True
-                if abs(_pre_drift) >= DRIFT_DELAY_POINTS and _pt < DRIFT_MIN_ENTRY_HOUR:
+                if _pre_drift <= -DRIFT_BLOCK_POINTS:        # large DOWN → block call spreads
+                    if not _call_spread_ever_blocked:
+                        _call_blocked_latch_time = _pt   # record when it first latched
+                    _call_spread_ever_blocked = True
+                if abs(_pre_drift) >= DRIFT_IC_BLOCK_POINTS:  # extreme → block IC
                     _ic_ever_blocked = True
             logger.debug(
                 f"Pre-scan drift check complete: put_blocked={_put_spread_ever_blocked} "
-                f"ic_blocked={_ic_ever_blocked}"
+                f"call_blocked={_call_spread_ever_blocked} ic_blocked={_ic_ever_blocked}"
             )
 
         # Build a per-run monitor with the request's risk params
@@ -477,22 +482,24 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     day_drift = (entry_spx - spx_open) if (spx_open and spx_open > 0) else 0.0
 
                     # Once the dangerous threshold is crossed, latch the flag for the day.
-                    # A temporary bounce does NOT re-enable the dangerous-side spread.
-                    # Both down AND up large drifts block put spreads and IC — on an up
-                    # day the put is still exposed to a reversal and IC has both legs at risk.
-                    # Call spreads are never blocked — selling above the market is always safe.
-                    if abs(day_drift) >= DRIFT_BLOCK_POINTS:
+                    # A temporary bounce does NOT re-enable the blocked side.
+                    if day_drift >= DRIFT_BLOCK_POINTS:          # large UP → block put spreads
                         _put_spread_ever_blocked = True
-                        _ic_ever_blocked         = True
-                    if abs(day_drift) >= DRIFT_DELAY_POINTS and current_time < DRIFT_MIN_ENTRY_HOUR:
+                    if day_drift <= -DRIFT_BLOCK_POINTS:         # large DOWN → block call spreads
+                        if not _call_spread_ever_blocked:
+                            _call_blocked_latch_time = current_time  # record first latch
+                        _call_spread_ever_blocked = True
+                    if abs(day_drift) >= DRIFT_IC_BLOCK_POINTS:  # extreme → block IC
                         _ic_ever_blocked = True
 
-                    ic_blocked_by_drift = _ic_ever_blocked
-                    put_spread_blocked  = _put_spread_ever_blocked
-                    if ic_blocked_by_drift or put_spread_blocked:
+                    ic_blocked_by_drift   = _ic_ever_blocked
+                    put_spread_blocked    = _put_spread_ever_blocked
+                    call_spread_blocked   = _call_spread_ever_blocked
+                    if ic_blocked_by_drift or put_spread_blocked or call_spread_blocked:
                         logger.debug(
                             f"Drift guard at {current_time}: drift={day_drift:+.1f} "
-                            f"ic_blocked={ic_blocked_by_drift} put_blocked={put_spread_blocked}"
+                            f"ic_blocked={ic_blocked_by_drift} put_blocked={put_spread_blocked} "
+                            f"call_blocked={call_spread_blocked}"
                         )
 
                     # Determine which entry types are permitted by this strategy mode.
@@ -501,10 +508,15 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     #  put spread on up-trend — sell premium below a rising market).
                     allow_ic      = strategy_mode in (STRATEGY_IRON_CONDOR, STRATEGY_IC_CREDIT_SPREADS) and not is_trending and not ic_blocked_by_drift
                     allow_spreads = strategy_mode in (STRATEGY_CREDIT_SPREADS, STRATEGY_IC_CREDIT_SPREADS)
-
-                    # Asymmetric override: in iron_condor or ic_credit_spreads mode,
-                    # when trending, allow the safe-side spread only
-                    if is_trending and strategy_mode in (STRATEGY_IRON_CONDOR, STRATEGY_IC_CREDIT_SPREADS):
+                    # Trend override: only apply when the short-term trend direction
+                    # agrees with (or is neutral to) the day's drift from open.
+                    # A 30-min bounce on a down day is not a real trend — ignore it.
+                    trend_agrees_with_drift = (
+                        (trend_dir == 'down' and day_drift <= 0) or
+                        (trend_dir == 'up'   and day_drift >= 0) or
+                        day_drift == 0.0
+                    )
+                    if is_trending and trend_agrees_with_drift and strategy_mode in (STRATEGY_IRON_CONDOR, STRATEGY_IC_CREDIT_SPREADS):
                         allow_spreads = True
                         # Override selection to the safe-side spread
                         if trend_dir == 'down':
@@ -553,6 +565,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                         'trend_override': False,
                                         'ic_blocked_by_drift': ic_blocked_by_drift,
                                         'put_spread_blocked': put_spread_blocked,
+                                        'call_spread_blocked': call_spread_blocked,
                                         'rsi': round(indicators.rsi, 2),
                                         'bb_position': round(indicators.bb_position, 3),
                                         'bb_upper': round(indicators.bb_upper, 2),
@@ -563,7 +576,25 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                 logger.info(f"Opened IC at {current_time}")
 
                     elif selection.strategy_type == StrategyType.PUT_SPREAD and allow_spreads and not put_spread_blocked:
-                        if open_put_spread is None and open_ic is None:
+                        # Three-part guard for put spreads on negative-drift days:
+                        #   1. Drift guard: call_spread_blocked must be True (drift <= -20 pts)
+                        #   2. RSI guard: RSI must be <= 45 (genuinely oversold, not a bounce)
+                        #   3. Cooldown: at least PUT_SPREAD_DRIFT_CONFIRM_MINUTES must have
+                        #      elapsed since call_spread_blocked first latched — prevents
+                        #      entering immediately after a sharp drop is confirmed.
+                        # On flat/up days (drift >= 0), all guards are bypassed.
+                        if day_drift < 0:
+                            rsi_ok = indicators.rsi <= PUT_SPREAD_MAX_RSI_ON_NEG_DRIFT
+                            if call_spread_blocked and _call_blocked_latch_time:
+                                latch_dt  = pd.Timestamp(f"{date} {_call_blocked_latch_time}")
+                                current_dt = pd.Timestamp(f"{date} {current_time}")
+                                cooldown_ok = (current_dt - latch_dt).seconds / 60 >= PUT_SPREAD_DRIFT_CONFIRM_MINUTES
+                            else:
+                                cooldown_ok = False
+                            put_ok = call_spread_blocked and rsi_ok and cooldown_ok
+                        else:
+                            put_ok = True
+                        if open_put_spread is None and open_ic is None and put_ok:
                             strategy = self._try_open_strategy(
                                 date, current_time, StrategyType.PUT_SPREAD,
                                 target_delta, target_prob_itm, min_spread_width, quantity,
@@ -592,6 +623,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                         'trend_override': 'trend override' in selection.reason.lower(),
                                         'ic_blocked_by_drift': ic_blocked_by_drift,
                                         'put_spread_blocked': put_spread_blocked,
+                                        'call_spread_blocked': call_spread_blocked,
                                         'rsi': round(indicators.rsi, 2),
                                         'bb_position': round(indicators.bb_position, 3),
                                         'bb_upper': round(indicators.bb_upper, 2),
@@ -601,7 +633,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                 }
                                 logger.info(f"Opened put spread at {current_time}")
 
-                    elif selection.strategy_type == StrategyType.CALL_SPREAD and allow_spreads:
+                    elif selection.strategy_type == StrategyType.CALL_SPREAD and allow_spreads and not call_spread_blocked:
                         if open_call_spread is None and open_ic is None:
                             strategy = self._try_open_strategy(
                                 date, current_time, StrategyType.CALL_SPREAD,
@@ -631,6 +663,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                         'trend_override': 'trend override' in selection.reason.lower(),
                                         'ic_blocked_by_drift': ic_blocked_by_drift,
                                         'put_spread_blocked': put_spread_blocked,
+                                        'call_spread_blocked': call_spread_blocked,
                                         'rsi': round(indicators.rsi, 2),
                                         'bb_position': round(indicators.bb_position, 3),
                                         'bb_upper': round(indicators.bb_upper, 2),
