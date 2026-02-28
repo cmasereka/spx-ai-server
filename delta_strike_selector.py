@@ -568,6 +568,7 @@ class IntradayPositionMonitor:
         """
         For IC: update prices and check each side independently.
         Each side exits when its cost/share hits take_profit or stop_loss.
+        stop_loss is per spread — applied identically to each IC leg.
         Updates ic_leg_status in place and returns it.
         """
         try:
@@ -598,6 +599,7 @@ class IntradayPositionMonitor:
         """
         For IC: returns (put_side_done, call_side_done, put_cost, call_cost).
         A side is 'done' when its per-share cost hits take_profit or stop_loss.
+        stop_loss is per spread — applied identically to each IC leg.
         Costs are already scaled by quantity; quantity is extracted from the strategy.
         """
         try:

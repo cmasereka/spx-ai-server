@@ -190,7 +190,6 @@ class TradeCheckpointsResponse(BaseModel):
 
 
 class WebSocketMessage(BaseModel):
-    """WebSocket message format"""
     type: str = Field(..., description="Message type")
     backtest_id: Optional[str] = Field(None, description="Related backtest ID")
     timestamp: datetime = Field(default_factory=datetime.now, description="Message timestamp")
@@ -203,3 +202,63 @@ class ErrorResponse(BaseModel):
     message: str = Field(..., description="Error message")
     timestamp: datetime = Field(default_factory=datetime.now, description="Error timestamp")
     details: Optional[Dict[str, Any]] = Field(None, description="Additional error details")
+
+
+# ---------------------------------------------------------------------------
+# Paper Trading models
+# ---------------------------------------------------------------------------
+
+class PaperTradingMode(str, Enum):
+    """Paper trading execution mode"""
+    SIMULATION = "simulation"  # Replay a historical date at full speed
+    LIVE = "live"              # Process today's data as bars arrive in real time
+
+
+class PaperTradingRequest(BaseModel):
+    """Request model for starting a paper trading session"""
+    mode: PaperTradingMode = Field(PaperTradingMode.SIMULATION, description="Execution mode")
+
+    # Optional date: defaults to latest available date when omitted
+    trade_date: Optional[date] = Field(None, description="Trading date (defaults to latest available)")
+
+    # Strategy configuration — same knobs as a backtest
+    strategy: BacktestStrategyEnum = Field(
+        BacktestStrategyEnum.CREDIT_SPREADS,
+        description="Which trade types to consider"
+    )
+    target_credit: float = Field(0.35, ge=0.05, le=5.0, description="Target net credit per spread")
+    spread_width: int = Field(10, ge=5, le=100, description="Spread width in strike points")
+    contracts: int = Field(1, ge=1, le=100, description="Number of contracts per position")
+    take_profit: float = Field(0.05, ge=0.01, le=10.0, description="Take-profit threshold")
+    stop_loss: float = Field(3.0, ge=0.10, le=20.0, description="Stop-loss threshold")
+    monitor_interval: int = Field(5, ge=1, le=15, description="Minutes between position checks")
+
+
+class PaperPosition(BaseModel):
+    """An open (not yet closed) paper trading position"""
+    position_id: str = Field(..., description="Unique identifier for this position")
+    strategy_type: str = Field(..., description="IC / Put Spread / Call Spread")
+    entry_time: str = Field(..., description="Entry time HH:MM:SS")
+    entry_spx_price: float = Field(..., description="SPX price at entry")
+    entry_credit: float = Field(..., description="Total credit received")
+    strikes: Dict[str, Any] = Field(default_factory=dict, description="Strike prices")
+
+
+class PaperTradingStatus(BaseModel):
+    """Full status of a paper trading session"""
+    session_id: str = Field(..., description="Unique session identifier")
+    mode: str = Field(..., description="simulation or live")
+    trade_date: str = Field(..., description="Date being traded YYYY-MM-DD")
+    status: str = Field(..., description="pending | running | completed | stopped | failed")
+
+    # Live position state
+    open_positions: List[PaperPosition] = Field(default_factory=list)
+    completed_trades: List[BacktestResult] = Field(default_factory=list)
+    day_pnl: float = Field(0.0)
+    trade_count: int = Field(0)
+
+    # Timing
+    created_at: datetime = Field(...)
+    started_at: Optional[datetime] = Field(None)
+    completed_at: Optional[datetime] = Field(None)
+    error_message: Optional[str] = Field(None)

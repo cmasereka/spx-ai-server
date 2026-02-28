@@ -149,10 +149,16 @@ class EnhancedQueryEngineAdapter:
         try:
             session_data = self.query_engine.get_trading_session_data(date, start_time, end_time)
 
-            if session_data and 'spx_prices' in session_data:
-                spx_df = session_data['spx_prices']
+            if session_data and 'spx' in session_data:
+                spx_df = session_data['spx']
                 if len(spx_df) > 0:
-                    return spx_df
+                    # Normalize column name so downstream code can always use 'close'
+                    if 'price' in spx_df.columns and 'close' not in spx_df.columns:
+                        spx_df = spx_df.rename(columns={'price': 'close'})
+                    # Drop any zero-price rows (e.g. the 09:30 sentinel bar in the data)
+                    spx_df = spx_df[spx_df['close'] > 0]
+                    if len(spx_df) > 0:
+                        return spx_df
 
             # Fallback: synthetic price history around current price
             current_price = self.query_engine.get_fastest_spx_price(date, end_time)

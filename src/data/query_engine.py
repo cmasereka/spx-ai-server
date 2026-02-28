@@ -163,8 +163,8 @@ class BacktestQueryEngine:
         else:
             target_dt = target_time
         
-        # Find nearest ATM index entry
-        atm_times = list(self._atm_index[date_str].keys())
+        # Find nearest ATM index entry — sort keys so bisect works correctly
+        atm_times = sorted(self._atm_index[date_str].keys())
         idx = bisect.bisect_right(atm_times, target_dt)
         
         if idx > 0:
