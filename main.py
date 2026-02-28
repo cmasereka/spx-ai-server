@@ -14,29 +14,38 @@ from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
 from api.models import (
-    BacktestRequest, BacktestResponse, BacktestStatus, 
+    BacktestRequest, BacktestResponse, BacktestStatus,
     BacktestResult, SystemStatus
 )
 from api.backtest_service import BacktestService
 from api.websocket_manager import WebSocketManager
 from api import database_routes
+from api.paper_trading_service import PaperTradingService
+import api.paper_trading_routes as paper_trading_routes
 
 # Global services
 backtest_service = BacktestService()
+paper_trading_svc = PaperTradingService()
 websocket_manager = WebSocketManager()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager"""
     logger.info("🚀 SPX AI Trading Platform starting up...")
-    
+
     # Initialize services
     await backtest_service.initialize()
     logger.info("✅ Backtest service initialized")
-    
+
+    # Reuse the already-loaded engine for paper trading
+    await paper_trading_svc.initialize(backtest_service.engine)
+    paper_trading_routes.init_router(paper_trading_svc, websocket_manager)
+    logger.info("✅ Paper trading service initialized")
+
     yield
-    
+
     # Cleanup
+    await paper_trading_svc.cleanup()
     await backtest_service.cleanup()
     logger.info("🛑 SPX AI Trading Platform shutting down")
 
@@ -64,6 +73,9 @@ app.add_middleware(
 
 # Include database routes
 app.include_router(database_routes.router)
+
+# Include paper trading routes
+app.include_router(paper_trading_routes.router)
 
 @app.get("/", tags=["Health"])
 async def root():

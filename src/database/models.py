@@ -177,6 +177,34 @@ class OptionData(Base):
     def __repr__(self):
         return f"<OptionData(symbol={self.symbol}, strike={self.strike}, exp={self.expiration_date})>"
 
+class PaperTradingRun(Base):
+    __tablename__ = 'paper_trading_runs'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_id = Column(String(50), unique=True, nullable=False, index=True)
+    mode = Column(String(20), nullable=False)        # 'simulation' | 'live'
+    trade_date = Column(Date, nullable=False)
+    strategy_type = Column(String(20), nullable=False)
+
+    # Strategy parameters
+    parameters = Column(JSONB, nullable=True)
+
+    # Status and timing
+    status = Column(String(20), nullable=False, default='pending')
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    error_message = Column(Text, nullable=True)
+
+    # Results summary
+    total_trades = Column(Integer, nullable=True)
+    successful_trades = Column(Integer, nullable=True)
+    total_pnl = Column(Float, nullable=True)
+
+    def __repr__(self):
+        return f"<PaperTradingRun(session_id={self.session_id}, date={self.trade_date}, status={self.status})>"
+
+
 class SystemLog(Base):
     __tablename__ = 'system_logs'
     

@@ -48,7 +48,7 @@ TREND_FILTER_POINTS           = 30  # SPX points moved → market is trending; b
 # drift into a falling market on neutral readings).
 DRIFT_BLOCK_POINTS      = 20.0   # Hard block: dangerous-side spread beyond this abs drift
 DRIFT_IC_BLOCK_POINTS   = 50.0   # Hard block: IC entirely on extreme moves
-PUT_SPREAD_MAX_RSI_ON_NEG_DRIFT = 45.0  # Max RSI allowed for put spread on negative-drift day
+PUT_SPREAD_MAX_RSI_ON_NEG_DRIFT = 30.0  # Max RSI allowed for put spread on negative-drift day
 PUT_SPREAD_MAX_RSI_ON_POS_DRIFT = 30.0  # Max RSI allowed for put spread on flat/positive-drift day
 #   Tighter requirement on up days: only enter if market is genuinely very oversold;
 #   an RSI between 30-45 on an up day does not provide enough conviction.
@@ -63,7 +63,7 @@ INTRADAY_CALL_REVERSAL_POINTS = 15.0
 INTRADAY_PUT_REVERSAL_POINTS  = 10.0
 # Extreme overbought threshold: when RSI exceeds this level, do not sell a call spread —
 # the market is in a momentum burst and may continue higher.
-CALL_SPREAD_MAX_ENTRY_RSI = 80.0
+CALL_SPREAD_MAX_ENTRY_RSI = 77.0
 
 # Strategy mode constants (match BacktestStrategyEnum values)
 STRATEGY_IRON_CONDOR     = "iron_condor"
@@ -129,7 +129,8 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                               monitor_interval: int = 1,
                               quantity: int = 1,
                               target_credit: Optional[float] = 0.50,
-                              strategy_mode: str = STRATEGY_IRON_CONDOR) -> DayBacktestResult:
+                              strategy_mode: str = STRATEGY_IRON_CONDOR,
+                              progress_callback=None) -> DayBacktestResult:
         """
         Full intraday scan loop for one trading day.
         strategy_mode controls which entry types are allowed:
@@ -144,6 +145,14 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
 
         scan_times = _build_minute_grid(date, ENTRY_SCAN_START, FINAL_EXIT_TIME)
         trades: List[EnhancedBacktestResult] = []
+
+        def _fire(event: dict):
+            """Invoke progress_callback safely — never let it crash the backtest."""
+            if progress_callback:
+                try:
+                    progress_callback(event)
+                except Exception as _cb_err:
+                    logger.debug(f"progress_callback error (ignored): {_cb_err}")
 
         if date not in self.available_dates:
             return DayBacktestResult(date=date, trades=[], total_pnl=0.0,
@@ -228,6 +237,17 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
         # Track whether a call spread was opened at any point today.
         # Used to prevent re-entry on a declining day after the first call spread closes.
         _had_call_spread_today = False
+
+        # Track whether a call spread closed with a profit today.
+        # Used to prevent entering a put spread after a winning CS on an up/flat day
+        # (the CS win is enough premium for the day; a subsequent PS risks giving it back).
+        _had_call_spread_win_today = False
+
+        # Track whether a put spread closed with a profit today.
+        # Used to prevent entering a call spread after a winning PS on a declining day
+        # (the PS win is enough premium for the day; a subsequent CS bets against an
+        # already-falling market with low RSI, which is extremely risky).
+        _had_put_spread_win_today = False
 
         # Checkpoint lists — built up while a position is open, flushed on close
         ic_checkpoints        : list = []
@@ -342,6 +362,8 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     ic_leg_status = None
                     ic_entry_meta = {}
                     ic_checkpoints = []
+                    _fire({'event': 'position_closed', 'strategy_type': 'Iron Condor',
+                           'result': trades[-1]})
 
             # --- 2. Monitor put spread ---
             if open_put_spread is not None and is_check_bar:
@@ -411,6 +433,11 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     open_put_spread = None
                     put_spread_meta = {}
                     put_spread_checkpoints = []
+                    # Latch win flag for post-PS call spread guard
+                    if pnl > 0:
+                        _had_put_spread_win_today = True
+                    _fire({'event': 'position_closed', 'strategy_type': 'Put Spread',
+                           'result': trades[-1]})
 
             # --- 3. Monitor call spread ---
             if open_call_spread is not None and is_check_bar:
@@ -480,8 +507,11 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     open_call_spread = None
                     call_spread_meta = {}
                     call_spread_checkpoints = []
-
-            # --- 4. Scan for new entry (only before 2 PM and before final bar) ---
+                    # Latch win flag for post-CS put spread guard
+                    if pnl > 0:
+                        _had_call_spread_win_today = True
+                    _fire({'event': 'position_closed', 'strategy_type': 'Call Spread',
+                           'result': trades[-1]})
             if not is_past_entry_cutoff and not is_final_bar:
                 try:
                     spx_history = self.get_spx_price_history(date, current_time, lookback_minutes=60)
@@ -581,6 +611,34 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     if indicators.bb_position < 0.05:
                         put_spread_blocked = True
 
+                    # Moderate-decline put spread guard:
+                    # When the market has declined moderately from the open (-50 < drift < 0)
+                    # and RSI is below 30 (oversold), a put spread with sl=3 is high risk:
+                    # the market has not fallen far enough to signal a reliable bounce, and
+                    # the stop is tight enough to get hit before any recovery.
+                    # We allow put spreads once the market has fallen more than 50 pts
+                    # (extreme sell-off territory) because at that magnitude a bounce is
+                    # significantly more likely than further continuation.
+                    if day_drift < 0 and day_drift > -50 and indicators.rsi < 30:
+                        put_spread_blocked = True
+
+                    # Extreme panic selling guard:
+                    # RSI below 12 indicates the most extreme short-term overselling —
+                    # the kind seen only during acute crash moments (sharp intraday drops).
+                    # In these conditions the market often continues falling for several more
+                    # bars before any meaningful bounce.  A put spread with sl=3 will almost
+                    # certainly be stopped out before the recovery materialises.
+                    if indicators.rsi < 12:
+                        put_spread_blocked = True
+
+                    # Deep crash continuation guard:
+                    # When the market has already fallen more than 50 pts AND RSI is still
+                    # below 20 (the market has not stabilised even at extreme sell-off levels),
+                    # further continuation is more likely than an immediate bounce.
+                    # Block put spreads until RSI shows at least some stabilisation (≥ 20).
+                    if day_drift < -50 and indicators.rsi < 20:
+                        put_spread_blocked = True
+
                     # Extreme overbought call spread guard:
                     # RSI above CALL_SPREAD_MAX_ENTRY_RSI (80) signals a momentum burst —
                     # the market is likely continuing higher, making a call spread
@@ -638,6 +696,85 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     if _had_call_spread_today and day_drift < 0:
                         call_spread_blocked = True
 
+                    # No call spread re-entry after a big run-up guard:
+                    # If a call spread was already opened today and drift has since extended
+                    # further upward (> 15 pts), the market is in a strong bull run.
+                    # Re-entering a second call spread chases momentum at the worst time —
+                    # stop losses on call spreads are triggered by further upside.
+                    if _had_call_spread_today and day_drift > 15:
+                        call_spread_blocked = True
+
+                    # Sub-zero Bollinger Band guard:
+                    # BB position < 0 (below the lower band) signals an extreme bearish
+                    # breakdown. Selling a call spread in this environment bets against
+                    # continued selling — extremely risky in a true breakdown.
+                    if indicators.bb_position < 0.10:
+                        call_spread_blocked = True
+
+                    # Expanded bear-flag guard (extended drift threshold):
+                    # Even a modest negative drift (-3 pts) combined with price near the
+                    # upper Bollinger Band (> 0.82) is a bear-flag pattern — block call spreads.
+                    if day_drift < -3 and indicators.bb_position > 0.82:
+                        call_spread_blocked = True
+
+                    # Low RSI guard (expanded from RSI < 30):
+                    # RSI below 32 means the market is deeply oversold — any call spread
+                    # bet against further downside is extremely risky at these levels.
+                    if indicators.rsi < 32:
+                        call_spread_blocked = True
+
+                    # Post-winning-call-spread put guard:
+                    # If a call spread already closed profitably today, do not open a new
+                    # put spread unless the market is at extreme oversold levels (RSI ≤ 20).
+                    # Rationale: the CS already secured the day's premium target.  Chasing
+                    # a PS with RSI still above 20 means the oversold signal is not strong
+                    # enough to justify the additional risk — the market may not have found
+                    # its floor yet.
+                    if _had_call_spread_win_today and indicators.rsi > 20:
+                        put_spread_blocked = True
+
+                    # Post-winning-put-spread call guard:
+                    # If a put spread already closed profitably today and the market is
+                    # still oversold (RSI < 40) and below the mid-Bollinger Band (< 0.50),
+                    # do not open a call spread.
+                    # Rationale: the market is in a confirmed downtrend; a call spread bets
+                    # on a capped market when all indicators still point downward.
+                    if _had_put_spread_win_today and indicators.rsi < 40 and indicators.bb_position < 0.50:
+                        call_spread_blocked = True
+
+                    # Concurrent call-spread / oversold guard:
+                    # If a call spread is currently open and RSI drops below 40, the market
+                    # is moving against the CS while also signaling oversold conditions.
+                    # Opening a put spread in this state creates an unintended IC-like
+                    # exposure where both legs are under simultaneous stress.
+                    if open_call_spread is not None and indicators.rsi < 40:
+                        put_spread_blocked = True
+
+                    # Concurrent put-spread / oversold guard:
+                    # If a put spread is currently open and the market is still oversold
+                    # (RSI < 40) with price below the mid-Bollinger Band (< 0.50), the
+                    # downtrend is not resolved.  Opening a call spread creates unbalanced
+                    # IC exposure on a clearly directional day.
+                    if open_put_spread is not None and indicators.rsi < 40 and indicators.bb_position < 0.50:
+                        call_spread_blocked = True
+
+                    # Concurrent put-spread / recovered market guard:
+                    # If a put spread is currently open and RSI has rebounded above 65,
+                    # the market has bounced enough to threaten the put spread's short leg.
+                    # Opening a call spread now creates unintended IC exposure at the exact
+                    # moment when both legs are under simultaneous pressure.
+                    if open_put_spread is not None and indicators.rsi > 65:
+                        call_spread_blocked = True
+
+                    # Overbought RSI on declining day guard:
+                    # When the market is below its opening level (negative day_drift) but
+                    # RSI is in overbought territory (> 74), the technical picture is
+                    # contradictory: price has already declined yet momentum is "overbought".
+                    # This typically indicates a late-day reversal that pushed RSI high on
+                    # a declining day — a very risky setup for a call spread.
+                    if day_drift < 0 and indicators.rsi > 74:
+                        call_spread_blocked = True
+
                     if selection.strategy_type == StrategyType.IRON_CONDOR and allow_ic:
                         if open_ic is None and open_put_spread is None and open_call_spread is None:
                             strategy = self._try_open_strategy(
@@ -678,6 +815,10 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                     }
                                 }
                                 logger.info(f"Opened IC at {current_time}")
+                                _fire({'event': 'position_opened', 'strategy_type': 'Iron Condor',
+                                       'entry_time': current_time, 'entry_spx': entry_spx,
+                                       'entry_credit': getattr(strategy, 'entry_credit', 0),
+                                       'strikes': ic_entry_meta.get('strike_selection')})
 
                     elif selection.strategy_type == StrategyType.PUT_SPREAD and allow_spreads and not put_spread_blocked:
                         # RSI conviction is required for ALL put spread entries.
@@ -741,6 +882,10 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                     }
                                 }
                                 logger.info(f"Opened put spread at {current_time}")
+                                _fire({'event': 'position_opened', 'strategy_type': 'Put Spread',
+                                       'entry_time': current_time, 'entry_spx': entry_spx,
+                                       'entry_credit': getattr(strategy, 'entry_credit', 0),
+                                       'strikes': put_spread_meta.get('strike_selection')})
 
                     elif selection.strategy_type == StrategyType.CALL_SPREAD and allow_spreads and not call_spread_blocked:
                         if open_call_spread is None and open_ic is None:
@@ -782,6 +927,10 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                     }
                                 }
                                 logger.info(f"Opened call spread at {current_time}")
+                                _fire({'event': 'position_opened', 'strategy_type': 'Call Spread',
+                                       'entry_time': current_time, 'entry_spx': entry_spx,
+                                       'entry_credit': getattr(strategy, 'entry_credit', 0),
+                                       'strikes': call_spread_meta.get('strike_selection')})
 
                 except Exception as e:
                     logger.debug(f"Entry scan error at {current_time}: {e}")
