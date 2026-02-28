@@ -291,7 +291,7 @@ class BacktestService:
 
                         # Send individual trade result
                         await websocket_manager.send_trade_result(
-                            backtest_id, api_result.dict()
+                            backtest_id, api_result.model_dump(mode="json")
                         )
                 
                 # Small async delay
