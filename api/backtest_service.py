@@ -290,6 +290,7 @@ class BacktestService:
                         "entry_spx_price": float(event.get("entry_spx", 0)),
                         "entry_credit":    float(event.get("entry_credit", 0)),
                         "strikes":         strikes,
+                        "entry_rationale": event.get("entry_rationale"),
                     }
                     loop.call_soon_threadsafe(
                         asyncio.ensure_future,

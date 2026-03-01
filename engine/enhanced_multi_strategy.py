@@ -851,7 +851,8 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                 _fire({'event': 'position_opened', 'strategy_type': 'Iron Condor',
                                        'entry_time': current_time, 'entry_spx': entry_spx,
                                        'entry_credit': getattr(strategy, 'entry_credit', 0),
-                                       'strikes': ic_entry_meta.get('strike_selection')})
+                                       'strikes': ic_entry_meta.get('strike_selection'),
+                                       'entry_rationale': ic_entry_meta.get('entry_rationale')})
 
                     elif selection.strategy_type == StrategyType.PUT_SPREAD and allow_spreads and not put_spread_blocked:
                         # RSI conviction is required for ALL put spread entries.
@@ -918,7 +919,8 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                 _fire({'event': 'position_opened', 'strategy_type': 'Put Spread',
                                        'entry_time': current_time, 'entry_spx': entry_spx,
                                        'entry_credit': getattr(strategy, 'entry_credit', 0),
-                                       'strikes': put_spread_meta.get('strike_selection')})
+                                       'strikes': put_spread_meta.get('strike_selection'),
+                                       'entry_rationale': put_spread_meta.get('entry_rationale')})
 
                     elif selection.strategy_type == StrategyType.CALL_SPREAD and allow_spreads and not call_spread_blocked:
                         if open_call_spread is None and open_ic is None:
@@ -963,7 +965,8 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                 _fire({'event': 'position_opened', 'strategy_type': 'Call Spread',
                                        'entry_time': current_time, 'entry_spx': entry_spx,
                                        'entry_credit': getattr(strategy, 'entry_credit', 0),
-                                       'strikes': call_spread_meta.get('strike_selection')})
+                                       'strikes': call_spread_meta.get('strike_selection'),
+                                       'entry_rationale': call_spread_meta.get('entry_rationale')})
 
                 except Exception as e:
                     logger.debug(f"Entry scan error at {current_time}: {e}")

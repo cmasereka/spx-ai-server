@@ -334,6 +334,7 @@ class LiveTradingService:
                         entry_spx_price=float(event.get("entry_spx", 0)),
                         entry_credit=float(event.get("entry_credit", 0)),
                         strikes=_strikes_from_selection(event.get("strikes")),
+                        entry_rationale=event.get("entry_rationale"),
                     )
                     state.open_positions.append(pos)
 

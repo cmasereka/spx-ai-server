@@ -106,6 +106,8 @@ class LiveTradingSession:
         strategy_mode: str = STRATEGY_IRON_CONDOR,
         quantity: int = 1,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        entry_start_time: str = "10:00:00",
+        last_entry_time: str = "14:00:00",
     ) -> DayBacktestResult:
         """
         Run the full trading day and return a DayBacktestResult.
@@ -151,6 +153,8 @@ class LiveTradingSession:
                 progress_callback=self._wrap_callback_with_broker(
                     _fire, quantity
                 ),
+                entry_start_time=entry_start_time,
+                last_entry_time=last_entry_time,
             )
         finally:
             # Always restore the original provider

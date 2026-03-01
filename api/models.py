@@ -61,6 +61,16 @@ class BacktestRequest(BaseModel):
     stop_loss: float = Field(6.0, ge=0.10, le=20.0, description="Stop loss: exit when cost-to-close per spread per share reaches this absolute value. E.g. 2.0 exits when closing costs $2.00/share.")
     monitor_interval: int = Field(5, ge=1, le=15, description="Minutes between position checks. 1 = every bar, 5 = every 5 minutes.")
 
+    # Entry / exit time window
+    entry_start_time: str = Field(
+        "10:00:00",
+        description="Time to begin scanning for entry signals (HH:MM:SS, 24-hour). Default 10:00:00."
+    )
+    last_entry_time: str = Field(
+        "14:00:00",
+        description="No new entries at or after this time (HH:MM:SS, 24-hour). Default 14:00:00."
+    )
+
     @field_validator('start_date', 'end_date', 'single_date')
     @classmethod
     def validate_dates(cls, v):
@@ -212,6 +222,7 @@ class PaperPosition(BaseModel):
     entry_spx_price: float = Field(..., description="SPX price at entry")
     entry_credit: float = Field(..., description="Total credit received")
     strikes: Dict[str, Any] = Field(default_factory=dict, description="Strike prices")
+    entry_rationale: Optional[Dict[str, Any]] = Field(None, description="Why this trade was entered")
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +270,16 @@ class LiveTradingRequest(BaseModel):
                              description="Stop-loss threshold ($/share cost-to-close)")
     monitor_interval: int = Field(5, ge=1, le=15,
                                   description="Minutes between position checks")
+
+    # Entry / exit time window
+    entry_start_time: str = Field(
+        "10:00:00",
+        description="Time to begin scanning for entry signals (HH:MM:SS, 24-hour). Default 10:00:00."
+    )
+    last_entry_time: str = Field(
+        "14:00:00",
+        description="No new entries at or after this time (HH:MM:SS, 24-hour). Default 14:00:00."
+    )
 
     @field_validator("trade_date")
     @classmethod

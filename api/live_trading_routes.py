@@ -6,11 +6,12 @@ Endpoints:
   GET    /api/v1/trading/sessions          — list all sessions
   GET    /api/v1/trading/sessions/{id}     — get session status
   DELETE /api/v1/trading/sessions/{id}     — stop a running session
+  DELETE /api/v1/trading/sessions/{id}?purge=true — stop and permanently delete
   POST   /api/v1/trading/test-connection   — test IBKR connectivity
 """
 
 import asyncio
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from loguru import logger
 
 from .models import LiveTradingRequest, LiveTradingStatus, IBKRConnectionConfig
@@ -81,17 +82,29 @@ async def get_live_trading_session(session_id: str):
 
 
 @router.delete("/sessions/{session_id}")
-async def stop_live_trading_session(session_id: str):
-    """Stop a running live trading session and close all open IBKR positions."""
+async def stop_live_trading_session(
+    session_id: str,
+    purge: bool = Query(False, description="If true, permanently delete the session record"),
+):
+    """
+    Stop a running session and close all open IBKR positions.
+    Pass ``?purge=true`` to also permanently remove the session record.
+    """
     try:
-        stopped = await live_trading_service.stop_session(session_id)
-        if not stopped:
-            raise HTTPException(status_code=404, detail="Session not found")
-        return {"message": "Session stopped", "session_id": session_id}
+        if purge:
+            deleted = await live_trading_service.delete_session(session_id)
+            if not deleted:
+                raise HTTPException(status_code=404, detail="Session not found")
+            return {"message": "Session deleted", "session_id": session_id}
+        else:
+            stopped = await live_trading_service.stop_session(session_id)
+            if not stopped:
+                raise HTTPException(status_code=404, detail="Session not found")
+            return {"message": "Session stopped", "session_id": session_id}
     except HTTPException:
         raise
     except Exception as exc:
-        logger.error(f"Failed to stop live session {session_id}: {exc}")
+        logger.error(f"Failed to stop/delete live session {session_id}: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
 
 
