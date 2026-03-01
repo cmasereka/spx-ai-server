@@ -225,12 +225,12 @@ class BacktestService:
     async def _run_backtest_with_progress(self, backtest_id: str, request: BacktestRequest,
                                         websocket_manager: WebSocketManager, loop) -> List[BacktestResult]:
         """Run backtest with progress updates"""
-        
+
         if not self.engine:
             raise RuntimeError("Backtest engine not initialized")
-        
+
         results = []
-        
+
         # Determine dates to test
         if request.mode.value == "single_day":
             test_dates = [request.single_date] if request.single_date else []
@@ -239,71 +239,131 @@ class BacktestService:
         else:
             # Filter available dates by range
             available_dates = self.engine.available_dates or []
-            
+
             # Convert string dates to date objects for comparison
             from datetime import datetime
-            
+
             test_dates = []
             for date_str in available_dates:
                 try:
                     # Convert string date to date object
                     date_obj = datetime.strptime(date_str, '%Y-%m-%d').date()
-                    
+
                     # Check if date falls within requested range
                     if (not request.start_date or date_obj >= request.start_date) and \
                        (not request.end_date or date_obj <= request.end_date):
                         test_dates.append(date_obj)
-                        
+
                 except ValueError:
                     logger.warning(f"Invalid date format in available_dates: {date_str}")
                     continue
-        
+
         total_dates = len(test_dates)
-        
+
+        # Track open positions keyed by (strategy_type, entry_time) so we can
+        # match them to subsequent monitor_tick and position_closed events.
+        open_position_ids: dict = {}
+        day_results: list = []  # populated by callback's position_closed handler
+
+        def make_progress_callback(day_backtest_id: str):
+            """Return a thread-safe callback for one day's backtest run."""
+            import uuid as _uuid
+
+            def callback(event: dict):
+                ev = event.get("event")
+                if ev == "position_opened":
+                    key = (event.get("strategy_type", ""), event.get("entry_time", ""))
+                    position_id = str(_uuid.uuid4())
+                    open_position_ids[key] = position_id
+                    # Convert strike selection object to plain dict
+                    raw_strikes = event.get("strikes")
+                    if hasattr(raw_strikes, "__dict__"):
+                        strikes = {k: v for k, v in vars(raw_strikes).items() if not k.startswith("_")}
+                    elif hasattr(raw_strikes, "_asdict"):
+                        strikes = raw_strikes._asdict()
+                    else:
+                        strikes = raw_strikes or {}
+                    payload = {
+                        "position_id":     position_id,
+                        "strategy_type":   event.get("strategy_type", ""),
+                        "entry_time":      event.get("entry_time", ""),
+                        "entry_spx_price": float(event.get("entry_spx", 0)),
+                        "entry_credit":    float(event.get("entry_credit", 0)),
+                        "strikes":         strikes,
+                    }
+                    loop.call_soon_threadsafe(
+                        asyncio.ensure_future,
+                        websocket_manager.send_backtest_update(day_backtest_id, "position_opened", payload)
+                    )
+
+                elif ev == "monitor_tick":
+                    key = (event.get("strategy_type", ""), event.get("entry_time", ""))
+                    position_id = open_position_ids.get(key)
+                    if position_id:
+                        payload = {
+                            "position_id":            position_id,
+                            "strategy_type":          event.get("strategy_type"),
+                            "entry_time":             event.get("entry_time"),
+                            "time":                   event.get("time"),
+                            "spx":                    event.get("spx"),
+                            "pnl_per_share":          event.get("pnl_per_share"),
+                            "entry_credit_per_share": event.get("entry_credit_per_share"),
+                        }
+                        loop.call_soon_threadsafe(
+                            asyncio.ensure_future,
+                            websocket_manager.send_backtest_update(day_backtest_id, "position_update", payload)
+                        )
+
+                elif ev == "position_closed":
+                    strategy_type = event.get("strategy_type", "")
+                    result = event.get("result")
+                    entry_time = getattr(result, "entry_time", event.get("entry_time", ""))
+                    key = (strategy_type, entry_time)
+                    open_position_ids.pop(key, None)
+                    if result:
+                        api_result = self._convert_single_trade(result, day_backtest_id)
+                        # Schedule DB save + trade_result WS message from the thread
+                        loop.call_soon_threadsafe(
+                            asyncio.ensure_future,
+                            self._save_and_send_trade(day_backtest_id, api_result, websocket_manager)
+                        )
+                        day_results.append(api_result)
+
+            return callback
+
         for i, test_date in enumerate(test_dates, 1):
             try:
                 # Send progress update
                 await websocket_manager.send_backtest_progress(
                     backtest_id, i, total_dates, str(test_date)
                 )
-                
-                # Run single day intraday scan in thread pool
-                day_result = await loop.run_in_executor(
+
+                callback = make_progress_callback(backtest_id)
+                day_results.clear()
+
+                # Run single day intraday scan in thread pool.
+                # Trades are sent via callback as they close; day_results is populated there.
+                await loop.run_in_executor(
                     self.executor,
                     self._run_single_day_backtest,
                     test_date,
-                    request
+                    request,
+                    callback,
                 )
 
-                # Convert each trade in the day result to API format and persist immediately
-                if day_result and day_result.trades:
-                    for trade in day_result.trades:
-                        api_result = self._convert_single_trade(trade, backtest_id)
-                        results.append(api_result)
+                # Wait briefly for all queued WS sends to flush before moving to the next day
+                await asyncio.sleep(0.05)
 
-                        # Persist trade to DB as soon as it closes
-                        await loop.run_in_executor(
-                            self.executor,
-                            self._save_single_trade_sync,
-                            backtest_id,
-                            api_result,
-                        )
+                # Accumulate into overall results (already persisted + sent by callback)
+                results.extend(day_results)
 
-                        # Send individual trade result
-                        await websocket_manager.send_trade_result(
-                            backtest_id, api_result.model_dump(mode="json")
-                        )
-                
-                # Small async delay
-                await asyncio.sleep(0.1)
-                
             except Exception as e:
                 logger.error(f"Failed to process date {test_date}: {e}")
                 continue
-        
+
         return results
-    
-    def _run_single_day_backtest(self, test_date, request: BacktestRequest) -> Optional[DayBacktestResult]:
+
+    def _run_single_day_backtest(self, test_date, request: BacktestRequest, progress_callback=None) -> Optional[DayBacktestResult]:
         """Run a single day intraday backtest — safe for thread pool execution."""
         try:
             date_str = test_date.strftime('%Y-%m-%d') if hasattr(test_date, 'strftime') else str(test_date)
@@ -316,10 +376,32 @@ class BacktestService:
                 target_credit=request.target_credit,
                 strategy_mode=request.strategy.value,
                 quantity=request.contracts,
+                entry_start_time=request.entry_start_time,
+                last_entry_time=request.last_entry_time,
+                progress_callback=progress_callback,
             )
         except Exception as e:
             logger.error(f"Single day backtest failed for {test_date}: {e}")
             return None
+
+    async def _save_and_send_trade(
+        self,
+        backtest_id: str,
+        api_result: BacktestResult,
+        websocket_manager: WebSocketManager,
+    ):
+        """Persist a single trade to DB and broadcast it via WebSocket."""
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                self.executor,
+                self._save_single_trade_sync,
+                backtest_id,
+                api_result,
+            )
+        except Exception as exc:
+            logger.error(f"Failed to persist trade for backtest {backtest_id}: {exc}")
+        await websocket_manager.send_trade_result(backtest_id, api_result.model_dump(mode="json"))
     
     def _convert_single_trade(self, result: EnhancedBacktestResult,
                               backtest_id: str) -> BacktestResult:

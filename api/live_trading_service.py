@@ -121,6 +121,27 @@ class LiveTradingService:
                 s.completed_at = datetime.now()
         return True
 
+    async def delete_session(self, session_id: str) -> bool:
+        """Stop the session if active, then remove it from memory and the database."""
+        await self.stop_session(session_id)
+        if session_id not in self._sessions:
+            return False
+        del self._sessions[session_id]
+        self._running_tasks.pop(session_id, None)
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self._delete_session_sync, session_id)
+        except Exception as exc:
+            logger.error(f"Failed to delete live session {session_id} from DB: {exc}")
+        return True
+
+    def _delete_session_sync(self, session_id: str):
+        with db_manager.get_session() as session:
+            run = session.query(PaperTradingRun).filter_by(session_id=session_id).first()
+            if run:
+                session.delete(run)
+                session.commit()
+
     async def start_session(
         self,
         request: LiveTradingRequest,
@@ -233,6 +254,8 @@ class LiveTradingService:
                     strategy_mode=req.strategy.value,
                     quantity=req.contracts,
                     progress_callback=callback,
+                    entry_start_time=req.entry_start_time,
+                    last_entry_time=req.last_entry_time,
                 ),
             )
 
@@ -336,6 +359,33 @@ class LiveTradingService:
                             {"session_id": state.session_id, **pos.dict()}
                         )
                     )
+
+                elif ev == "monitor_tick":
+                    # Find the matching open position and broadcast its live PnL
+                    strategy_type = event.get("strategy_type", "")
+                    entry_time = event.get("entry_time", "")
+                    pos = next(
+                        (p for p in state.open_positions
+                         if p.strategy_type == strategy_type and p.entry_time == entry_time),
+                        None,
+                    )
+                    if pos:
+                        loop.call_soon_threadsafe(
+                            asyncio.ensure_future,
+                            websocket_manager.send_backtest_update(
+                                backtest_id, "position_update",
+                                {
+                                    "session_id": state.session_id,
+                                    "position_id": pos.position_id,
+                                    "strategy_type": strategy_type,
+                                    "entry_time": entry_time,
+                                    "time": event.get("time"),
+                                    "spx": event.get("spx"),
+                                    "pnl_per_share": event.get("pnl_per_share"),
+                                    "entry_credit_per_share": event.get("entry_credit_per_share"),
+                                }
+                            )
+                        )
 
                 elif ev == "position_closed":
                     result: EnhancedBacktestResult = event.get("result")
