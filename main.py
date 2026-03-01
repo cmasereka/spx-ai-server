@@ -20,12 +20,12 @@ from api.models import (
 from api.backtest_service import BacktestService
 from api.websocket_manager import WebSocketManager
 from api import database_routes
-from api.paper_trading_service import PaperTradingService
-import api.paper_trading_routes as paper_trading_routes
+from api.live_trading_service import LiveTradingService
+import api.live_trading_routes as live_trading_routes
 
 # Global services
 backtest_service = BacktestService()
-paper_trading_svc = PaperTradingService()
+live_trading_svc = LiveTradingService()
 websocket_manager = WebSocketManager()
 
 @asynccontextmanager
@@ -37,15 +37,15 @@ async def lifespan(app: FastAPI):
     await backtest_service.initialize()
     logger.info("✅ Backtest service initialized")
 
-    # Reuse the already-loaded engine for paper trading
-    await paper_trading_svc.initialize(backtest_service.engine)
-    paper_trading_routes.init_router(paper_trading_svc, websocket_manager)
-    logger.info("✅ Paper trading service initialized")
+    # Live trading service (IBKR) — reuses the same engine
+    await live_trading_svc.initialize(backtest_service.engine)
+    live_trading_routes.init_router(live_trading_svc, websocket_manager)
+    logger.info("✅ Live trading service initialized")
 
     yield
 
     # Cleanup
-    await paper_trading_svc.cleanup()
+    await live_trading_svc.cleanup()
     await backtest_service.cleanup()
     logger.info("🛑 SPX AI Trading Platform shutting down")
 
@@ -74,8 +74,8 @@ app.add_middleware(
 # Include database routes
 app.include_router(database_routes.router)
 
-# Include paper trading routes
-app.include_router(paper_trading_routes.router)
+# Include live (IBKR) trading routes
+app.include_router(live_trading_routes.router)
 
 @app.get("/", tags=["Health"])
 async def root():
