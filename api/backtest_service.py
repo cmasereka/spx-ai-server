@@ -275,14 +275,42 @@ class BacktestService:
                     key = (event.get("strategy_type", ""), event.get("entry_time", ""))
                     position_id = str(_uuid.uuid4())
                     open_position_ids[key] = position_id
-                    # Convert strike selection object to plain dict
+                    # Convert strike selection object → normalized dict matching closed-trade keys
                     raw_strikes = event.get("strikes")
-                    if hasattr(raw_strikes, "__dict__"):
-                        strikes = {k: v for k, v in vars(raw_strikes).items() if not k.startswith("_")}
+                    stype_str = event.get("strategy_type", "")
+                    if raw_strikes is not None and hasattr(raw_strikes, "put_short_strike"):
+                        # IronCondorStrikeSelection
+                        if stype_str == "Iron Condor":
+                            strikes = {
+                                "put_long":   raw_strikes.put_long_strike,
+                                "put_short":  raw_strikes.put_short_strike,
+                                "call_short": raw_strikes.call_short_strike,
+                                "call_long":  raw_strikes.call_long_strike,
+                            }
+                        elif stype_str == "Put Spread":
+                            strikes = {
+                                "put_long":  raw_strikes.put_long_strike,
+                                "put_short": raw_strikes.put_short_strike,
+                            }
+                        else:  # Call Spread
+                            strikes = {
+                                "call_short": raw_strikes.call_short_strike,
+                                "call_long":  raw_strikes.call_long_strike,
+                            }
+                    elif raw_strikes is not None and hasattr(raw_strikes, "short_strike"):
+                        # Plain StrikeSelection (single-leg side)
+                        if stype_str == "Put Spread":
+                            strikes = {"put_long": raw_strikes.long_strike, "put_short": raw_strikes.short_strike}
+                        elif stype_str == "Call Spread":
+                            strikes = {"call_short": raw_strikes.short_strike, "call_long": raw_strikes.long_strike}
+                        else:
+                            strikes = {}
                     elif hasattr(raw_strikes, "_asdict"):
                         strikes = raw_strikes._asdict()
+                    elif isinstance(raw_strikes, dict):
+                        strikes = raw_strikes
                     else:
-                        strikes = raw_strikes or {}
+                        strikes = {}
                     payload = {
                         "position_id":     position_id,
                         "strategy_type":   event.get("strategy_type", ""),
