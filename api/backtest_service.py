@@ -263,10 +263,14 @@ class BacktestService:
         # Track open positions keyed by (strategy_type, entry_time) so we can
         # match them to subsequent monitor_tick and position_closed events.
         open_position_ids: dict = {}
-        day_results: list = []  # populated by callback's position_closed handler
+        day_results: list = []       # populated by callback's position_closed handler
+        day_ws_events: list = []     # collected WS events; drained async with delays below
 
-        def make_progress_callback(day_backtest_id: str):
-            """Return a thread-safe callback for one day's backtest run."""
+        def make_progress_callback():
+            """Return a callback for one day's backtest run.
+            Collects WS events into day_ws_events so they can be streamed
+            with controlled delays from the async loop after the thread finishes.
+            """
             import uuid as _uuid
 
             def callback(event: dict):
@@ -320,10 +324,7 @@ class BacktestService:
                         "strikes":         strikes,
                         "entry_rationale": event.get("entry_rationale"),
                     }
-                    loop.call_soon_threadsafe(
-                        asyncio.ensure_future,
-                        websocket_manager.send_backtest_update(day_backtest_id, "position_opened", payload)
-                    )
+                    day_ws_events.append(("position_opened", payload))
 
                 elif ev == "monitor_tick":
                     key = (event.get("strategy_type", ""), event.get("entry_time", ""))
@@ -338,10 +339,7 @@ class BacktestService:
                             "pnl_per_share":          event.get("pnl_per_share"),
                             "entry_credit_per_share": event.get("entry_credit_per_share"),
                         }
-                        loop.call_soon_threadsafe(
-                            asyncio.ensure_future,
-                            websocket_manager.send_backtest_update(day_backtest_id, "position_update", payload)
-                        )
+                        day_ws_events.append(("position_update", payload))
 
                 elif ev == "position_closed":
                     strategy_type = event.get("strategy_type", "")
@@ -350,12 +348,8 @@ class BacktestService:
                     key = (strategy_type, entry_time)
                     open_position_ids.pop(key, None)
                     if result:
-                        api_result = self._convert_single_trade(result, day_backtest_id)
-                        # Schedule DB save + trade_result WS message from the thread
-                        loop.call_soon_threadsafe(
-                            asyncio.ensure_future,
-                            self._save_and_send_trade(day_backtest_id, api_result, websocket_manager)
-                        )
+                        api_result = self._convert_single_trade(result, backtest_id)
+                        day_ws_events.append(("trade_result", api_result))
                         day_results.append(api_result)
 
             return callback
@@ -367,11 +361,12 @@ class BacktestService:
                     backtest_id, i, total_dates, str(test_date)
                 )
 
-                callback = make_progress_callback(backtest_id)
+                day_ws_events.clear()
                 day_results.clear()
+                callback = make_progress_callback()
 
                 # Run single day intraday scan in thread pool.
-                # Trades are sent via callback as they close; day_results is populated there.
+                # Events are collected into day_ws_events; not sent yet.
                 await loop.run_in_executor(
                     self.executor,
                     self._run_single_day_backtest,
@@ -380,10 +375,21 @@ class BacktestService:
                     callback,
                 )
 
-                # Wait briefly for all queued WS sends to flush before moving to the next day
-                await asyncio.sleep(0.05)
+                # Stream the day's events with staggered delays so the frontend
+                # can render each monitoring step as it arrives.
+                # position_opened / position_update get a short pause so React
+                # has time to commit each render before the next update lands.
+                for ev_type, ev_data in day_ws_events:
+                    if ev_type == "position_opened":
+                        await websocket_manager.send_backtest_update(backtest_id, "position_opened", ev_data)
+                        await asyncio.sleep(0.05)   # 50 ms – let frontend render the opening row
+                    elif ev_type == "position_update":
+                        await websocket_manager.send_backtest_update(backtest_id, "position_update", ev_data)
+                        await asyncio.sleep(0.02)   # 20 ms per tick (~50 fps updates)
+                    elif ev_type == "trade_result":
+                        await self._save_and_send_trade(backtest_id, ev_data, websocket_manager)
 
-                # Accumulate into overall results (already persisted + sent by callback)
+                # Accumulate into overall results (already persisted + sent above)
                 results.extend(day_results)
 
             except Exception as e:
