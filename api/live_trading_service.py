@@ -31,7 +31,7 @@ from market_data.realtime_provider import RealtimeMarketDataProvider
 from broker.null_adapter import NullBrokerAdapter
 from trading.session import LiveTradingSession
 from src.database.connection import db_manager
-from src.database.models import PaperTradingRun, IBKROrder
+from src.database.models import PaperTradingRun, IBKROrder, Trade
 
 
 class _LiveSessionState:
@@ -88,7 +88,101 @@ class LiveTradingService:
     async def initialize(self, engine: EnhancedBacktestingEngine):
         """Called from FastAPI lifespan — shares the engine already loaded by BacktestService."""
         self.engine = engine
+        self._load_sessions_from_db()
         logger.info("LiveTradingService initialised")
+
+    def _load_sessions_from_db(self):
+        """Restore completed/stopped/failed sessions from the database into memory."""
+        try:
+            with db_manager.get_session() as db_session:
+                runs = db_session.query(PaperTradingRun).order_by(
+                    PaperTradingRun.created_at.asc()
+                ).all()
+
+                for run in runs:
+                    # Reconstruct a minimal LiveTradingRequest from stored parameters
+                    params = run.parameters or {}
+                    from .models import IBKRConnectionConfig, BacktestStrategyEnum
+                    try:
+                        request = LiveTradingRequest(
+                            ibkr=IBKRConnectionConfig(
+                                host=params.get("ibkr_host", "127.0.0.1"),
+                                port=params.get("ibkr_port", 7497),
+                                client_id=params.get("ibkr_client_id", 1),
+                                account=params.get("ibkr_account", ""),
+                            ),
+                            trade_date=run.trade_date,
+                            strategy=params.get("strategy", BacktestStrategyEnum.CREDIT_SPREADS),
+                            target_credit=params.get("target_credit", 0.35),
+                            spread_width=params.get("spread_width", 10),
+                            contracts=params.get("contracts", 1),
+                            take_profit=params.get("take_profit", 0.05),
+                            stop_loss=params.get("stop_loss", 3.0),
+                            monitor_interval=params.get("monitor_interval", 5),
+                            entry_start_time=params.get("entry_start_time", "10:00:00"),
+                            last_entry_time=params.get("last_entry_time", "14:00:00"),
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            f"Could not reconstruct request for session {run.session_id}: {exc}"
+                        )
+                        continue
+
+                    state = _LiveSessionState(
+                        session_id=run.session_id,
+                        trade_date=str(run.trade_date),
+                        request=request,
+                    )
+                    state.status = run.status
+                    state.created_at = run.created_at
+                    state.started_at = run.started_at
+                    state.completed_at = run.completed_at
+                    state.error_message = run.error_message
+                    state.trade_count = run.total_trades or 0
+                    state.day_pnl = run.total_pnl or 0.0
+
+                    # Load completed trades from the trades table
+                    from src.database.models import Trade as TradeModel
+                    db_trades = db_session.query(TradeModel).filter_by(
+                        backtest_run_id=run.id
+                    ).order_by(TradeModel.created_at.asc()).all()
+
+                    for t in db_trades:
+                        from .models import StrategyDetails
+                        sd = t.strategy_details or {}
+                        strategy = StrategyDetails(
+                            strategy_type=t.strategy_type,
+                            strikes=t.strikes or {},
+                            entry_credit=t.entry_credit,
+                            max_profit=t.max_profit or 0.0,
+                            max_loss=t.max_loss or 0.0,
+                            breakeven_points=sd.get("breakeven_points", []),
+                        )
+                        state.completed_trades.append(BacktestResult(
+                            trade_id=t.trade_id,
+                            trade_date=t.trade_date,
+                            entry_time=t.entry_time,
+                            exit_time=t.exit_time,
+                            entry_spx_price=t.entry_spx_price,
+                            exit_spx_price=t.exit_spx_price,
+                            strategy=strategy,
+                            entry_credit=t.entry_credit,
+                            exit_cost=t.exit_cost,
+                            pnl=t.pnl,
+                            pnl_percentage=t.pnl_percentage,
+                            exit_reason=t.exit_reason,
+                            is_winner=t.is_winner,
+                            monitoring_points=t.monitoring_data or [],
+                            entry_rationale=sd.get("entry_rationale"),
+                            exit_rationale=sd.get("exit_rationale"),
+                        ))
+
+                    self._sessions[run.session_id] = state
+
+                logger.info(f"Loaded {len(runs)} live session(s) from database")
+
+        except Exception as exc:
+            logger.warning(f"Could not load live sessions from DB (may not exist yet): {exc}")
 
     async def cleanup(self):
         for sid, task in list(self._running_tasks.items()):
@@ -403,10 +497,11 @@ class LiveTradingService:
                         state.day_pnl += result.pnl
                         state.trade_count += 1
 
+                        # Persist trade to DB and broadcast via WebSocket
                         loop.call_soon_threadsafe(
                             asyncio.ensure_future,
-                            websocket_manager.send_trade_result(
-                                backtest_id, api_result.dict()
+                            self._save_and_send_live_trade(
+                                state.session_id, api_result, websocket_manager, backtest_id
                             )
                         )
 
@@ -415,6 +510,68 @@ class LiveTradingService:
     # ------------------------------------------------------------------
     # Database helpers
     # ------------------------------------------------------------------
+
+    async def _save_and_send_live_trade(
+        self,
+        session_id: str,
+        api_result: BacktestResult,
+        websocket_manager: WebSocketManager,
+        backtest_id: str,
+    ):
+        """Persist a single live trade to the trades table and broadcast via WebSocket."""
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                self._executor, self._save_live_trade_sync, session_id, api_result
+            )
+        except Exception as exc:
+            logger.error(f"Failed to persist live trade {api_result.trade_id}: {exc}")
+        await websocket_manager.send_trade_result(backtest_id, api_result.dict())
+
+    def _save_live_trade_sync(self, session_id: str, result: BacktestResult):
+        """Write one completed trade to the trades table, linked to the live session."""
+        with db_manager.get_session() as db_session:
+            run = db_session.query(PaperTradingRun).filter_by(
+                session_id=session_id
+            ).first()
+            if not run:
+                logger.error(
+                    f"PaperTradingRun {session_id} not found — cannot save trade {result.trade_id}"
+                )
+                return
+            trade = Trade(
+                trade_id=result.trade_id,
+                backtest_run_id=run.id,
+                trade_date=result.trade_date,
+                entry_time=result.entry_time,
+                exit_time=result.exit_time,
+                entry_spx_price=result.entry_spx_price,
+                exit_spx_price=result.exit_spx_price,
+                strategy_type=result.strategy.strategy_type,
+                strikes=result.strategy.strikes,
+                entry_credit=result.entry_credit,
+                exit_cost=result.exit_cost,
+                pnl=result.pnl,
+                pnl_percentage=result.pnl_percentage,
+                exit_reason=result.exit_reason,
+                is_winner=result.is_winner,
+                max_profit=result.strategy.max_profit,
+                max_loss=result.strategy.max_loss,
+                strategy_details={
+                    "strategy_type": result.strategy.strategy_type,
+                    "strikes": result.strategy.strikes,
+                    "entry_credit": result.strategy.entry_credit,
+                    "max_profit": result.strategy.max_profit,
+                    "max_loss": result.strategy.max_loss,
+                    "breakeven_points": result.strategy.breakeven_points,
+                    "entry_rationale": result.entry_rationale,
+                    "exit_rationale": result.exit_rationale,
+                },
+                monitoring_data=result.monitoring_points,
+            )
+            db_session.add(trade)
+            db_session.commit()
+            logger.debug(f"Persisted live trade {result.trade_id} for session {session_id}")
 
     async def _save_session_to_db(self, state: _LiveSessionState):
         try:
@@ -439,6 +596,8 @@ class LiveTradingService:
                     "take_profit": req.take_profit,
                     "stop_loss": req.stop_loss,
                     "monitor_interval": req.monitor_interval,
+                    "entry_start_time": req.entry_start_time,
+                    "last_entry_time": req.last_entry_time,
                     "ibkr_host": req.ibkr.host,
                     "ibkr_port": req.ibkr.port,
                     "ibkr_client_id": req.ibkr.client_id,
