@@ -276,7 +276,8 @@ class IBKRMarketDataProvider(MarketDataProvider):
             rows = []
             for strike in strikes:
                 for right in ("P", "C"):
-                    contract = Option("SPXW", expiry, strike, right, "SMART", "USD")
+                    contract = Option("SPXW", expiry, strike, right,
+                                      exchange="SMART", currency="USD")
                     try:
                         ticker = self._ib.reqMktData(contract, "", True, False)
                         self._ib.sleep(0)  # allow event loop to process

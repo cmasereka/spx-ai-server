@@ -267,6 +267,37 @@ class IBKRConnectionConfig(BaseModel):
     account: str = Field("", description="IBKR account string (e.g. DU123456 for paper)")
 
 
+class IBKRDiagnosticRequest(BaseModel):
+    """
+    Request body for POST /api/v1/trading/diagnose-market-data.
+
+    Tests the full data path (SPX price + options chain) without starting a
+    trading session.  Uses a separate clientId so it never interferes with a
+    running session.
+    """
+    ibkr: IBKRConnectionConfig = Field(default_factory=IBKRConnectionConfig)
+    trade_date: Optional[str] = Field(
+        None,
+        description="Date to use for options expiry (YYYY-MM-DD). Defaults to today."
+    )
+    spx_price_hint: float = Field(
+        5800.0,
+        description="Approximate SPX level to centre the options chain query around "
+                    "when live price is unavailable (e.g. outside market hours)."
+    )
+    diagnostic_client_id: int = Field(
+        50,
+        ge=1, le=999,
+        description="clientId used for the diagnostic connection. "
+                    "Must differ from any running session clientId."
+    )
+    num_strikes: int = Field(
+        5,
+        ge=1, le=20,
+        description="Number of strikes on each side (put/call) to sample from the chain."
+    )
+
+
 class LiveTradingRequest(BaseModel):
     """Request model for starting a live / IBKR paper trading session."""
 
