@@ -156,11 +156,11 @@ class IBKRMarketDataProvider(MarketDataProvider):
             bars = self._ib.reqRealTimeBars(
                 contract=self._spx_contract,
                 barSize=5,
-                whatToShow="TRADES",
+                whatToShow="MIDPOINT",   # SPX is a cash index — TRADES is not supported
                 useRTH=True,
             )
             bars.updateEvent += self._on_rtbar
-            logger.info("Subscribed to SPX real-time bars (5s)")
+            logger.info("Subscribed to SPX real-time bars (5s, MIDPOINT)")
         except Exception as exc:
             logger.warning(f"Failed to subscribe to SPX real-time bars: {exc}")
 
@@ -336,9 +336,15 @@ class IBKRMarketDataProvider(MarketDataProvider):
 
     @property
     def available_dates(self) -> List[str]:
-        """For a live provider, only today's date is 'available'."""
-        today = datetime.now().strftime("%Y-%m-%d")
-        return [today] if self._connected else []
+        """Return the session's trade date when connected.
+
+        Uses self._today (set in connect(), overrideable by callers) rather than
+        recomputing datetime.now() so that sessions targeting a future date
+        (e.g. started on Sunday for Monday's trading) are not rejected.
+        """
+        if self._connected and self._today:
+            return [self._today]
+        return []
 
     @property
     def is_connected(self) -> bool:

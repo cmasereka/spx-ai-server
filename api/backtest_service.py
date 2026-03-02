@@ -407,6 +407,11 @@ class BacktestService:
                 quantity=request.contracts,
                 entry_start_time=request.entry_start_time,
                 last_entry_time=request.last_entry_time,
+                stale_loss_minutes=request.stale_loss_minutes,
+                stale_loss_threshold=request.stale_loss_threshold,
+                stagnation_window=request.stagnation_window,
+                min_improvement=request.min_improvement,
+                enable_stale_loss_exit=request.enable_stale_loss_exit,
                 progress_callback=progress_callback,
             )
         except Exception as e:

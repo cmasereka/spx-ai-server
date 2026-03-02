@@ -71,6 +71,34 @@ class BacktestRequest(BaseModel):
         description="No new entries at or after this time (HH:MM:SS, 24-hour). Default 14:00:00."
     )
 
+    # Stale-loss exit parameters
+    enable_stale_loss_exit: bool = Field(
+        False,
+        description="Enable the stale-loss exit feature. When False (default) the position is "
+                    "held until take_profit, stop_loss, or expiry regardless of duration."
+    )
+    stale_loss_minutes: int = Field(
+        120, ge=10, le=360,
+        description="Close a position that has been continuously losing for this many consecutive "
+                    "minutes (cost > entry_credit × stale_loss_threshold). Default 120 (2 hours)."
+    )
+    stale_loss_threshold: float = Field(
+        1.5, ge=1.0, le=5.0,
+        description="Cost-to-close must exceed entry_credit × this value to qualify as 'in the red' "
+                    "for stale-loss detection. Default 1.5 (50% above original credit collected)."
+    )
+    stagnation_window: int = Field(
+        30, ge=5, le=120,
+        description="Number of recent 1-min bars to examine for improvement. "
+                    "If the cost has not dropped by min_improvement in this window the position "
+                    "is considered stagnant. Default 30 bars."
+    )
+    min_improvement: float = Field(
+        0.05, ge=0.01, le=1.0,
+        description="Minimum cost improvement ($/share) required in the stagnation window to "
+                    "keep the position open. Default $0.05/share."
+    )
+
     @field_validator('start_date', 'end_date', 'single_date')
     @classmethod
     def validate_dates(cls, v):
@@ -279,6 +307,34 @@ class LiveTradingRequest(BaseModel):
     last_entry_time: str = Field(
         "14:00:00",
         description="No new entries at or after this time (HH:MM:SS, 24-hour). Default 14:00:00."
+    )
+
+    # Stale-loss exit parameters
+    enable_stale_loss_exit: bool = Field(
+        False,
+        description="Enable the stale-loss exit feature. When False (default) the position is "
+                    "held until take_profit, stop_loss, or expiry regardless of duration."
+    )
+    stale_loss_minutes: int = Field(
+        120, ge=10, le=360,
+        description="Close a position that has been continuously losing for this many consecutive "
+                    "minutes (cost > entry_credit × stale_loss_threshold). Default 120 (2 hours)."
+    )
+    stale_loss_threshold: float = Field(
+        1.5, ge=1.0, le=5.0,
+        description="Cost-to-close must exceed entry_credit × this value to qualify as 'in the red' "
+                    "for stale-loss detection. Default 1.5 (50% above original credit collected)."
+    )
+    stagnation_window: int = Field(
+        30, ge=5, le=120,
+        description="Number of recent 1-min bars to examine for improvement. "
+                    "If the cost has not dropped by min_improvement in this window the position "
+                    "is considered stagnant. Default 30 bars."
+    )
+    min_improvement: float = Field(
+        0.05, ge=0.01, le=1.0,
+        description="Minimum cost improvement ($/share) required in the stagnation window to "
+                    "keep the position open. Default $0.05/share."
     )
 
     @field_validator("trade_date")

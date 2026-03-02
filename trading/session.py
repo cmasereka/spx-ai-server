@@ -26,11 +26,88 @@ import threading
 from datetime import datetime
 from typing import List, Optional, Callable, Dict, Any
 
+import pandas as pd
 from loguru import logger
 
 from market_data.provider import MarketDataProvider
 from broker.adapter import BrokerAdapter, OrderResult
 from broker.null_adapter import NullBrokerAdapter
+
+
+# ---------------------------------------------------------------------------
+# Shim: adapt a live MarketDataProvider to the BacktestQueryEngine interface
+# expected by EnhancedStrategyBuilder / ParquetDataAdapter.
+# ---------------------------------------------------------------------------
+
+class _LiveLoaderShim:
+    """
+    Mimics the `.loader` attribute of a Parquet BacktestQueryEngine.
+
+    The real loader has `get_options_chain_at_time()` and `load_options_data()`
+    which pull from disk.  This shim delegates to the live provider instead.
+    The DataFrame columns are renamed from `option_type` → `right` so that
+    ParquetDataAdapter.convert_options_dataframe_to_dict() works unchanged.
+    """
+
+    def __init__(self, provider: MarketDataProvider):
+        self._provider = provider
+
+    def get_options_chain_at_time(
+        self, date, timestamp, center_strike: float, strike_range: float = 150
+    ) -> pd.DataFrame:
+        df = self._provider.get_options_data(str(date), str(timestamp))
+        if df is None or df.empty:
+            return pd.DataFrame()
+        filtered = df[
+            (df["strike"] >= center_strike - strike_range) &
+            (df["strike"] <= center_strike + strike_range)
+        ].copy()
+        if "option_type" in filtered.columns and "right" not in filtered.columns:
+            filtered = filtered.rename(columns={"option_type": "right"})
+        return filtered if len(filtered) > 0 else pd.DataFrame()
+
+    def load_options_data(self, date) -> pd.DataFrame:
+        """Only used for diagnostics; return empty for live sessions."""
+        return pd.DataFrame()
+
+    @property
+    def available_dates(self):
+        return self._provider.available_dates
+
+
+class _LiveQueryEngineShim:
+    """
+    Adapts a live MarketDataProvider to the BacktestQueryEngine interface so
+    that EnhancedStrategyBuilder and ParquetDataAdapter work without Parquet.
+
+    Used in LiveTradingSession.run() to temporarily replace
+    strategy_builder.query_engine and strategy_builder.data_adapter.query_engine.
+    """
+
+    def __init__(self, provider: MarketDataProvider):
+        self._provider = provider
+        self.loader = _LiveLoaderShim(provider)
+
+    def get_fastest_spx_price(self, date, timestamp) -> Optional[float]:
+        return self._provider.get_fastest_spx_price(str(date), str(timestamp))
+
+    def find_liquid_options(
+        self, date, timestamp, min_bid: float = 0.05, max_spread_pct: float = 30.0
+    ) -> pd.DataFrame:
+        """Return live options filtered by basic liquidity criteria."""
+        df = self._provider.get_options_data(str(date), str(timestamp))
+        if df is None or df.empty:
+            return pd.DataFrame()
+        df = df.copy()
+        mask = df["bid"] >= min_bid
+        if "ask" in df.columns:
+            mid = (df["ask"] + df["bid"]) / 2.0 + 1e-9
+            mask = mask & ((df["ask"] - df["bid"]) / mid * 100 <= max_spread_pct)
+        result = df[mask]
+        if "option_type" in result.columns and "right" not in result.columns:
+            result = result.rename(columns={"option_type": "right"})
+        return result if len(result) > 0 else pd.DataFrame()
+
 
 # Reuse the same building blocks as the backtest engine
 from enhanced_backtest import (
@@ -108,6 +185,11 @@ class LiveTradingSession:
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         entry_start_time: str = "10:00:00",
         last_entry_time: str = "14:00:00",
+        stale_loss_minutes: int = 120,
+        stale_loss_threshold: float = 1.5,
+        stagnation_window: int = 30,
+        min_improvement: float = 0.05,
+        enable_stale_loss_exit: bool = False,
     ) -> DayBacktestResult:
         """
         Run the full trading day and return a DayBacktestResult.
@@ -134,12 +216,24 @@ class LiveTradingSession:
         # We swap the engine's enhanced_query_engine temporarily so that all
         # sub-components (delta_selector, intraday_monitor) also use the
         # injected provider.
+        #
+        # Additionally we swap strategy_builder.query_engine and
+        # strategy_builder.data_adapter.query_engine via a shim so that
+        # price updates and strategy construction during the session never
+        # touch the Parquet dataset.
         original_provider = self._engine.enhanced_query_engine
+        original_sb_qe    = self._engine.strategy_builder.query_engine
+        original_sb_da_qe = self._engine.strategy_builder.data_adapter.query_engine
+
+        live_shim = _LiveQueryEngineShim(self._provider)
         try:
             self._engine.enhanced_query_engine = self._provider
             # Re-wire sub-components to the new provider
-            self._engine.delta_selector.query_engine  = self._provider
+            self._engine.delta_selector.query_engine   = self._provider
             self._engine.intraday_monitor.query_engine = self._provider
+            # Re-wire strategy_builder to use live data instead of Parquet
+            self._engine.strategy_builder.query_engine                  = live_shim
+            self._engine.strategy_builder.data_adapter.query_engine     = live_shim
 
             result = self._engine.backtest_day_intraday(
                 date=date,
@@ -155,12 +249,19 @@ class LiveTradingSession:
                 ),
                 entry_start_time=entry_start_time,
                 last_entry_time=last_entry_time,
+                stale_loss_minutes=stale_loss_minutes,
+                stale_loss_threshold=stale_loss_threshold,
+                stagnation_window=stagnation_window,
+                min_improvement=min_improvement,
+                enable_stale_loss_exit=enable_stale_loss_exit,
             )
         finally:
-            # Always restore the original provider
+            # Always restore the original providers/engines
             self._engine.enhanced_query_engine  = original_provider
             self._engine.delta_selector.query_engine   = original_provider
             self._engine.intraday_monitor.query_engine = original_provider
+            self._engine.strategy_builder.query_engine                  = original_sb_qe
+            self._engine.strategy_builder.data_adapter.query_engine     = original_sb_da_qe
 
         return result
 

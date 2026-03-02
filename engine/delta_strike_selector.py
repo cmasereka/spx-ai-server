@@ -503,12 +503,21 @@ class IntradayPositionMonitor:
     def __init__(self, query_engine, strategy_builder,
                  take_profit: float = 0.10,
                  stop_loss: float = 2.0,
-                 monitor_interval: int = 1):
+                 monitor_interval: int = 1,
+                 stale_loss_minutes: int = 120,
+                 stale_loss_threshold: float = 1.5,
+                 stagnation_window: int = 30,
+                 min_improvement: float = 0.05):
         self.query_engine = query_engine
         self.strategy_builder = strategy_builder
         self.take_profit = take_profit      # close when cost/share <= this
         self.stop_loss = stop_loss          # close when cost/share >= this
         self.monitor_interval = monitor_interval
+        # Stale-loss exit parameters
+        self.stale_loss_minutes = stale_loss_minutes      # consecutive bars in the red required
+        self.stale_loss_threshold = stale_loss_threshold  # cost must exceed entry_credit × this
+        self.stagnation_window = stagnation_window        # look-back window for improvement check
+        self.min_improvement = min_improvement            # minimum $/share improvement to not be stagnant
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -531,6 +540,92 @@ class IntradayPositionMonitor:
     def _should_exit_ic_side(self, side_cost: float, quantity: int = 1) -> Tuple[bool, str]:
         """Same check for a single IC side (put or call spread)."""
         return self._should_exit(side_cost, quantity)
+
+    def check_stale_loss(self, checkpoints: list, entry_credit_per_share: float,
+                         cost_key: str = "cost_per_share") -> Tuple[bool, str]:
+        """
+        Two-condition stale-loss exit check.
+
+        Condition 1: The last `stale_loss_minutes` worth of bars all have
+                     cost_per_share > entry_credit_per_share × stale_loss_threshold
+                     (position has been meaningfully in the red for a sustained period).
+
+        Condition 2: In the last `stagnation_window` minutes of bars the cost has not
+                     improved (decreased) by more than `min_improvement` $/share
+                     (position is stuck — no sign of recovery).
+
+        Both conditions must be true to trigger.
+
+        Note: checkpoints are only appended on check bars (every monitor_interval minutes),
+        so minute-based thresholds are divided by monitor_interval to get bar counts.
+
+        Returns (should_exit, reason_string).
+        """
+        # Convert minute-based thresholds to bar counts
+        interval = max(1, self.monitor_interval)
+        required_bars    = max(1, self.stale_loss_minutes // interval)
+        stagnation_bars  = max(1, self.stagnation_window  // interval)
+
+        if len(checkpoints) < required_bars:
+            return False, ""
+
+        threshold = entry_credit_per_share * self.stale_loss_threshold
+
+        # Condition 1 — last N bars continuously above threshold
+        recent = checkpoints[-required_bars:]
+        all_red = all(cp.get(cost_key, 0.0) > threshold for cp in recent)
+        if not all_red:
+            return False, ""
+
+        # Condition 2 — no meaningful improvement in the stagnation window
+        window_size = min(stagnation_bars, len(checkpoints))
+        window = checkpoints[-window_size:]
+        costs = [cp.get(cost_key, 0.0) for cp in window]
+        improvement = max(costs) - min(costs)   # total range; improvement = how much cost dropped
+
+        if improvement < self.min_improvement:
+            current_cost = costs[-1]
+            elapsed_minutes = required_bars * interval
+            window_minutes  = window_size  * interval
+            return True, (
+                f"Stale loss: cost ${current_cost:.3f}/share has exceeded "
+                f"{self.stale_loss_threshold:.1f}× entry credit (${threshold:.3f}/share) "
+                f"for {elapsed_minutes}+ minutes with only ${improvement:.3f}/share "
+                f"movement in the last {window_minutes} minutes (min ${self.min_improvement:.2f} required)"
+            )
+
+        return False, ""
+
+    def _get_ic_side_entry_credits(self, strategy, quantity: int = 1) -> Tuple[float, float]:
+        """
+        Compute per-share entry credit for each IC leg independently.
+        Returns (put_credit_per_share, call_credit_per_share).
+        """
+        try:
+            put_legs = [l for l in strategy.legs if l.option_type.value == 'put']
+            call_legs = [l for l in strategy.legs if l.option_type.value == 'call']
+        except AttributeError:
+            put_legs = [l for l in strategy.legs if str(l.option_type).lower() == 'put']
+            call_legs = [l for l in strategy.legs if str(l.option_type).lower() == 'call']
+
+        def _side_credit(legs) -> float:
+            credit = 0.0
+            for leg in legs:
+                leg_qty = getattr(leg, 'quantity', 1)
+                entry_price = getattr(leg, 'entry_price', 0)
+                is_short = getattr(leg, 'position_side', None)
+                try:
+                    short = is_short.name == 'SHORT'
+                except AttributeError:
+                    short = str(is_short).upper() == 'SHORT'
+                sign = 1 if short else -1
+                credit += entry_price * leg_qty * 100 * sign
+            return max(credit, 0.0)
+
+        put_credit = _side_credit(put_legs)
+        call_credit = _side_credit(call_legs)
+        per_share = 100.0 * max(quantity, 1)
+        return put_credit / per_share, call_credit / per_share
 
     def check_decay(self, strategy, strategy_type: StrategyType) -> Tuple[bool, float, str]:
         """

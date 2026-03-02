@@ -132,7 +132,12 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                               strategy_mode: str = STRATEGY_IRON_CONDOR,
                               progress_callback=None,
                               entry_start_time: str = ENTRY_SCAN_START,
-                              last_entry_time: str = LAST_ENTRY_TIME) -> DayBacktestResult:
+                              last_entry_time: str = LAST_ENTRY_TIME,
+                              stale_loss_minutes: int = 120,
+                              stale_loss_threshold: float = 1.5,
+                              stagnation_window: int = 30,
+                              min_improvement: float = 0.05,
+                              enable_stale_loss_exit: bool = False) -> DayBacktestResult:
         """
         Full intraday scan loop for one trading day.
         strategy_mode controls which entry types are allowed:
@@ -146,7 +151,10 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
         logger.info(
             f"Intraday scan: {date} | mode={strategy_mode} credit={target_credit} "
             f"contracts={quantity} tp={take_profit} sl={stop_loss} interval={monitor_interval}m "
-            f"entry_window={entry_start_time}–{last_entry_time}"
+            f"entry_window={entry_start_time}–{last_entry_time} "
+            f"stale_loss={'ON' if enable_stale_loss_exit else 'OFF'}"
+            + (f" ({stale_loss_minutes}m×{stale_loss_threshold}× stagnation={stagnation_window}m/${min_improvement})"
+               if enable_stale_loss_exit else "")
         )
 
         scan_times = _build_minute_grid(date, entry_start_time, FINAL_EXIT_TIME)
@@ -160,9 +168,37 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                 except Exception as _cb_err:
                     logger.debug(f"progress_callback error (ignored): {_cb_err}")
 
+        # For live/paper sessions: warn if all scan bars are already in the past.
+        # This happens when the session is started after market close or on a
+        # non-trading day — the loop will iterate instantly with no real waits.
+        try:
+            from datetime import datetime as _dt
+            _now_time = _dt.now().strftime("%H:%M:%S")
+            if date == _dt.now().strftime("%Y-%m-%d") and _now_time >= FINAL_EXIT_TIME:
+                logger.warning(
+                    f"Session started after market close ({_now_time} >= {FINAL_EXIT_TIME}) "
+                    f"for date {date}. All scan bars are in the past — the scan will complete "
+                    f"instantly with 0 trades. Start the session before {FINAL_EXIT_TIME} on a "
+                    f"trading day."
+                )
+        except Exception:
+            pass
+
         if date not in self.available_dates:
-            return DayBacktestResult(date=date, trades=[], total_pnl=0.0,
-                                     trade_count=0, scan_minutes_checked=0)
+            # Also accept dates the currently-injected provider knows about.
+            # This is essential for live trading: the engine's cached available_dates
+            # only covers historical Parquet data; the live IBKR provider returns
+            # today's date via its own available_dates property.
+            provider_dates = getattr(self.enhanced_query_engine, 'available_dates', None) or []
+            if date not in provider_dates:
+                logger.warning(
+                    f"Date {date} not found in Parquet dataset or injected provider — skipping. "
+                    f"Parquet has {len(self.available_dates)} dates "
+                    f"(latest: {self.available_dates[-1] if self.available_dates else 'none'}). "
+                    f"Provider dates: {provider_dates}"
+                )
+                return DayBacktestResult(date=date, trades=[], total_pnl=0.0,
+                                         trade_count=0, scan_minutes_checked=0)
 
         # Fetch opening SPX price for daily-drift guards.
         # Try several early bars; keep as None (not 0) so the guard stays
@@ -229,6 +265,10 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
             take_profit=take_profit,
             stop_loss=stop_loss,
             monitor_interval=monitor_interval,
+            stale_loss_minutes=stale_loss_minutes,
+            stale_loss_threshold=stale_loss_threshold,
+            stagnation_window=stagnation_window,
+            min_improvement=min_improvement,
         )
 
         # Open position slots
@@ -266,6 +306,14 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
 
             # Respect monitor_interval; always process the final bar for the hard close.
             is_check_bar = (bar_index % monitor_interval == 0) or is_final_bar
+
+            # Pace the loop to wall-clock time for real-time (live/paper) sessions.
+            # RealtimeMarketDataProvider._wait_for_bar() blocks until the bar minute
+            # has elapsed; for historical simulations this is a fast dictionary lookup.
+            # This call must be unconditional so the wait fires even on bars where no
+            # position is open and the entry window has closed (otherwise those bars
+            # iterate instantly and the session appears to end immediately).
+            self.enhanced_query_engine.get_fastest_spx_price(date, current_time)
 
             # --- 1. Monitor IC legs independently ---
             if open_ic is not None and ic_leg_status is not None and is_check_bar:
@@ -320,6 +368,30 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     'pnl_per_share': round(entry_credit_ps - total_cost_ps, 4),
                     'entry_credit_per_share': entry_credit_ps,
                 })
+
+                # Stale-loss check per IC leg (skip the hard-close final bar)
+                if enable_stale_loss_exit and not is_final_bar:
+                    put_credit_ps, call_credit_ps = monitor._get_ic_side_entry_credits(open_ic, ic_quantity)
+                    if not ic_leg_status.put_side_closed:
+                        stale, stale_reason = monitor.check_stale_loss(
+                            ic_checkpoints, put_credit_ps, cost_key="put_cost_per_share"
+                        )
+                        if stale:
+                            ic_leg_status.put_side_closed = True
+                            ic_leg_status.put_side_exit_time = current_time
+                            ic_leg_status.put_side_exit_cost = raw_put
+                            ic_leg_status.put_side_exit_reason = stale_reason
+                            logger.info(f"IC put-side stale-loss exit at {current_time}: {stale_reason}")
+                    if not ic_leg_status.call_side_closed:
+                        stale, stale_reason = monitor.check_stale_loss(
+                            ic_checkpoints, call_credit_ps, cost_key="call_cost_per_share"
+                        )
+                        if stale:
+                            ic_leg_status.call_side_closed = True
+                            ic_leg_status.call_side_exit_time = current_time
+                            ic_leg_status.call_side_exit_cost = raw_call
+                            ic_leg_status.call_side_exit_reason = stale_reason
+                            logger.info(f"IC call-side stale-loss exit at {current_time}: {stale_reason}")
 
                 # If both sides closed → finalize IC trade
                 if ic_leg_status.put_side_closed and ic_leg_status.call_side_closed:
@@ -414,6 +486,14 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     'entry_credit_per_share': entry_credit_ps,
                 })
 
+                # Stale-loss check (skip regular take-profit / stop-loss hits and final bar)
+                if enable_stale_loss_exit and not is_final_bar and not should_exit:
+                    stale, stale_reason = monitor.check_stale_loss(put_spread_checkpoints, entry_credit_ps)
+                    if stale:
+                        should_exit = True
+                        reason = stale_reason
+                        logger.info(f"Put spread stale-loss exit at {current_time}: {stale_reason}")
+
                 if should_exit or is_final_bar:
                     exit_reason = reason if should_exit else "Expired at market close"
                     entry_credit = ps_entry_credit
@@ -496,6 +576,14 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     'pnl_per_share': round(entry_credit_ps - cost_ps, 4),
                     'entry_credit_per_share': entry_credit_ps,
                 })
+
+                # Stale-loss check (skip regular take-profit / stop-loss hits and final bar)
+                if enable_stale_loss_exit and not is_final_bar and not should_exit:
+                    stale, stale_reason = monitor.check_stale_loss(call_spread_checkpoints, entry_credit_ps)
+                    if stale:
+                        should_exit = True
+                        reason = stale_reason
+                        logger.info(f"Call spread stale-loss exit at {current_time}: {stale_reason}")
 
                 if should_exit or is_final_bar:
                     exit_reason = reason if should_exit else "Expired at market close"

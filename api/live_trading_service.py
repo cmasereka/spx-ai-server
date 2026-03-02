@@ -121,6 +121,11 @@ class LiveTradingService:
                             monitor_interval=params.get("monitor_interval", 5),
                             entry_start_time=params.get("entry_start_time", "10:00:00"),
                             last_entry_time=params.get("last_entry_time", "14:00:00"),
+                            stale_loss_minutes=params.get("stale_loss_minutes", 120),
+                            stale_loss_threshold=params.get("stale_loss_threshold", 1.5),
+                            stagnation_window=params.get("stagnation_window", 30),
+                            min_improvement=params.get("min_improvement", 0.05),
+                            enable_stale_loss_exit=params.get("enable_stale_loss_exit", False),
                         )
                     except Exception as exc:
                         logger.warning(
@@ -295,6 +300,10 @@ class LiveTradingService:
             client_id=req.ibkr.client_id,
             account=req.ibkr.account,
         )
+        logger.info(
+            f"Session {backtest_id}: connecting to IBKR "
+            f"{req.ibkr.host}:{req.ibkr.port} clientId={req.ibkr.client_id}"
+        )
         connected = await loop.run_in_executor(None, ibkr_provider.connect)
         if not connected:
             with state._lock:
@@ -307,6 +316,16 @@ class LiveTradingService:
             await self._update_session_db_status(state)
             await websocket_manager.send_backtest_error(backtest_id, state.error_message)
             return
+
+        # Override the provider's trade date to the session's intended date.
+        # IBKRMarketDataProvider.connect() sets _today = datetime.now(), which is
+        # wrong when the user starts a session today for tomorrow's trading.
+        ibkr_provider._today = state.trade_date
+
+        logger.info(
+            f"Session {backtest_id}: IBKR connected — trade_date={state.trade_date} "
+            f"provider dates: {ibkr_provider.available_dates}"
+        )
 
         with state._lock:
             state.status = "running"
@@ -326,6 +345,13 @@ class LiveTradingService:
             rt_provider = RealtimeMarketDataProvider(
                 ibkr_provider,
                 trade_date=state.trade_date,
+            )
+
+            logger.info(
+                f"Session {backtest_id}: scanning date={state.trade_date} "
+                f"entry_window={req.entry_start_time}–{req.last_entry_time} "
+                f"strategy={req.strategy.value} credit={req.target_credit} "
+                f"tp={req.take_profit} sl={req.stop_loss}"
             )
 
             session = LiveTradingSession(
@@ -350,7 +376,18 @@ class LiveTradingService:
                     progress_callback=callback,
                     entry_start_time=req.entry_start_time,
                     last_entry_time=req.last_entry_time,
+                    stale_loss_minutes=req.stale_loss_minutes,
+                    stale_loss_threshold=req.stale_loss_threshold,
+                    stagnation_window=req.stagnation_window,
+                    min_improvement=req.min_improvement,
+                    enable_stale_loss_exit=req.enable_stale_loss_exit,
                 ),
+            )
+
+            logger.info(
+                f"Session {backtest_id}: scan complete — "
+                f"trades={day_result.trade_count} pnl={day_result.total_pnl:.2f} "
+                f"bars_checked={day_result.scan_minutes_checked}"
             )
 
             with state._lock:
@@ -598,6 +635,11 @@ class LiveTradingService:
                     "monitor_interval": req.monitor_interval,
                     "entry_start_time": req.entry_start_time,
                     "last_entry_time": req.last_entry_time,
+                    "stale_loss_minutes": req.stale_loss_minutes,
+                    "stale_loss_threshold": req.stale_loss_threshold,
+                    "stagnation_window": req.stagnation_window,
+                    "min_improvement": req.min_improvement,
+                    "enable_stale_loss_exit": req.enable_stale_loss_exit,
                     "ibkr_host": req.ibkr.host,
                     "ibkr_port": req.ibkr.port,
                     "ibkr_client_id": req.ibkr.client_id,
