@@ -205,6 +205,51 @@ class PaperTradingRun(Base):
         return f"<PaperTradingRun(session_id={self.session_id}, date={self.trade_date}, status={self.status})>"
 
 
+class IBKROrder(Base):
+    """
+    Records every order submitted to IBKR during a live / paper trading session.
+
+    Captures both the intended price (from the model) and the actual fill so
+    that slippage can be tracked and compared against backtest assumptions.
+    """
+    __tablename__ = 'ibkr_orders'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    order_id = Column(String(50), unique=True, nullable=False, index=True)
+
+    # Session linkage
+    session_id = Column(String(50), nullable=False, index=True)
+
+    # Order details
+    symbol = Column(String(20), nullable=False, default='SPXW')
+    strategy_type = Column(String(30), nullable=False)
+    is_entry = Column(Boolean, nullable=False)   # True = opening, False = closing
+
+    # Pricing
+    limit_price = Column(Float, nullable=False)   # Price we requested (model mid)
+    fill_price = Column(Float, nullable=False)     # Actual IBKR fill
+    slippage = Column(Float, nullable=False)       # fill_price - limit_price
+    quantity = Column(Integer, nullable=False)
+
+    # Status
+    success = Column(Boolean, nullable=False, default=True)
+    error_message = Column(Text, nullable=True)
+
+    # Timing
+    timestamp = Column(String(8), nullable=False)  # HH:MM:SS bar time
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+
+    # Raw broker response (optional JSON blob)
+    broker_data = Column(JSONB, nullable=True)
+
+    def __repr__(self):
+        direction = "OPEN" if self.is_entry else "CLOSE"
+        return (
+            f"<IBKROrder(id={self.order_id}, {direction} {self.strategy_type}, "
+            f"fill={self.fill_price:.2f}, slippage={self.slippage:+.2f})>"
+        )
+
+
 class SystemLog(Base):
     __tablename__ = 'system_logs'
     

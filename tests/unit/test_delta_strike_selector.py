@@ -555,3 +555,105 @@ class TestIntradayPositionMonitor:
                 strategy, StrategyType.PUT_SPREAD, '2026-02-10', '10:30:00'
             )
             assert should_exit is False, f"Should not exit at quantity={qty}"
+
+    # ------------------------------------------------------------------
+    # Stale-loss tests
+    # ------------------------------------------------------------------
+
+    def _make_checkpoints(self, n: int, cost_per_share: float,
+                          cost_key: str = "cost_per_share") -> list:
+        """Generate n uniform checkpoints at a fixed cost_per_share value."""
+        return [{cost_key: cost_per_share, "time": f"10:{i:02d}:00", "spx": 5000.0}
+                for i in range(n)]
+
+    def test_stale_loss_not_triggered_when_insufficient_bars(self):
+        """Should not trigger when fewer bars than stale_loss_minutes have accumulated."""
+        monitor = IntradayPositionMonitor(
+            self.mock_query_engine, self.mock_strategy_builder,
+            stale_loss_minutes=10, stale_loss_threshold=1.5,
+            stagnation_window=5, min_improvement=0.05,
+        )
+        # Only 5 bars — fewer than the required 10
+        checkpoints = self._make_checkpoints(5, cost_per_share=0.80)
+        exit_, reason = monitor.check_stale_loss(checkpoints, entry_credit_per_share=0.40)
+        assert exit_ is False
+        assert reason == ""
+
+    def test_stale_loss_not_triggered_when_cost_below_threshold(self):
+        """Should not trigger when cost is below the stale-loss threshold."""
+        monitor = IntradayPositionMonitor(
+            self.mock_query_engine, self.mock_strategy_builder,
+            stale_loss_minutes=10, stale_loss_threshold=1.5,
+            stagnation_window=5, min_improvement=0.05,
+        )
+        # 15 bars, cost = 0.50 = 1.25× credit (below 1.5 threshold)
+        checkpoints = self._make_checkpoints(15, cost_per_share=0.50)
+        exit_, reason = monitor.check_stale_loss(checkpoints, entry_credit_per_share=0.40)
+        assert exit_ is False
+
+    def test_stale_loss_not_triggered_when_improvement_sufficient(self):
+        """Should not trigger when cost has improved more than min_improvement recently."""
+        monitor = IntradayPositionMonitor(
+            self.mock_query_engine, self.mock_strategy_builder,
+            stale_loss_minutes=10, stale_loss_threshold=1.5,
+            stagnation_window=5, min_improvement=0.05,
+        )
+        # 15 bars all above threshold; last 5 have a $0.10 swing → improvement >= min
+        checkpoints = self._make_checkpoints(10, cost_per_share=0.90)
+        checkpoints += [{"cost_per_share": 0.90, "time": "10:10:00", "spx": 5000.0},
+                        {"cost_per_share": 0.85, "time": "10:11:00", "spx": 5000.0},
+                        {"cost_per_share": 0.80, "time": "10:12:00", "spx": 5000.0},
+                        {"cost_per_share": 0.82, "time": "10:13:00", "spx": 5000.0},
+                        {"cost_per_share": 0.80, "time": "10:14:00", "spx": 5000.0}]
+        exit_, reason = monitor.check_stale_loss(checkpoints, entry_credit_per_share=0.40)
+        assert exit_ is False
+
+    def test_stale_loss_triggers_both_conditions_met(self):
+        """Should trigger when cost is persistently above threshold and stagnant."""
+        monitor = IntradayPositionMonitor(
+            self.mock_query_engine, self.mock_strategy_builder,
+            stale_loss_minutes=10, stale_loss_threshold=1.5,
+            stagnation_window=5, min_improvement=0.05,
+        )
+        # 15 bars all at $0.80 (= 2.0× credit of $0.40, above 1.5 threshold)
+        # Zero movement — improvement = 0 < 0.05
+        checkpoints = self._make_checkpoints(15, cost_per_share=0.80)
+        exit_, reason = monitor.check_stale_loss(checkpoints, entry_credit_per_share=0.40)
+        assert exit_ is True
+        assert "stale loss" in reason.lower()
+        assert "0.80" in reason or "80" in reason
+
+    def test_stale_loss_ic_put_side_key(self):
+        """Stale-loss check works on IC put_cost_per_share checkpoints."""
+        monitor = IntradayPositionMonitor(
+            self.mock_query_engine, self.mock_strategy_builder,
+            stale_loss_minutes=5, stale_loss_threshold=1.5,
+            stagnation_window=3, min_improvement=0.05,
+        )
+        # 8 bars; put cost = $0.90 (> 1.5 × $0.40 = $0.60); call cost fine
+        checkpoints = [
+            {"put_cost_per_share": 0.90, "call_cost_per_share": 0.10,
+             "cost_per_share": 1.00, "time": f"10:0{i}:00", "spx": 5000.0}
+            for i in range(8)
+        ]
+        # Put side should trigger
+        put_exit, put_reason = monitor.check_stale_loss(
+            checkpoints, entry_credit_per_share=0.40, cost_key="put_cost_per_share"
+        )
+        # Call side should NOT trigger (call cost < threshold)
+        call_exit, _ = monitor.check_stale_loss(
+            checkpoints, entry_credit_per_share=0.40, cost_key="call_cost_per_share"
+        )
+        assert put_exit is True
+        assert "stale loss" in put_reason.lower()
+        assert call_exit is False
+
+    def test_stale_loss_default_params_stored(self):
+        """Default stale-loss parameter values are stored correctly."""
+        monitor = IntradayPositionMonitor(self.mock_query_engine, self.mock_strategy_builder)
+        assert monitor.stale_loss_minutes == 120
+        assert monitor.stale_loss_threshold == 1.5
+        assert monitor.stagnation_window == 30
+        assert monitor.min_improvement == 0.05
+        # The on/off toggle lives in BacktestRequest, not the monitor itself —
+        # the scan loop gates calls to check_stale_loss behind enable_stale_loss_exit.

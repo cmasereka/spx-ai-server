@@ -44,8 +44,11 @@ class BacktestService:
         """Initialize the backtest service"""
         try:
             # Initialize the enhanced backtesting engine
-            logger.info("Initializing Enhanced Backtesting Engine...")
-            self.engine = EnhancedBacktestingEngine("data/processed/parquet_1m")
+            # Set LOAD_PARQUET_DATA = False to skip historical data (live-trading-only mode)
+            LOAD_PARQUET_DATA = False
+            data_path = "data/processed/parquet_1m" if LOAD_PARQUET_DATA else ""
+            logger.info(f"Initializing Enhanced Backtesting Engine (parquet={'on' if LOAD_PARQUET_DATA else 'off'})...")
+            self.engine = EnhancedBacktestingEngine(data_path)
             
             logger.info("✅ Backtest service initialized successfully")
             
@@ -225,12 +228,12 @@ class BacktestService:
     async def _run_backtest_with_progress(self, backtest_id: str, request: BacktestRequest,
                                         websocket_manager: WebSocketManager, loop) -> List[BacktestResult]:
         """Run backtest with progress updates"""
-        
+
         if not self.engine:
             raise RuntimeError("Backtest engine not initialized")
-        
+
         results = []
-        
+
         # Determine dates to test
         if request.mode.value == "single_day":
             test_dates = [request.single_date] if request.single_date else []
@@ -239,71 +242,166 @@ class BacktestService:
         else:
             # Filter available dates by range
             available_dates = self.engine.available_dates or []
-            
+
             # Convert string dates to date objects for comparison
             from datetime import datetime
-            
+
             test_dates = []
             for date_str in available_dates:
                 try:
                     # Convert string date to date object
                     date_obj = datetime.strptime(date_str, '%Y-%m-%d').date()
-                    
+
                     # Check if date falls within requested range
                     if (not request.start_date or date_obj >= request.start_date) and \
                        (not request.end_date or date_obj <= request.end_date):
                         test_dates.append(date_obj)
-                        
+
                 except ValueError:
                     logger.warning(f"Invalid date format in available_dates: {date_str}")
                     continue
-        
+
         total_dates = len(test_dates)
-        
+
+        # Track open positions keyed by (strategy_type, entry_time) so we can
+        # match them to subsequent monitor_tick and position_closed events.
+        open_position_ids: dict = {}
+        day_results: list = []       # populated by callback's position_closed handler
+        day_ws_events: list = []     # collected WS events; drained async with delays below
+
+        def make_progress_callback():
+            """Return a callback for one day's backtest run.
+            Collects WS events into day_ws_events so they can be streamed
+            with controlled delays from the async loop after the thread finishes.
+            """
+            import uuid as _uuid
+
+            def callback(event: dict):
+                ev = event.get("event")
+                if ev == "position_opened":
+                    key = (event.get("strategy_type", ""), event.get("entry_time", ""))
+                    position_id = str(_uuid.uuid4())
+                    open_position_ids[key] = position_id
+                    # Convert strike selection object → normalized dict matching closed-trade keys
+                    raw_strikes = event.get("strikes")
+                    stype_str = event.get("strategy_type", "")
+                    if raw_strikes is not None and hasattr(raw_strikes, "put_short_strike"):
+                        # IronCondorStrikeSelection
+                        if stype_str == "Iron Condor":
+                            strikes = {
+                                "put_long":   raw_strikes.put_long_strike,
+                                "put_short":  raw_strikes.put_short_strike,
+                                "call_short": raw_strikes.call_short_strike,
+                                "call_long":  raw_strikes.call_long_strike,
+                            }
+                        elif stype_str == "Put Spread":
+                            strikes = {
+                                "put_long":  raw_strikes.put_long_strike,
+                                "put_short": raw_strikes.put_short_strike,
+                            }
+                        else:  # Call Spread
+                            strikes = {
+                                "call_short": raw_strikes.call_short_strike,
+                                "call_long":  raw_strikes.call_long_strike,
+                            }
+                    elif raw_strikes is not None and hasattr(raw_strikes, "short_strike"):
+                        # Plain StrikeSelection (single-leg side)
+                        if stype_str == "Put Spread":
+                            strikes = {"put_long": raw_strikes.long_strike, "put_short": raw_strikes.short_strike}
+                        elif stype_str == "Call Spread":
+                            strikes = {"call_short": raw_strikes.short_strike, "call_long": raw_strikes.long_strike}
+                        else:
+                            strikes = {}
+                    elif hasattr(raw_strikes, "_asdict"):
+                        strikes = raw_strikes._asdict()
+                    elif isinstance(raw_strikes, dict):
+                        strikes = raw_strikes
+                    else:
+                        strikes = {}
+                    payload = {
+                        "position_id":     position_id,
+                        "strategy_type":   event.get("strategy_type", ""),
+                        "entry_time":      event.get("entry_time", ""),
+                        "entry_spx_price": float(event.get("entry_spx", 0)),
+                        "entry_credit":    float(event.get("entry_credit", 0)),
+                        "strikes":         strikes,
+                        "entry_rationale": event.get("entry_rationale"),
+                    }
+                    day_ws_events.append(("position_opened", payload))
+
+                elif ev == "monitor_tick":
+                    key = (event.get("strategy_type", ""), event.get("entry_time", ""))
+                    position_id = open_position_ids.get(key)
+                    if position_id:
+                        payload = {
+                            "position_id":            position_id,
+                            "strategy_type":          event.get("strategy_type"),
+                            "entry_time":             event.get("entry_time"),
+                            "time":                   event.get("time"),
+                            "spx":                    event.get("spx"),
+                            "pnl_per_share":          event.get("pnl_per_share"),
+                            "entry_credit_per_share": event.get("entry_credit_per_share"),
+                        }
+                        day_ws_events.append(("position_update", payload))
+
+                elif ev == "position_closed":
+                    strategy_type = event.get("strategy_type", "")
+                    result = event.get("result")
+                    entry_time = getattr(result, "entry_time", event.get("entry_time", ""))
+                    key = (strategy_type, entry_time)
+                    open_position_ids.pop(key, None)
+                    if result:
+                        api_result = self._convert_single_trade(result, backtest_id)
+                        day_ws_events.append(("trade_result", api_result))
+                        day_results.append(api_result)
+
+            return callback
+
         for i, test_date in enumerate(test_dates, 1):
             try:
                 # Send progress update
                 await websocket_manager.send_backtest_progress(
                     backtest_id, i, total_dates, str(test_date)
                 )
-                
-                # Run single day intraday scan in thread pool
-                day_result = await loop.run_in_executor(
+
+                day_ws_events.clear()
+                day_results.clear()
+                callback = make_progress_callback()
+
+                # Run single day intraday scan in thread pool.
+                # Events are collected into day_ws_events; not sent yet.
+                await loop.run_in_executor(
                     self.executor,
                     self._run_single_day_backtest,
                     test_date,
-                    request
+                    request,
+                    callback,
                 )
 
-                # Convert each trade in the day result to API format and persist immediately
-                if day_result and day_result.trades:
-                    for trade in day_result.trades:
-                        api_result = self._convert_single_trade(trade, backtest_id)
-                        results.append(api_result)
+                # Stream the day's events with staggered delays so the frontend
+                # can render each monitoring step as it arrives.
+                # position_opened / position_update get a short pause so React
+                # has time to commit each render before the next update lands.
+                for ev_type, ev_data in day_ws_events:
+                    if ev_type == "position_opened":
+                        await websocket_manager.send_backtest_update(backtest_id, "position_opened", ev_data)
+                        await asyncio.sleep(0.05)   # 50 ms – let frontend render the opening row
+                    elif ev_type == "position_update":
+                        await websocket_manager.send_backtest_update(backtest_id, "position_update", ev_data)
+                        await asyncio.sleep(0.02)   # 20 ms per tick (~50 fps updates)
+                    elif ev_type == "trade_result":
+                        await self._save_and_send_trade(backtest_id, ev_data, websocket_manager)
 
-                        # Persist trade to DB as soon as it closes
-                        await loop.run_in_executor(
-                            self.executor,
-                            self._save_single_trade_sync,
-                            backtest_id,
-                            api_result,
-                        )
+                # Accumulate into overall results (already persisted + sent above)
+                results.extend(day_results)
 
-                        # Send individual trade result
-                        await websocket_manager.send_trade_result(
-                            backtest_id, api_result.model_dump(mode="json")
-                        )
-                
-                # Small async delay
-                await asyncio.sleep(0.1)
-                
             except Exception as e:
                 logger.error(f"Failed to process date {test_date}: {e}")
                 continue
-        
+
         return results
-    
-    def _run_single_day_backtest(self, test_date, request: BacktestRequest) -> Optional[DayBacktestResult]:
+
+    def _run_single_day_backtest(self, test_date, request: BacktestRequest, progress_callback=None) -> Optional[DayBacktestResult]:
         """Run a single day intraday backtest — safe for thread pool execution."""
         try:
             date_str = test_date.strftime('%Y-%m-%d') if hasattr(test_date, 'strftime') else str(test_date)
@@ -316,10 +414,37 @@ class BacktestService:
                 target_credit=request.target_credit,
                 strategy_mode=request.strategy.value,
                 quantity=request.contracts,
+                entry_start_time=request.entry_start_time,
+                last_entry_time=request.last_entry_time,
+                stale_loss_minutes=request.stale_loss_minutes,
+                stale_loss_threshold=request.stale_loss_threshold,
+                stagnation_window=request.stagnation_window,
+                min_improvement=request.min_improvement,
+                enable_stale_loss_exit=request.enable_stale_loss_exit,
+                progress_callback=progress_callback,
             )
         except Exception as e:
             logger.error(f"Single day backtest failed for {test_date}: {e}")
             return None
+
+    async def _save_and_send_trade(
+        self,
+        backtest_id: str,
+        api_result: BacktestResult,
+        websocket_manager: WebSocketManager,
+    ):
+        """Persist a single trade to DB and broadcast it via WebSocket."""
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                self.executor,
+                self._save_single_trade_sync,
+                backtest_id,
+                api_result,
+            )
+        except Exception as exc:
+            logger.error(f"Failed to persist trade for backtest {backtest_id}: {exc}")
+        await websocket_manager.send_trade_result(backtest_id, api_result.model_dump(mode="json"))
     
     def _convert_single_trade(self, result: EnhancedBacktestResult,
                               backtest_id: str) -> BacktestResult:

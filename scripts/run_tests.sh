@@ -3,14 +3,14 @@
 # SPX AI Trading System - Test Runner Script
 # Comprehensive test execution with reporting
 
+# Resolve the project root (one level up from this script)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+
+cd "$PROJECT_ROOT"
+
 echo "🚀 SPX AI Trading System - Comprehensive Test Suite"
 echo "=================================================="
-
-# Check if we're in the right directory
-if [ ! -f "enhanced_multi_strategy.py" ]; then
-    echo "❌ Error: Please run this script from the project root directory"
-    exit 1
-fi
 
 # Check if pytest is available
 if ! command -v pytest &> /dev/null; then
@@ -98,7 +98,7 @@ if [ $overall_result -eq 0 ]; then
     echo "----------------------------------------"
     
     # Test the actual enhanced multi-strategy system
-    timeout 30 python enhanced_multi_strategy.py --date 2026-02-09 > "$TEST_RESULTS_DIR/system_test_output.log" 2>&1
+    timeout 30 python engine/enhanced_multi_strategy.py --date 2026-02-09 > "$TEST_RESULTS_DIR/system_test_output.log" 2>&1
     system_result=$?
     
     if [ $system_result -eq 0 ]; then

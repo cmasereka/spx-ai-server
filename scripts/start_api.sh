@@ -1,5 +1,11 @@
 #!/bin/bash
 
+# Resolve the project root (one level up from this script)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+
+cd "$PROJECT_ROOT"
+
 echo "🚀 Starting SPX AI Trading Platform API..."
 echo "======================================"
 
@@ -35,7 +41,7 @@ echo ""
 echo "✅ Starting server on http://localhost:8000"
 echo "📖 API Documentation: http://localhost:8000/docs"
 echo "🔗 WebSocket endpoint: ws://localhost:8000/ws/{client_id}"
-echo "🧪 Test script: python test_api.py"
+echo "🧪 Test script: python scripts/test_api.py"
 echo ""
 echo "Press Ctrl+C to stop the server"
 echo "======================================"

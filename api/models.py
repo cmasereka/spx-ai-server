@@ -61,6 +61,44 @@ class BacktestRequest(BaseModel):
     stop_loss: float = Field(6.0, ge=0.10, le=20.0, description="Stop loss: exit when cost-to-close per spread per share reaches this absolute value. E.g. 2.0 exits when closing costs $2.00/share.")
     monitor_interval: int = Field(5, ge=1, le=15, description="Minutes between position checks. 1 = every bar, 5 = every 5 minutes.")
 
+    # Entry / exit time window
+    entry_start_time: str = Field(
+        "10:00:00",
+        description="Time to begin scanning for entry signals (HH:MM:SS, 24-hour). Default 10:00:00."
+    )
+    last_entry_time: str = Field(
+        "14:00:00",
+        description="No new entries at or after this time (HH:MM:SS, 24-hour). Default 14:00:00."
+    )
+
+    # Stale-loss exit parameters
+    enable_stale_loss_exit: bool = Field(
+        False,
+        description="Enable the stale-loss exit feature. When False (default) the position is "
+                    "held until take_profit, stop_loss, or expiry regardless of duration."
+    )
+    stale_loss_minutes: int = Field(
+        120, ge=10, le=360,
+        description="Close a position that has been continuously losing for this many consecutive "
+                    "minutes (cost > entry_credit × stale_loss_threshold). Default 120 (2 hours)."
+    )
+    stale_loss_threshold: float = Field(
+        1.5, ge=1.0, le=5.0,
+        description="Cost-to-close must exceed entry_credit × this value to qualify as 'in the red' "
+                    "for stale-loss detection. Default 1.5 (50% above original credit collected)."
+    )
+    stagnation_window: int = Field(
+        30, ge=5, le=120,
+        description="Number of recent 1-min bars to examine for improvement. "
+                    "If the cost has not dropped by min_improvement in this window the position "
+                    "is considered stagnant. Default 30 bars."
+    )
+    min_improvement: float = Field(
+        0.05, ge=0.01, le=1.0,
+        description="Minimum cost improvement ($/share) required in the stagnation window to "
+                    "keep the position open. Default $0.05/share."
+    )
+
     @field_validator('start_date', 'end_date', 'single_date')
     @classmethod
     def validate_dates(cls, v):
@@ -204,58 +242,169 @@ class ErrorResponse(BaseModel):
     details: Optional[Dict[str, Any]] = Field(None, description="Additional error details")
 
 
-# ---------------------------------------------------------------------------
-# Paper Trading models
-# ---------------------------------------------------------------------------
-
-class PaperTradingMode(str, Enum):
-    """Paper trading execution mode"""
-    SIMULATION = "simulation"  # Replay a historical date at full speed
-    LIVE = "live"              # Process today's data as bars arrive in real time
-
-
-class PaperTradingRequest(BaseModel):
-    """Request model for starting a paper trading session"""
-    mode: PaperTradingMode = Field(PaperTradingMode.SIMULATION, description="Execution mode")
-
-    # Optional date: defaults to latest available date when omitted
-    trade_date: Optional[date] = Field(None, description="Trading date (defaults to latest available)")
-
-    # Strategy configuration — same knobs as a backtest
-    strategy: BacktestStrategyEnum = Field(
-        BacktestStrategyEnum.CREDIT_SPREADS,
-        description="Which trade types to consider"
-    )
-    target_credit: float = Field(0.35, ge=0.05, le=5.0, description="Target net credit per spread")
-    spread_width: int = Field(10, ge=5, le=100, description="Spread width in strike points")
-    contracts: int = Field(1, ge=1, le=100, description="Number of contracts per position")
-    take_profit: float = Field(0.05, ge=0.01, le=10.0, description="Take-profit threshold")
-    stop_loss: float = Field(3.0, ge=0.10, le=20.0, description="Stop-loss threshold")
-    monitor_interval: int = Field(5, ge=1, le=15, description="Minutes between position checks")
-
-
 class PaperPosition(BaseModel):
-    """An open (not yet closed) paper trading position"""
+    """An open (not yet closed) trading position"""
     position_id: str = Field(..., description="Unique identifier for this position")
     strategy_type: str = Field(..., description="IC / Put Spread / Call Spread")
     entry_time: str = Field(..., description="Entry time HH:MM:SS")
     entry_spx_price: float = Field(..., description="SPX price at entry")
     entry_credit: float = Field(..., description="Total credit received")
     strikes: Dict[str, Any] = Field(default_factory=dict, description="Strike prices")
+    entry_rationale: Optional[Dict[str, Any]] = Field(None, description="Why this trade was entered")
 
 
-class PaperTradingStatus(BaseModel):
-    """Full status of a paper trading session"""
+# ---------------------------------------------------------------------------
+# Live / IBKR Trading models
+# ---------------------------------------------------------------------------
+
+class IBKRConnectionConfig(BaseModel):
+    """IBKR TWS / IB Gateway connection parameters."""
+    host: str = Field("127.0.0.1", description="TWS / Gateway host")
+    port: int = Field(7497, ge=1, le=65535,
+                      description="7497 = TWS paper, 7496 = TWS live, "
+                                  "4002 = Gateway paper, 4001 = Gateway live")
+    client_id: int = Field(1, ge=1, le=999, description="IBKR client ID (must be unique per connection)")
+    account: str = Field("", description="IBKR account string (e.g. DU123456 for paper)")
+
+
+class IBKRDiagnosticRequest(BaseModel):
+    """
+    Request body for POST /api/v1/trading/diagnose-market-data.
+
+    Tests the full data path (SPX price + options chain) without starting a
+    trading session.  Uses a separate clientId so it never interferes with a
+    running session.
+    """
+    ibkr: IBKRConnectionConfig = Field(default_factory=IBKRConnectionConfig)
+    trade_date: Optional[str] = Field(
+        None,
+        description="Date to use for options expiry (YYYY-MM-DD). Defaults to today."
+    )
+    spx_price_hint: float = Field(
+        5800.0,
+        description="Approximate SPX level to centre the options chain query around "
+                    "when live price is unavailable (e.g. outside market hours)."
+    )
+    diagnostic_client_id: int = Field(
+        50,
+        ge=1, le=999,
+        description="clientId used for the diagnostic connection. "
+                    "Must differ from any running session clientId."
+    )
+    num_strikes: int = Field(
+        5,
+        ge=1, le=20,
+        description="Number of strikes on each side (put/call) to sample from the chain."
+    )
+
+
+class LiveTradingRequest(BaseModel):
+    """Request model for starting a live / IBKR paper trading session."""
+
+    # IBKR connection
+    ibkr: IBKRConnectionConfig = Field(
+        default_factory=IBKRConnectionConfig,
+        description="IBKR connection settings"
+    )
+
+    # Optional date: defaults to today when omitted
+    trade_date: Optional[date] = Field(
+        None,
+        description="Trading date (YYYY-MM-DD). Defaults to today."
+    )
+
+    # Strategy — same knobs as backtesting
+    strategy: BacktestStrategyEnum = Field(
+        BacktestStrategyEnum.CREDIT_SPREADS,
+        description="Which trade types to consider"
+    )
+    target_credit: float = Field(0.35, ge=0.05, le=5.0,
+                                 description="Target net credit per spread per share")
+    spread_width: int = Field(10, ge=5, le=100,
+                              description="Spread width in strike points")
+    contracts: int = Field(1, ge=1, le=100, description="Number of contracts per position")
+    take_profit: float = Field(0.05, ge=0.01, le=10.0,
+                               description="Take-profit threshold ($/share cost-to-close)")
+    stop_loss: float = Field(3.0, ge=0.10, le=20.0,
+                             description="Stop-loss threshold ($/share cost-to-close)")
+    monitor_interval: int = Field(5, ge=1, le=15,
+                                  description="Minutes between position checks")
+
+    # Entry / exit time window
+    entry_start_time: str = Field(
+        "10:00:00",
+        description="Time to begin scanning for entry signals (HH:MM:SS, 24-hour). Default 10:00:00."
+    )
+    last_entry_time: str = Field(
+        "14:00:00",
+        description="No new entries at or after this time (HH:MM:SS, 24-hour). Default 14:00:00."
+    )
+
+    # Stale-loss exit parameters
+    enable_stale_loss_exit: bool = Field(
+        False,
+        description="Enable the stale-loss exit feature. When False (default) the position is "
+                    "held until take_profit, stop_loss, or expiry regardless of duration."
+    )
+    stale_loss_minutes: int = Field(
+        120, ge=10, le=360,
+        description="Close a position that has been continuously losing for this many consecutive "
+                    "minutes (cost > entry_credit × stale_loss_threshold). Default 120 (2 hours)."
+    )
+    stale_loss_threshold: float = Field(
+        1.5, ge=1.0, le=5.0,
+        description="Cost-to-close must exceed entry_credit × this value to qualify as 'in the red' "
+                    "for stale-loss detection. Default 1.5 (50% above original credit collected)."
+    )
+    stagnation_window: int = Field(
+        30, ge=5, le=120,
+        description="Number of recent 1-min bars to examine for improvement. "
+                    "If the cost has not dropped by min_improvement in this window the position "
+                    "is considered stagnant. Default 30 bars."
+    )
+    min_improvement: float = Field(
+        0.05, ge=0.01, le=1.0,
+        description="Minimum cost improvement ($/share) required in the stagnation window to "
+                    "keep the position open. Default $0.05/share."
+    )
+
+    @field_validator("trade_date")
+    @classmethod
+    def validate_trade_date(cls, v):
+        # Live trading can target today or a future date — no restriction needed
+        return v
+
+
+class OrderSlippage(BaseModel):
+    """Slippage record for a single IBKR order."""
+    order_id: str
+    strategy_type: str
+    is_entry: bool
+    limit_price: float
+    fill_price: float
+    slippage: float
+    timestamp: str
+    success: bool
+
+
+class LiveTradingStatus(BaseModel):
+    """Full status of a live / IBKR paper trading session."""
     session_id: str = Field(..., description="Unique session identifier")
-    mode: str = Field(..., description="simulation or live")
+    mode: str = Field(..., description="live")
     trade_date: str = Field(..., description="Date being traded YYYY-MM-DD")
-    status: str = Field(..., description="pending | running | completed | stopped | failed")
+    status: str = Field(..., description="pending | connecting | running | completed | stopped | failed")
+    ibkr_connected: bool = Field(False, description="Whether IBKR connection is active")
 
     # Live position state
     open_positions: List[PaperPosition] = Field(default_factory=list)
     completed_trades: List[BacktestResult] = Field(default_factory=list)
     day_pnl: float = Field(0.0)
     trade_count: int = Field(0)
+
+    # Slippage tracking
+    orders: List[OrderSlippage] = Field(default_factory=list,
+                                        description="All IBKR orders with fill details")
+    total_slippage: float = Field(0.0, description="Cumulative slippage across all orders")
 
     # Timing
     created_at: datetime = Field(...)
