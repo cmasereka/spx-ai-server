@@ -14,8 +14,13 @@ Order execution strategy
 5. After MAX_IMPROVE_ATTEMPTS, switch to a market order as a last resort.
 6. Time out after TOTAL_TIMEOUT_SECS — treat as failed fill.
 
-The IBKR connection is shared with IBKRMarketDataProvider (same IB instance).
-Pass the IB instance to the constructor to avoid creating two connections.
+Connection model
+----------------
+IBKRBrokerAdapter uses its OWN dedicated IB connection (separate clientId from
+the market data provider) so that order submission is never blocked by the
+snapshot data flood on the market data connection.
+
+Pass host/port/client_id to the constructor and call connect() before trading.
 """
 
 import time
@@ -36,31 +41,98 @@ except ImportError:
     IB_AVAILABLE = False
 
 # Order fill timing constants
-INITIAL_WAIT_SECS   = 20   # Wait this long for initial limit order fill
-IMPROVE_STEP        = 0.05  # How much to move the limit price per improvement step
-MAX_IMPROVE_ATTEMPTS = 3   # Number of price improvements before going to market
-IMPROVE_WAIT_SECS   = 10   # Wait between each improvement attempt
-TOTAL_TIMEOUT_SECS  = 90   # Give up after this many seconds
+INITIAL_WAIT_SECS    = 30   # Wait this long for initial limit order fill
+IMPROVE_STEP         = 0.05  # How much to move the limit price per improvement step
+MAX_IMPROVE_ATTEMPTS = 3    # Number of price improvements before going to market
+IMPROVE_WAIT_SECS    = 15   # Wait between each improvement attempt
+TOTAL_TIMEOUT_SECS   = 120  # Give up after this many seconds
 
 
 class IBKRBrokerAdapter(BrokerAdapter):
     """
     Real order execution adapter for IBKR paper / live trading.
 
+    Uses a dedicated IB connection (separate from IBKRMarketDataProvider) so
+    that order submission is never blocked by the concurrent snapshot data flood
+    on the market data connection.
+
     Parameters
     ----------
-    ib:      A connected ib_insync.IB instance (shared with IBKRMarketDataProvider).
-    account: IBKR account string (e.g. 'DU123456' for paper, 'U123456' for live).
+    host:       TWS / IB Gateway host (e.g. '127.0.0.1')
+    port:       TWS / IB Gateway port (e.g. 7497 for paper TWS)
+    client_id:  Must be DIFFERENT from the market data provider clientId.
+                Convention: market data uses client_id N, broker uses N+1.
+    account:    IBKR account string (e.g. 'DU123456' for paper, 'U123456' live).
     """
 
-    def __init__(self, ib: "IB", account: str = ""):
+    def __init__(self, host: str, port: int, client_id: int, account: str = ""):
         if not IB_AVAILABLE:
             raise ImportError(
                 "ib_insync must be installed to use IBKRBrokerAdapter. "
                 "Run: pip install ib_insync"
             )
-        self._ib = ib
+        self._host = host
+        self._port = port
+        self._client_id = client_id
         self._account = account
+        self._ib: Optional["IB"] = None
+
+    # ------------------------------------------------------------------
+    # Connection lifecycle
+    # ------------------------------------------------------------------
+
+    def connect(self, timeout: int = 15) -> bool:
+        """Open a dedicated IB connection for order execution."""
+        import asyncio
+        try:
+            asyncio.get_event_loop()
+        except RuntimeError:
+            asyncio.set_event_loop(asyncio.new_event_loop())
+
+        try:
+            self._ib = IB()
+            last_exc = None
+            for attempt in range(1, 4):
+                try:
+                    self._ib.connect(self._host, self._port,
+                                     clientId=self._client_id, timeout=timeout)
+                    if self._ib.isConnected():
+                        break
+                except Exception as exc:
+                    last_exc = exc
+                    logger.warning(
+                        f"IBKRBrokerAdapter connect attempt {attempt}/3 failed: {exc} "
+                        "— waiting 3s before retry"
+                    )
+                    time.sleep(3)
+            else:
+                raise last_exc or ConnectionError(
+                    f"IBKRBrokerAdapter could not connect after 3 attempts"
+                )
+
+            if self._ib.isConnected():
+                logger.info(
+                    f"IBKRBrokerAdapter connected to {self._host}:{self._port} "
+                    f"(clientId={self._client_id})"
+                )
+                return True
+            return False
+        except Exception as exc:
+            logger.error(f"IBKRBrokerAdapter connection failed: {exc}")
+            return False
+
+    def disconnect(self):
+        """Close the dedicated IB connection."""
+        if self._ib and self._ib.isConnected():
+            try:
+                self._ib.disconnect()
+            except Exception:
+                pass
+        logger.info("IBKRBrokerAdapter disconnected")
+
+    @property
+    def is_connected(self) -> bool:
+        return bool(self._ib) and self._ib.isConnected()
 
     # ------------------------------------------------------------------
     # BrokerAdapter implementation
@@ -106,7 +178,7 @@ class IBKRBrokerAdapter(BrokerAdapter):
                 logger.error(f"close_all failed for strategy: {exc}")
                 results.append(OrderResult(
                     order_id=str(uuid.uuid4()),
-                    symbol="SPXW",
+                    symbol="SPX",
                     fill_price=0.0,
                     limit_price=0.0,
                     quantity=getattr(strat, "quantity", 1),
@@ -146,19 +218,22 @@ class IBKRBrokerAdapter(BrokerAdapter):
                 raise ValueError("Could not build combo contract from strategy legs")
 
             action = "SELL" if is_entry else "BUY"
+            # target_price is the total dollar amount (entry_credit / exit_cost × 100 × qty).
+            # IBKR combo lmtPrice is expressed as per-share price (before the 100 multiplier).
+            per_share_price = abs(target_price) / (100.0 * max(quantity, 1))
             fill_price = self._submit_with_retry(
                 combo=combo,
                 action=action,
                 quantity=quantity,
-                target_price=abs(target_price),
+                target_price=per_share_price,
                 use_market=use_market,
             )
 
             return OrderResult(
                 order_id=str(uuid.uuid4()),
-                symbol="SPXW",
-                fill_price=fill_price if fill_price is not None else target_price,
-                limit_price=target_price,
+                symbol="SPX",
+                fill_price=fill_price if fill_price is not None else per_share_price,
+                limit_price=per_share_price,
                 quantity=quantity,
                 strategy_type=strategy_type,
                 is_entry=is_entry,
@@ -169,11 +244,12 @@ class IBKRBrokerAdapter(BrokerAdapter):
 
         except Exception as exc:
             logger.error(f"IBKRBrokerAdapter order failed: {exc}")
+            fallback_price = abs(target_price) / (100.0 * max(quantity, 1))
             return OrderResult(
                 order_id=str(uuid.uuid4()),
-                symbol="SPXW",
-                fill_price=target_price,
-                limit_price=target_price,
+                symbol="SPX",
+                fill_price=fallback_price,
+                limit_price=fallback_price,
                 quantity=quantity,
                 strategy_type=strategy_type,
                 is_entry=is_entry,
@@ -204,13 +280,14 @@ class IBKRBrokerAdapter(BrokerAdapter):
                 # Qualify the individual option contract to get conId
                 opt_contract = Contract(
                     secType="OPT",
-                    symbol="SPXW",
+                    symbol="SPX",
                     lastTradeDateOrContractMonth=expiry,
                     strike=strike,
                     right=right,
-                    exchange="SMART",
+                    exchange="CBOE",
                     currency="USD",
                     multiplier="100",
+                    tradingClass="SPXW",
                 )
                 qualified = self._ib.qualifyContracts(opt_contract)
                 if not qualified:
@@ -224,12 +301,12 @@ class IBKRBrokerAdapter(BrokerAdapter):
                         conId=qualified[0].conId,
                         ratio=1,
                         action=action,
-                        exchange="SMART",
+                        exchange="CBOE",
                     )
                 )
 
             bag = Contract()
-            bag.symbol   = "SPXW"
+            bag.symbol   = "SPX"
             bag.secType  = "BAG"
             bag.currency = "USD"
             bag.exchange = "SMART"

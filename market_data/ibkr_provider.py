@@ -24,9 +24,12 @@ IBKR Port Reference
 
 import time
 import threading
+import pytz
 from collections import defaultdict
 from datetime import datetime, date as date_type
 from typing import Optional, List, Dict, Deque
+
+_ET = pytz.timezone("America/New_York")
 from collections import deque
 
 import pandas as pd
@@ -106,9 +109,8 @@ class IBKRMarketDataProvider(MarketDataProvider):
         """Connect to IBKR TWS / IB Gateway. Returns True on success."""
         if not IB_AVAILABLE:
             return False
-        # ib_insync's synchronous connect() calls asyncio.get_event_loop() internally.
-        # When running inside a ThreadPoolExecutor worker there is no event loop yet,
-        # so we create and register one before touching any ib_insync code.
+        # The caller (_run_session_in_thread) sets a fresh event loop on this
+        # thread before calling connect(), so we just verify one exists.
         import asyncio
         try:
             asyncio.get_event_loop()
@@ -116,10 +118,28 @@ class IBKRMarketDataProvider(MarketDataProvider):
             asyncio.set_event_loop(asyncio.new_event_loop())
         try:
             self._ib = IB()
-            self._ib.connect(self.host, self.port, clientId=self.client_id,
-                             timeout=timeout)
+            # Retry up to 3 times — previous session's clientId slot may still
+            # be held by the Gateway for a few seconds after disconnect.
+            last_exc = None
+            for attempt in range(1, 4):
+                try:
+                    self._ib.connect(self.host, self.port, clientId=self.client_id,
+                                     timeout=timeout)
+                    if self._ib.isConnected():
+                        break
+                except Exception as exc:
+                    last_exc = exc
+                    logger.warning(
+                        f"IBKR connect attempt {attempt}/3 failed: {exc} — "
+                        f"waiting 5s before retry"
+                    )
+                    time.sleep(5)
+            else:
+                raise last_exc or ConnectionError("IBKR connect failed after 3 attempts")
             self._connected = self._ib.isConnected()
             if self._connected:
+                # Request live market data (requires active CBOE options subscription).
+                self._ib.reqMarketDataType(1)
                 self._today = datetime.now().strftime("%Y-%m-%d")
                 self._spx_contract = Index("SPX", "CBOE", "USD")
                 self._ib.qualifyContracts(self._spx_contract)
@@ -149,27 +169,92 @@ class IBKRMarketDataProvider(MarketDataProvider):
     # ------------------------------------------------------------------
 
     def _subscribe_spx_bars(self):
-        """Subscribe to 5-second real-time bars for SPX."""
+        """Subscribe to 5-second real-time bars for SPX and backfill today's 1-min history."""
         if not self._ib or not self._spx_contract:
+            logger.error("_subscribe_spx_bars: ib or spx_contract not set")
             return
+        logger.info("Requesting SPX real-time bars subscription...")
         try:
             bars = self._ib.reqRealTimeBars(
                 contract=self._spx_contract,
                 barSize=5,
-                whatToShow="MIDPOINT",   # SPX is a cash index — TRADES is not supported
+                whatToShow="TRADES",   # SPX Index uses TRADES (= calculated index value)
                 useRTH=True,
             )
             bars.updateEvent += self._on_rtbar
             logger.info("Subscribed to SPX real-time bars (5s, MIDPOINT)")
         except Exception as exc:
-            logger.warning(f"Failed to subscribe to SPX real-time bars: {exc}")
+            logger.error(f"Failed to subscribe to SPX real-time bars: {exc}")
+
+        # Backfill today's 1-minute bars so that opening price and drift guards
+        # work correctly when connecting mid-session.
+        logger.info("Requesting historical 1-min SPX bars for backfill...")
+        try:
+            # Small pause to avoid IBKR pacing violation after reqRealTimeBars
+            self._ib.sleep(1)
+            hist_bars = self._ib.reqHistoricalData(
+                contract=self._spx_contract,
+                endDateTime="",
+                durationStr="1 D",
+                barSizeSetting="1 min",
+                whatToShow="TRADES",   # SPX Index uses TRADES for historical data
+                useRTH=True,
+                formatDate=1,
+                keepUpToDate=False,
+                timeout=30,
+            )
+            logger.info(f"reqHistoricalData returned {len(hist_bars) if hist_bars else 0} raw bars")
+            count = 0
+            for bar in hist_bars:
+                # bar.date can be a datetime object or a string depending on formatDate.
+                # Convert to ET so buffer keys match _wait_for_bar.
+                if isinstance(bar.date, datetime):
+                    if bar.date.tzinfo is not None:
+                        bar_dt = bar.date.astimezone(_ET).replace(tzinfo=None)
+                    else:
+                        # Assume IBKR returned local (server) time — convert via local tz
+                        bar_dt = pytz.timezone("America/Chicago").localize(bar.date).astimezone(_ET).replace(tzinfo=None)
+                else:
+                    try:
+                        bar_dt = datetime.strptime(bar.date, "%Y%m%d %H:%M:%S")
+                    except ValueError:
+                        try:
+                            bar_dt = datetime.strptime(bar.date, "%Y-%m-%d %H:%M:%S")
+                        except ValueError:
+                            logger.warning(f"Unrecognised bar date format: {bar.date!r}")
+                            continue
+                date_str = bar_dt.strftime("%Y-%m-%d")
+                time_str = bar_dt.strftime("%H:%M:%S")
+                price = float(bar.close)
+                if price > 0:
+                    with self._lock:
+                        self._price_buffer[date_str][time_str] = price
+                        self._price_keys.append((date_str, time_str))
+                    count += 1
+            logger.info(f"Backfilled {count} historical 1-min SPX bars into buffer")
+            if count > 0:
+                # Log a sample so we can confirm dates/times are correct
+                sample_date = list(self._price_buffer.keys())[-1]
+                sample_times = sorted(self._price_buffer[sample_date].keys())
+                logger.info(
+                    f"Buffer sample — date={sample_date} "
+                    f"first={sample_times[0]} last={sample_times[-1]} "
+                    f"bars={len(sample_times)}"
+                )
+        except Exception as exc:
+            logger.error(f"Historical backfill failed: {exc}")
 
     def _on_rtbar(self, bars, has_new_bar: bool):
         """Callback invoked by ib_insync on each new 5-second bar."""
         if not has_new_bar or not bars:
             return
         bar = bars[-1]
-        bar_dt = datetime.fromtimestamp(bar.time)
+        # bar.time is a datetime when using TRADES, or a unix int with MIDPOINT.
+        # Convert to ET so buffer keys match _wait_for_bar which uses ET.
+        if isinstance(bar.time, datetime):
+            bar_dt = bar.time.astimezone(_ET).replace(tzinfo=None)
+        else:
+            bar_dt = datetime.fromtimestamp(bar.time, tz=_ET).replace(tzinfo=None)
         date_str = bar_dt.strftime("%Y-%m-%d")
         # Snap to the nearest minute
         time_str = bar_dt.strftime("%H:%M") + ":00"
@@ -179,6 +264,7 @@ class IBKRMarketDataProvider(MarketDataProvider):
         with self._lock:
             self._price_buffer[date_str][time_str] = close_price
             self._price_keys.append((date_str, time_str))
+        logger.debug(f"SPX bar: {date_str} {time_str} close={close_price:.2f}")
 
     # ------------------------------------------------------------------
     # MarketDataProvider — price methods
@@ -262,6 +348,7 @@ class IBKRMarketDataProvider(MarketDataProvider):
 
         spx_price = self.get_fastest_spx_price(date, timestamp)
         if not spx_price:
+            logger.warning(f"get_options_data: no SPX price in buffer for {date} {timestamp}")
             return None
 
         try:
@@ -273,45 +360,68 @@ class IBKRMarketDataProvider(MarketDataProvider):
             expiry = datetime.strptime(date, "%Y-%m-%d").strftime("%Y%m%d")
             T = _time_to_expiry_years(timestamp, date)
 
-            rows = []
+            logger.debug(
+                f"IBKR options fetch: SPX={spx_price:.2f} center={round(spx_price/5)*5} "
+                f"strikes={len(strikes)} expiry={expiry} @ {timestamp}"
+            )
+
+            # Submit all snapshot requests up-front, then wait once for IBKR to respond.
+            # snapshot=True with a single ib.sleep(0) per contract is unreliable —
+            # IBKR needs ~2-3 s to push all responses after the batch is submitted.
+            pending: list = []
             for strike in strikes:
                 for right in ("P", "C"):
-                    contract = Option("SPXW", expiry, strike, right,
-                                      exchange="SMART", currency="USD")
+                    contract = Option("SPX", expiry, strike, right,
+                                      exchange="CBOE", currency="USD",
+                                      multiplier="100",
+                                      tradingClass="SPXW")
                     try:
                         ticker = self._ib.reqMktData(contract, "", True, False)
-                        self._ib.sleep(0)  # allow event loop to process
-                        bid = float(ticker.bid) if ticker.bid and ticker.bid > 0 else 0.0
-                        ask = float(ticker.ask) if ticker.ask and ticker.ask > 0 else 0.0
-                        if ask <= 0:
-                            continue
-                        mid_price = (bid + ask) / 2.0
-                        is_call = right == "C"
-                        delta = _compute_bs_delta(
-                            S=spx_price,
-                            K=float(strike),
-                            T=T,
-                            r=RISK_FREE_RATE,
-                            mid_price=mid_price,
-                            is_call=is_call,
-                        )
-                        rows.append({
-                            "strike": float(strike),
-                            "option_type": "call" if is_call else "put",
-                            "expiration": date,
-                            "bid": bid,
-                            "ask": ask,
-                            "delta": delta,
-                            "gamma": float(ticker.modelGreeks.gamma) if ticker.modelGreeks else 0.0,
-                            "theta": float(ticker.modelGreeks.theta) if ticker.modelGreeks else 0.0,
-                            "vega":  float(ticker.modelGreeks.vega)  if ticker.modelGreeks else 0.0,
-                            "volume": int(ticker.volume) if ticker.volume else 0,
-                        })
-                        self._ib.cancelMktData(contract)
+                        pending.append((strike, right, contract, ticker))
                     except Exception as opt_exc:
-                        logger.debug(f"Options snapshot failed for {strike}{right}: {opt_exc}")
-                        continue
+                        logger.debug(f"reqMktData failed for {strike}{right}: {opt_exc}")
 
+            # Wait for IBKR to push all snapshot responses
+            self._ib.sleep(3)
+
+            rows = []
+            for strike, right, contract, ticker in pending:
+                try:
+                    bid = float(ticker.bid) if ticker.bid and ticker.bid > 0 else 0.0
+                    ask = float(ticker.ask) if ticker.ask and ticker.ask > 0 else 0.0
+                    # snapshot=True subscriptions are auto-cancelled by IBKR once the
+                    # snapshot arrives — do NOT call cancelMktData() or we get Error 300.
+                    if ask <= 0:
+                        continue
+                    mid_price = (bid + ask) / 2.0
+                    is_call = right == "C"
+                    delta = _compute_bs_delta(
+                        S=spx_price,
+                        K=float(strike),
+                        T=T,
+                        r=RISK_FREE_RATE,
+                        mid_price=mid_price,
+                        is_call=is_call,
+                    )
+                    rows.append({
+                        "strike": float(strike),
+                        "option_type": "call" if is_call else "put",
+                        "expiration": date,
+                        "bid": bid,
+                        "ask": ask,
+                        "delta": delta,
+                        "gamma": float(ticker.modelGreeks.gamma) if ticker.modelGreeks else 0.0,
+                        "theta": float(ticker.modelGreeks.theta) if ticker.modelGreeks else 0.0,
+                        "vega":  float(ticker.modelGreeks.vega)  if ticker.modelGreeks else 0.0,
+                        "volume": int(ticker.volume) if ticker.volume and ticker.volume == ticker.volume else 0,
+                    })
+                except Exception as opt_exc:
+                    logger.debug(f"Options snapshot failed for {strike}{right}: {opt_exc}")
+                    continue
+
+            logger.debug(
+                f"IBKR options fetch complete: {len(rows)}/{len(pending)} contracts had quotes"
+            )
             return pd.DataFrame(rows) if rows else None
 
         except Exception as exc:

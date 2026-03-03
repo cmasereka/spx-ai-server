@@ -264,8 +264,9 @@ def _diagnose_market_data_sync(request: IBKRDiagnosticRequest) -> dict:
     trade_date = request.trade_date or _date.today().strftime("%Y-%m-%d")
     expiry_str = datetime.strptime(trade_date, "%Y-%m-%d").strftime("%Y%m%d")
 
-    # Determine market-hours status for context
-    now_et = datetime.now()   # assumes server is running ET; adjust if needed
+    # Determine market-hours status in US/Eastern time
+    import pytz
+    now_et = datetime.now(pytz.timezone("America/New_York"))
     market_open  = _time(9, 30)
     market_close = _time(16, 0)
     is_market_hours = market_open <= now_et.time() <= market_close
@@ -277,7 +278,7 @@ def _diagnose_market_data_sync(request: IBKRDiagnosticRequest) -> dict:
         "port": cfg.port,
         "diagnostic_client_id": request.diagnostic_client_id,
         "trade_date": trade_date,
-        "server_time": now_et.strftime("%Y-%m-%d %H:%M:%S"),
+        "server_time": now_et.strftime("%Y-%m-%d %H:%M:%S %Z"),
         "is_market_hours": is_market_hours,
         "spx": {},
         "options": {},
@@ -293,6 +294,7 @@ def _diagnose_market_data_sync(request: IBKRDiagnosticRequest) -> dict:
             return report
 
         report["connected"] = True
+        ib.reqMarketDataType(1)  # Live data
 
         # ------------------------------------------------------------------
         # 1. SPX Index price
@@ -354,8 +356,10 @@ def _diagnose_market_data_sync(request: IBKRDiagnosticRequest) -> dict:
         pending: list = []   # (strike, right, contract, ticker)
         for strike in strikes:
             for right in ("P", "C"):
-                contract = Option("SPXW", expiry_str, strike, right,
-                                  exchange="SMART", currency="USD")
+                contract = Option("SPX", expiry_str, strike, right,
+                                  exchange="CBOE", currency="USD",
+                                  multiplier="100",
+                                  tradingClass="SPXW")
                 try:
                     ticker = ib.reqMktData(contract, "", snapshot=True, regulatorySnapshot=False)
                     pending.append((strike, right, contract, ticker))
@@ -399,7 +403,7 @@ def _diagnose_market_data_sync(request: IBKRDiagnosticRequest) -> dict:
                         "iv":    round(float(greeks.impliedVol), 4) if greeks and greeks.impliedVol else None,
                     })
 
-                ib.cancelMktData(contract)
+                # snapshot=True subscriptions are auto-cancelled by IBKR — do NOT call cancelMktData()
 
             except Exception as opt_err:
                 option_errors.append(f"{strike}{right}: {opt_err}")

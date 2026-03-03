@@ -445,12 +445,13 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                         exit_rationale=ic_exit_rationale,
                         ic_leg_status=ic_leg_status
                     ))
+                    _closed_strategy = open_ic
                     open_ic = None
                     ic_leg_status = None
                     ic_entry_meta = {}
                     ic_checkpoints = []
                     _fire({'event': 'position_closed', 'strategy_type': 'Iron Condor',
-                           'result': trades[-1]})
+                           'result': trades[-1], 'strategy_obj': _closed_strategy})
 
             # --- 2. Monitor put spread ---
             if open_put_spread is not None and is_check_bar:
@@ -534,6 +535,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                         entry_rationale=put_spread_meta.get('entry_rationale'),
                         exit_rationale=ps_exit_rationale,
                     ))
+                    _closed_strategy = open_put_spread
                     open_put_spread = None
                     put_spread_meta = {}
                     put_spread_checkpoints = []
@@ -541,7 +543,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     if pnl > 0:
                         _had_put_spread_win_today = True
                     _fire({'event': 'position_closed', 'strategy_type': 'Put Spread',
-                           'result': trades[-1]})
+                           'result': trades[-1], 'strategy_obj': _closed_strategy})
 
             # --- 3. Monitor call spread ---
             if open_call_spread is not None and is_check_bar:
@@ -625,6 +627,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                         entry_rationale=call_spread_meta.get('entry_rationale'),
                         exit_rationale=cs_exit_rationale,
                     ))
+                    _closed_strategy = open_call_spread
                     open_call_spread = None
                     call_spread_meta = {}
                     call_spread_checkpoints = []
@@ -632,7 +635,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                     if pnl > 0:
                         _had_call_spread_win_today = True
                     _fire({'event': 'position_closed', 'strategy_type': 'Call Spread',
-                           'result': trades[-1]})
+                           'result': trades[-1], 'strategy_obj': _closed_strategy})
             if not is_past_entry_cutoff and not is_final_bar:
                 try:
                     spx_history = self.get_spx_price_history(date, current_time, lookback_minutes=60)
@@ -940,7 +943,8 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                        'entry_time': current_time, 'entry_spx': entry_spx,
                                        'entry_credit': getattr(strategy, 'entry_credit', 0),
                                        'strikes': ic_entry_meta.get('strike_selection'),
-                                       'entry_rationale': ic_entry_meta.get('entry_rationale')})
+                                       'entry_rationale': ic_entry_meta.get('entry_rationale'),
+                                       'strategy_obj': strategy})
 
                     elif selection.strategy_type == StrategyType.PUT_SPREAD and allow_spreads and not put_spread_blocked:
                         # RSI conviction is required for ALL put spread entries.
@@ -1008,7 +1012,8 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                        'entry_time': current_time, 'entry_spx': entry_spx,
                                        'entry_credit': getattr(strategy, 'entry_credit', 0),
                                        'strikes': put_spread_meta.get('strike_selection'),
-                                       'entry_rationale': put_spread_meta.get('entry_rationale')})
+                                       'entry_rationale': put_spread_meta.get('entry_rationale'),
+                                       'strategy_obj': strategy})
 
                     elif selection.strategy_type == StrategyType.CALL_SPREAD and allow_spreads and not call_spread_blocked:
                         if open_call_spread is None and open_ic is None:
@@ -1054,7 +1059,8 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                        'entry_time': current_time, 'entry_spx': entry_spx,
                                        'entry_credit': getattr(strategy, 'entry_credit', 0),
                                        'strikes': call_spread_meta.get('strike_selection'),
-                                       'entry_rationale': call_spread_meta.get('entry_rationale')})
+                                       'entry_rationale': call_spread_meta.get('entry_rationale'),
+                                       'strategy_obj': strategy})
 
                 except Exception as e:
                     logger.debug(f"Entry scan error at {current_time}: {e}")

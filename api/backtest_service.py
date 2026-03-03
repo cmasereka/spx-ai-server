@@ -44,8 +44,11 @@ class BacktestService:
         """Initialize the backtest service"""
         try:
             # Initialize the enhanced backtesting engine
-            logger.info("Initializing Enhanced Backtesting Engine...")
-            self.engine = EnhancedBacktestingEngine("data/processed/parquet_1m")
+            # Set LOAD_PARQUET_DATA = False to skip historical data (live-trading-only mode)
+            LOAD_PARQUET_DATA = False
+            data_path = "data/processed/parquet_1m" if LOAD_PARQUET_DATA else ""
+            logger.info(f"Initializing Enhanced Backtesting Engine (parquet={'on' if LOAD_PARQUET_DATA else 'off'})...")
+            self.engine = EnhancedBacktestingEngine(data_path)
             
             logger.info("✅ Backtest service initialized successfully")
             

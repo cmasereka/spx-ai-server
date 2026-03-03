@@ -215,9 +215,11 @@ class LiveTradingService:
         if not s:
             return False
         with s._lock:
-            if s.status in ("running", "connecting"):
+            if s.status not in ("completed", "stopped", "failed"):
                 s.status = "stopped"
                 s.completed_at = datetime.now()
+        # Persist immediately so a server restart doesn't revert the status
+        await self._update_session_db_status(s)
         return True
 
     async def delete_session(self, session_id: str) -> bool:
@@ -300,47 +302,67 @@ class LiveTradingService:
             client_id=req.ibkr.client_id,
             account=req.ibkr.account,
         )
-        logger.info(
-            f"Session {backtest_id}: connecting to IBKR "
-            f"{req.ibkr.host}:{req.ibkr.port} clientId={req.ibkr.client_id}"
-        )
-        connected = await loop.run_in_executor(None, ibkr_provider.connect)
-        if not connected:
-            with state._lock:
-                state.status = "failed"
-                state.error_message = (
+
+        # Shared container so the worker thread can report back connect result
+        connect_result: dict = {}
+
+        def _run_session_in_thread():
+            """
+            Connect to IBKR and run the full trading session in a single thread.
+
+            ib_insync's IB object binds its asyncio event loop to the thread that
+            calls connect().  All subsequent reqMktData / sleep / cancelMktData
+            calls must happen in that same thread.  Previously connect() ran in
+            one run_in_executor call and session.run() ran in another, putting
+            them in different threads — the event loop was unreachable from the
+            session thread, so real-time bar callbacks and snapshot responses
+
+            A fresh event loop is created at the top of this function and set as
+            the current thread's loop so that ib_insync always finds a clean,
+            running loop regardless of what ThreadPoolExecutor may have left behind.
+            """
+            import asyncio as _asyncio
+            _thread_loop = _asyncio.new_event_loop()
+            _asyncio.set_event_loop(_thread_loop)
+
+            from broker.ibkr_adapter import IBKRBrokerAdapter
+
+            logger.info(
+                f"Session {backtest_id}: connecting to IBKR "
+                f"{req.ibkr.host}:{req.ibkr.port} clientId={req.ibkr.client_id}"
+            )
+            connected = ibkr_provider.connect()
+            connect_result["connected"] = connected
+            if not connected:
+                connect_result["error"] = (
                     f"Could not connect to IBKR at {req.ibkr.host}:{req.ibkr.port}. "
                     "Ensure TWS / IB Gateway is running and API connections are enabled."
                 )
-                state.completed_at = datetime.now()
-            await self._update_session_db_status(state)
-            await websocket_manager.send_backtest_error(backtest_id, state.error_message)
-            return
+                return None
 
-        # Override the provider's trade date to the session's intended date.
-        # IBKRMarketDataProvider.connect() sets _today = datetime.now(), which is
-        # wrong when the user starts a session today for tomorrow's trading.
-        ibkr_provider._today = state.trade_date
+            # Override trade date (connect() sets _today = datetime.now())
+            ibkr_provider._today = state.trade_date
+            logger.info(
+                f"Session {backtest_id}: IBKR connected — trade_date={state.trade_date} "
+                f"provider dates: {ibkr_provider.available_dates}"
+            )
 
-        logger.info(
-            f"Session {backtest_id}: IBKR connected — trade_date={state.trade_date} "
-            f"provider dates: {ibkr_provider.available_dates}"
-        )
-
-        with state._lock:
-            state.status = "running"
-            state.started_at = datetime.now()
-            state.ibkr_connected = True
-
-        await self._update_session_db_status(state)
-        await websocket_manager.send_backtest_update(
-            backtest_id, "status_change",
-            {"status": "running", "session_id": backtest_id}
-        )
-
-        try:
-            from broker.ibkr_adapter import IBKRBrokerAdapter
-            broker_adapter = IBKRBrokerAdapter(ibkr_provider._ib, account=req.ibkr.account)
+            broker_adapter = IBKRBrokerAdapter(
+                host=req.ibkr.host,
+                port=req.ibkr.port,
+                # Use client_id + 1 so order submission never shares a connection
+                # with the market data provider and avoids the 10197 flood conflict.
+                client_id=req.ibkr.client_id + 1,
+                account=req.ibkr.account,
+            )
+            broker_connected = broker_adapter.connect()
+            if not broker_connected:
+                logger.warning(
+                    f"Session {backtest_id}: broker adapter connection failed — "
+                    "orders will not be submitted to IBKR (NullAdapter fallback)"
+                )
+                from broker.null_adapter import NullBrokerAdapter
+                broker_adapter = NullBrokerAdapter()
 
             rt_provider = RealtimeMarketDataProvider(
                 ibkr_provider,
@@ -362,9 +384,8 @@ class LiveTradingService:
 
             callback = self._make_callback(state, loop, websocket_manager, backtest_id)
 
-            day_result = await loop.run_in_executor(
-                self._executor,
-                lambda: session.run(
+            try:
+                return session.run(
                     date=state.trade_date,
                     take_profit=req.take_profit,
                     stop_loss=req.stop_loss,
@@ -381,8 +402,39 @@ class LiveTradingService:
                     stagnation_window=req.stagnation_window,
                     min_improvement=req.min_improvement,
                     enable_stale_loss_exit=req.enable_stale_loss_exit,
-                ),
-            )
+                )
+            finally:
+                try:
+                    broker_adapter.disconnect()
+                except Exception:
+                    pass
+
+        day_result = await loop.run_in_executor(self._executor, _run_session_in_thread)
+        # Handle connect failure reported from the worker thread
+        if not connect_result.get("connected", False):
+            with state._lock:
+                state.status = "failed"
+                state.error_message = connect_result.get("error", "IBKR connection failed")
+                state.completed_at = datetime.now()
+            await self._update_session_db_status(state)
+            await websocket_manager.send_backtest_error(backtest_id, state.error_message)
+            return
+
+        with state._lock:
+            state.status = "running"
+            state.started_at = datetime.now()
+            state.ibkr_connected = True
+
+        await self._update_session_db_status(state)
+        await websocket_manager.send_backtest_update(
+            backtest_id, "status_change",
+            {"status": "running", "session_id": backtest_id}
+        )
+
+        try:
+            if day_result is None:
+                # connect_result already handled above; nothing more to do
+                return
 
             logger.info(
                 f"Session {backtest_id}: scan complete — "
@@ -420,10 +472,14 @@ class LiveTradingService:
 
         except asyncio.CancelledError:
             with state._lock:
-                if state.status == "running":
+                if state.status not in ("completed", "stopped", "failed"):
                     state.status = "stopped"
                     state.completed_at = datetime.now()
-            await self._update_session_db_status(state)
+            await self._finalise_session_db(state)
+            await websocket_manager.send_backtest_update(
+                backtest_id, "status_change",
+                {"status": "stopped", "session_id": backtest_id},
+            )
 
         except Exception as exc:
             logger.error(f"Live trading session {state.session_id} failed: {exc}")
@@ -533,6 +589,21 @@ class LiveTradingService:
                         state.completed_trades.append(api_result)
                         state.day_pnl += result.pnl
                         state.trade_count += 1
+
+                        # Record IBKR close order slippage if available
+                        order_result = event.get("order_result")
+                        if order_result:
+                            slippage = OrderSlippage(
+                                order_id=order_result.order_id,
+                                strategy_type=order_result.strategy_type,
+                                is_entry=False,
+                                limit_price=order_result.limit_price,
+                                fill_price=order_result.fill_price,
+                                slippage=order_result.slippage,
+                                timestamp=order_result.timestamp,
+                                success=order_result.success,
+                            )
+                            state.orders.append(slippage)
 
                         # Persist trade to DB and broadcast via WebSocket
                         loop.call_soon_threadsafe(
@@ -690,7 +761,49 @@ class LiveTradingService:
                 run.total_pnl = state.day_pnl
                 session.commit()
 
-            # Persist IBKR order records
+                # Upsert every completed trade — this catches any that were
+                # missed by the async position_closed callback (e.g. session
+                # crashed or was stopped before the coroutine executed).
+                existing_ids = {
+                    row[0] for row in
+                    session.query(Trade.trade_id).filter_by(backtest_run_id=run.id).all()
+                }
+                for t in state.completed_trades:
+                    if t.trade_id in existing_ids:
+                        continue
+                    sd = t.strategy.__dict__ if hasattr(t.strategy, "__dict__") else {}
+                    trade = Trade(
+                        trade_id=t.trade_id,
+                        backtest_run_id=run.id,
+                        trade_date=t.trade_date,
+                        entry_time=t.entry_time,
+                        exit_time=t.exit_time,
+                        entry_spx_price=t.entry_spx_price,
+                        exit_spx_price=t.exit_spx_price,
+                        strategy_type=t.strategy.strategy_type,
+                        strikes=t.strategy.strikes,
+                        entry_credit=t.entry_credit,
+                        exit_cost=t.exit_cost,
+                        pnl=t.pnl,
+                        pnl_percentage=t.pnl_percentage,
+                        exit_reason=t.exit_reason,
+                        is_winner=t.is_winner,
+                        max_profit=t.strategy.max_profit,
+                        max_loss=t.strategy.max_loss,
+                        strategy_details={
+                            "strategy_type": t.strategy.strategy_type,
+                            "strikes": t.strategy.strikes,
+                            "entry_credit": t.strategy.entry_credit,
+                            "max_profit": t.strategy.max_profit,
+                            "max_loss": t.strategy.max_loss,
+                            "breakeven_points": t.strategy.breakeven_points,
+                            "entry_rationale": t.entry_rationale,
+                            "exit_rationale": t.exit_rationale,
+                        },
+                        monitoring_data=t.monitoring_points,
+                    )
+                    session.add(trade)
+                session.commit()
             for order in state.orders:
                 ibkr_rec = IBKROrder(
                     order_id=order.order_id,

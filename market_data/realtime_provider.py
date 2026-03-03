@@ -24,7 +24,10 @@ import time
 from datetime import datetime
 from typing import Optional, List
 import pandas as pd
+import pytz
 from loguru import logger
+
+_ET = pytz.timezone("America/New_York")
 
 from .provider import MarketDataProvider
 
@@ -64,12 +67,14 @@ class RealtimeMarketDataProvider(MarketDataProvider):
         """
         Block until wall-clock time >= *timestamp* + grace_secs.
 
+        Bar timestamps are interpreted as US/Eastern time (market time).
         If the timestamp is already in the past, returns immediately.
         """
         try:
-            bar_dt = datetime.strptime(
+            naive_dt = datetime.strptime(
                 f"{self._trade_date} {timestamp}", "%Y-%m-%d %H:%M:%S"
             )
+            bar_dt = _ET.localize(naive_dt)
         except ValueError:
             return
 

@@ -304,18 +304,28 @@ class LiveTradingSession:
 
             elif ev == "position_closed":
                 result = event.get("result")
+                strategy = event.get("strategy_obj")
                 if result is not None:
                     debit = result.exit_cost or 0.0
-                    # We don't have the original strategy object here, so use
-                    # close_position with a stub (NullAdapter handles this fine;
-                    # IBKRAdapter would need the original contract — tracked in
-                    # LiveTradingService via the open_position order_id).
-                    # For now log the event; full IBKR close wiring is in
-                    # LiveTradingService._on_position_closed().
-                    logger.info(
-                        f"Broker position_closed event: {result.exit_reason} "
-                        f"pnl={result.pnl:.2f}"
-                    )
+                    exit_timestamp = event.get("exit_time") or result.exit_time or timestamp
+                    if strategy is not None:
+                        order = broker.close_position(strategy, quantity, exit_timestamp, debit)
+                        event["order_result"] = order
+                        if not order.success:
+                            logger.warning(
+                                f"Broker close_position failed: {order.error_message}"
+                            )
+                        else:
+                            logger.info(
+                                f"Broker filled CLOSE {order.strategy_type} "
+                                f"@ {order.fill_price:.2f} (target {order.limit_price:.2f}, "
+                                f"slippage {order.slippage:+.2f})"
+                            )
+                    else:
+                        logger.info(
+                            f"Broker position_closed event: {result.exit_reason} "
+                            f"pnl={result.pnl:.2f}"
+                        )
 
             # Always invoke the user's callback last
             user_callback(event)
