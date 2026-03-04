@@ -137,13 +137,19 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                               stale_loss_threshold: float = 1.5,
                               stagnation_window: int = 30,
                               min_improvement: float = 0.05,
-                              enable_stale_loss_exit: bool = False) -> DayBacktestResult:
+                              enable_stale_loss_exit: bool = False,
+                              skip_indicators: bool = False) -> DayBacktestResult:
         """
         Full intraday scan loop for one trading day.
         strategy_mode controls which entry types are allowed:
           iron_condor       — IC only
           credit_spreads    — put/call spreads only
           ic_credit_spreads — all types
+
+        skip_indicators: when True, bypasses RSI/BB analysis entirely and uses
+          only drift-from-open guards for entry decisions. Useful for live sessions
+          where price history hasn't accumulated yet. Indicators will be added back
+          once the warmup period issue is resolved.
 
         entry_start_time: first bar at which entries are considered (default 10:00:00)
         last_entry_time:  no new entries at or after this time (default 14:00:00)
@@ -166,7 +172,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                 try:
                     progress_callback(event)
                 except Exception as _cb_err:
-                    logger.debug(f"progress_callback error (ignored): {_cb_err}")
+                    logger.error(f"progress_callback error: {_cb_err}")
 
         # For live/paper sessions: warn if all scan bars are already in the past.
         # This happens when the session is started after market close or on a
@@ -313,7 +319,26 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
             # This call must be unconditional so the wait fires even on bars where no
             # position is open and the entry window has closed (otherwise those bars
             # iterate instantly and the session appears to end immediately).
-            self.enhanced_query_engine.get_fastest_spx_price(date, current_time)
+            _bar_spx = self.enhanced_query_engine.get_fastest_spx_price(date, current_time)
+
+            _drift_from_open = (_bar_spx - spx_open) if (_bar_spx and spx_open) else None
+            _drift_str = f" drift={_drift_from_open:+.1f}" if _drift_from_open is not None else ""
+
+            _pos_parts = []
+            if open_ic:
+                _pos_parts.append(f"IC=open(entry={ic_entry_meta.get('entry_time', '?')})")
+            if open_put_spread:
+                _pos_parts.append(f"put=open(entry={put_spread_meta.get('entry_time', '?')})")
+            if open_call_spread:
+                _pos_parts.append(f"call=open(entry={call_spread_meta.get('entry_time', '?')})")
+            _pos_str = " | ".join(_pos_parts) if _pos_parts else "no position open"
+
+            _phase = "FINAL-BAR" if is_final_bar else ("past-entry [monitoring only]" if is_past_entry_cutoff else "entry-window")
+            logger.info(
+                f"Bar {current_time} | "
+                f"SPX={f'{_bar_spx:.2f}' if _bar_spx else 'N/A'}{_drift_str} | "
+                f"{_pos_str} | {_phase}"
+            )
 
             # --- 1. Monitor IC legs independently ---
             if open_ic is not None and ic_leg_status is not None and is_check_bar:
@@ -638,273 +663,311 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                            'result': trades[-1], 'strategy_obj': _closed_strategy})
             if not is_past_entry_cutoff and not is_final_bar:
                 try:
-                    spx_history = self.get_spx_price_history(date, current_time, lookback_minutes=60)
-                    indicators = self.technical_analyzer.analyze_market_conditions(spx_history)
-
-                    # Skip bars where indicators are at sentinel fallback values —
-                    # these occur when there isn't enough price history to compute
-                    # real RSI/BB values (RSI defaults to 50.0, BB position to 0.5).
-                    # Entering on sentinel values is indistinguishable from noise.
-                    if indicators.rsi == 50.0 and indicators.bb_position == 0.5:
-                        continue
-
-                    selection = self.strategy_selector.select_strategy(indicators)
                     entry_spx = self.enhanced_query_engine.get_fastest_spx_price(date, current_time) or 0
 
-                    # --- Trend filter (30-min momentum window) ---
-                    is_trending, trend_dir = self._get_trend_state(date, current_time, spx_history)
-                    if is_trending:
-                        logger.debug(
-                            f"Trend detected at {current_time}: {trend_dir} "
-                            f"({TREND_FILTER_POINTS}+ pts over {TREND_FILTER_LOOKBACK_MINUTES}m)"
-                        )
+                    if skip_indicators:
+                        # --- Simple mode: no RSI/BB dependency ---
+                        # Use drift direction only to select strategy type.
+                        # All RSI/BB-based guards are skipped; only drift and
+                        # intraday-reversal guards apply.
+                        if spx_open is None and entry_spx > 0:
+                            spx_open = entry_spx
+                            logger.debug(f"Drift guard: latched open = {spx_open} at {current_time}")
+                        day_drift = (entry_spx - spx_open) if (spx_open and spx_open > 0) else 0.0
+                        _intraday_max_drift = max(_intraday_max_drift, day_drift)
+                        _intraday_min_drift = min(_intraday_min_drift, day_drift)
 
-                    # --- Daily-drift guard (anchored to opening price, sticky) ---
-                    # Latch the first valid SPX price as the open reference if
-                    # pre-scan fetch failed (09:30 bar often has price=0 in data).
-                    if spx_open is None and entry_spx > 0:
-                        spx_open = entry_spx
-                        logger.debug(f"Drift guard: latched open = {spx_open} at {current_time}")
-                    day_drift = (entry_spx - spx_open) if (spx_open and spx_open > 0) else 0.0
+                        if day_drift >= DRIFT_BLOCK_POINTS:
+                            _put_spread_ever_blocked = True
+                        if day_drift <= -DRIFT_BLOCK_POINTS:
+                            if not _call_spread_ever_blocked:
+                                _call_blocked_latch_time = current_time
+                            _call_spread_ever_blocked = True
+                        if abs(day_drift) >= DRIFT_IC_BLOCK_POINTS:
+                            _ic_ever_blocked = True
 
-                    # Once the dangerous threshold is crossed, latch the flag for the day.
-                    # A temporary bounce does NOT re-enable the blocked side.
-                    if day_drift >= DRIFT_BLOCK_POINTS:          # large UP → block put spreads
-                        _put_spread_ever_blocked = True
-                    if day_drift <= -DRIFT_BLOCK_POINTS:         # large DOWN → block call spreads
-                        if not _call_spread_ever_blocked:
-                            _call_blocked_latch_time = current_time  # record first latch
-                        _call_spread_ever_blocked = True
-                    if abs(day_drift) >= DRIFT_IC_BLOCK_POINTS:  # extreme → block IC
-                        _ic_ever_blocked = True
-                    # Update intraday extreme trackers (used for reversal guard below)
-                    _intraday_max_drift = max(_intraday_max_drift, day_drift)
-                    _intraday_min_drift = min(_intraday_min_drift, day_drift)
+                        ic_blocked_by_drift = _ic_ever_blocked
+                        put_spread_blocked  = _put_spread_ever_blocked
+                        call_spread_blocked = _call_spread_ever_blocked
 
-                    ic_blocked_by_drift   = _ic_ever_blocked
-                    put_spread_blocked    = _put_spread_ever_blocked
-                    call_spread_blocked   = _call_spread_ever_blocked
-                    if ic_blocked_by_drift or put_spread_blocked or call_spread_blocked:
-                        logger.debug(
-                            f"Drift guard at {current_time}: drift={day_drift:+.1f} "
-                            f"ic_blocked={ic_blocked_by_drift} put_blocked={put_spread_blocked} "
-                            f"call_blocked={call_spread_blocked}"
-                        )
+                        # Intraday reversal guards (no RSI needed)
+                        if (_intraday_max_drift - day_drift) >= INTRADAY_CALL_REVERSAL_POINTS:
+                            call_spread_blocked = True
+                        if (day_drift - _intraday_min_drift) >= INTRADAY_PUT_REVERSAL_POINTS:
+                            put_spread_blocked = True
 
-                    # Determine which entry types are permitted by this strategy mode.
-                    # On trend days, IC is blocked; asymmetric spread is used instead
-                    # (call spread on down-trend — sell premium above a falling market;
-                    #  put spread on up-trend — sell premium below a rising market).
-                    allow_ic      = strategy_mode in (STRATEGY_IRON_CONDOR, STRATEGY_IC_CREDIT_SPREADS) and not is_trending and not ic_blocked_by_drift
-                    allow_spreads = strategy_mode in (STRATEGY_CREDIT_SPREADS, STRATEGY_IC_CREDIT_SPREADS)
-                    # Trend override: apply when the short-term trend direction agrees with
-                    # the day's drift. Applies in all strategy modes so the trend signal is
-                    # always respected (in credit_spreads mode the trend would otherwise be ignored).
-                    trend_agrees_with_drift = (
-                        (trend_dir == 'down' and day_drift <= 0) or
-                        (trend_dir == 'up'   and day_drift >= 0) or
-                        day_drift == 0.0
-                    )
-                    if is_trending and trend_agrees_with_drift:
-                        allow_spreads = True
-                        # Override selection to the safe-side spread
-                        if trend_dir == 'down':
-                            selection = StrategySelection(
-                                strategy_type=StrategyType.CALL_SPREAD,
-                                market_signal=MarketSignal.BEARISH,
-                                confidence=selection.confidence,
-                                reason=f"Trend override (down {trend_dir}) → Call Credit Spread only"
-                            )
+                        # Re-entry guards (no RSI needed)
+                        if _had_call_spread_today and day_drift < 0:
+                            call_spread_blocked = True
+                        if _had_call_spread_today and day_drift > 15:
+                            call_spread_blocked = True
+
+                        allow_ic      = strategy_mode in (STRATEGY_IRON_CONDOR, STRATEGY_IC_CREDIT_SPREADS) and not ic_blocked_by_drift
+                        allow_spreads = strategy_mode in (STRATEGY_CREDIT_SPREADS, STRATEGY_IC_CREDIT_SPREADS)
+                        is_trending   = False
+                        trend_dir     = "neutral"
+
+                        # Strategy type: IC for IC modes; for spread modes pick direction from drift
+                        if strategy_mode in (STRATEGY_IRON_CONDOR, STRATEGY_IC_CREDIT_SPREADS):
+                            _sel_type = StrategyType.IRON_CONDOR
+                        elif day_drift < -5:
+                            _sel_type = StrategyType.CALL_SPREAD  # market fell → sell above
                         else:
-                            selection = StrategySelection(
-                                strategy_type=StrategyType.PUT_SPREAD,
-                                market_signal=MarketSignal.BULLISH,
-                                confidence=selection.confidence,
-                                reason=f"Trend override (up {trend_dir}) → Put Credit Spread only"
+                            _sel_type = StrategyType.PUT_SPREAD    # flat/up → sell below
+                        selection = StrategySelection(
+                            strategy_type=_sel_type,
+                            market_signal=MarketSignal.NEUTRAL,
+                            confidence=0.5,
+                            reason=f"simple-mode drift={day_drift:+.1f}",
+                        )
+
+                        _guard_summary = []
+                        if ic_blocked_by_drift:   _guard_summary.append("IC:drift-extreme")
+                        if put_spread_blocked:     _guard_summary.append("put:BLOCKED")
+                        if call_spread_blocked:    _guard_summary.append("call:BLOCKED")
+                        if not _guard_summary:     _guard_summary.append("all-clear")
+                        logger.info(
+                            f"  Entry eval {current_time} [simple] | "
+                            f"signal={_sel_type.value if hasattr(_sel_type, 'value') else _sel_type} | "
+                            f"drift={day_drift:+.1f} | "
+                            f"allow: IC={allow_ic} spreads={allow_spreads} | "
+                            f"guards: {' '.join(_guard_summary)}"
+                        )
+
+                    else:
+                        # --- Full mode: RSI/BB indicators ---
+                        spx_history = self.get_spx_price_history(date, current_time, lookback_minutes=60)
+                        indicators  = self.technical_analyzer.analyze_market_conditions(spx_history)
+
+                        # Skip bars where indicators are at sentinel fallback values —
+                        # these occur when there isn't enough price history to compute
+                        # real RSI/BB values (RSI defaults to 50.0, BB position to 0.5).
+                        # Entering on sentinel values is indistinguishable from noise.
+                        if indicators.rsi == 50.0 and indicators.bb_position == 0.5:
+                            _bar_count = len(spx_history) if spx_history is not None else 0
+                            logger.info(
+                                f"  Entry eval {current_time} | warming up "
+                                f"({_bar_count} price bars) — need ~15 for RSI"
+                            )
+                            continue
+
+                        selection = self.strategy_selector.select_strategy(indicators)
+
+                        # --- Trend filter (30-min momentum window) ---
+                        is_trending, trend_dir = self._get_trend_state(date, current_time, spx_history)
+                        if is_trending:
+                            logger.debug(
+                                f"Trend detected at {current_time}: {trend_dir} "
+                                f"({TREND_FILTER_POINTS}+ pts over {TREND_FILTER_LOOKBACK_MINUTES}m)"
                             )
 
-                    # Bollinger Band breakout guard:
-                    # BB position > 0.94 means price is near/above the upper band — a
-                    # strong bullish breakout in progress. Selling a call spread bets
-                    # against this breakout. Block it.
-                    # BB position < 0.05 means price is near/below the lower band — a
-                    # bearish breakdown. Selling a put spread bets against continued
-                    # selling. Block it.
-                    if indicators.bb_position > 0.94:
-                        call_spread_blocked = True
-                    if indicators.bb_position < 0.05:
-                        put_spread_blocked = True
+                    if not skip_indicators:
+                        # --- Daily-drift guard (anchored to opening price, sticky) ---
+                        # Latch the first valid SPX price as the open reference if
+                        # pre-scan fetch failed (09:30 bar often has price=0 in data).
+                        if spx_open is None and entry_spx > 0:
+                            spx_open = entry_spx
+                            logger.debug(f"Drift guard: latched open = {spx_open} at {current_time}")
+                        day_drift = (entry_spx - spx_open) if (spx_open and spx_open > 0) else 0.0
 
-                    # Moderate-decline put spread guard:
-                    # When the market has declined moderately from the open (-50 < drift < 0)
-                    # and RSI is below 30 (oversold), a put spread with sl=3 is high risk:
-                    # the market has not fallen far enough to signal a reliable bounce, and
-                    # the stop is tight enough to get hit before any recovery.
-                    # We allow put spreads once the market has fallen more than 50 pts
-                    # (extreme sell-off territory) because at that magnitude a bounce is
-                    # significantly more likely than further continuation.
-                    if day_drift < 0 and day_drift > -50 and indicators.rsi < 30:
-                        put_spread_blocked = True
+                        # Once the dangerous threshold is crossed, latch the flag for the day.
+                        # A temporary bounce does NOT re-enable the blocked side.
+                        if day_drift >= DRIFT_BLOCK_POINTS:          # large UP → block put spreads
+                            _put_spread_ever_blocked = True
+                        if day_drift <= -DRIFT_BLOCK_POINTS:         # large DOWN → block call spreads
+                            if not _call_spread_ever_blocked:
+                                _call_blocked_latch_time = current_time  # record first latch
+                            _call_spread_ever_blocked = True
+                        if abs(day_drift) >= DRIFT_IC_BLOCK_POINTS:  # extreme → block IC
+                            _ic_ever_blocked = True
+                        # Update intraday extreme trackers (used for reversal guard below)
+                        _intraday_max_drift = max(_intraday_max_drift, day_drift)
+                        _intraday_min_drift = min(_intraday_min_drift, day_drift)
 
-                    # Extreme panic selling guard:
-                    # RSI below 12 indicates the most extreme short-term overselling —
-                    # the kind seen only during acute crash moments (sharp intraday drops).
-                    # In these conditions the market often continues falling for several more
-                    # bars before any meaningful bounce.  A put spread with sl=3 will almost
-                    # certainly be stopped out before the recovery materialises.
-                    if indicators.rsi < 12:
-                        put_spread_blocked = True
+                        ic_blocked_by_drift   = _ic_ever_blocked
+                        put_spread_blocked    = _put_spread_ever_blocked
+                        call_spread_blocked   = _call_spread_ever_blocked
+                        if ic_blocked_by_drift or put_spread_blocked or call_spread_blocked:
+                            logger.debug(
+                                f"Drift guard at {current_time}: drift={day_drift:+.1f} "
+                                f"ic_blocked={ic_blocked_by_drift} put_blocked={put_spread_blocked} "
+                                f"call_blocked={call_spread_blocked}"
+                            )
 
-                    # Deep crash continuation guard:
-                    # When the market has already fallen more than 50 pts AND RSI is still
-                    # below 20 (the market has not stabilised even at extreme sell-off levels),
-                    # further continuation is more likely than an immediate bounce.
-                    # Block put spreads until RSI shows at least some stabilisation (≥ 20).
-                    if day_drift < -50 and indicators.rsi < 20:
-                        put_spread_blocked = True
+                        # Determine which entry types are permitted by this strategy mode.
+                        # On trend days, IC is blocked; asymmetric spread is used instead
+                        # (call spread on down-trend — sell premium above a falling market;
+                        #  put spread on up-trend — sell premium below a rising market).
+                        allow_ic      = strategy_mode in (STRATEGY_IRON_CONDOR, STRATEGY_IC_CREDIT_SPREADS) and not is_trending and not ic_blocked_by_drift
+                        allow_spreads = strategy_mode in (STRATEGY_CREDIT_SPREADS, STRATEGY_IC_CREDIT_SPREADS)
+                        # Trend override: apply when the short-term trend direction agrees with
+                        # the day's drift. Applies in all strategy modes so the trend signal is
+                        # always respected (in credit_spreads mode the trend would otherwise be ignored).
+                        trend_agrees_with_drift = (
+                            (trend_dir == 'down' and day_drift <= 0) or
+                            (trend_dir == 'up'   and day_drift >= 0) or
+                            day_drift == 0.0
+                        )
+                        if is_trending and trend_agrees_with_drift:
+                            allow_spreads = True
+                            # Override selection to the safe-side spread
+                            if trend_dir == 'down':
+                                selection = StrategySelection(
+                                    strategy_type=StrategyType.CALL_SPREAD,
+                                    market_signal=MarketSignal.BEARISH,
+                                    confidence=selection.confidence,
+                                    reason=f"Trend override (down {trend_dir}) → Call Credit Spread only"
+                                )
+                            else:
+                                selection = StrategySelection(
+                                    strategy_type=StrategyType.PUT_SPREAD,
+                                    market_signal=MarketSignal.BULLISH,
+                                    confidence=selection.confidence,
+                                    reason=f"Trend override (up {trend_dir}) → Put Credit Spread only"
+                                )
 
-                    # Extreme overbought call spread guard:
-                    # RSI above CALL_SPREAD_MAX_ENTRY_RSI (80) signals a momentum burst —
-                    # the market is likely continuing higher, making a call spread
-                    # (which caps profit at the short strike) extremely risky.
-                    if indicators.rsi > CALL_SPREAD_MAX_ENTRY_RSI:
-                        call_spread_blocked = True
+                        # Bollinger Band breakout guard
+                        if indicators.bb_position > 0.94:
+                            call_spread_blocked = True
+                        if indicators.bb_position < 0.05:
+                            put_spread_blocked = True
 
-                    # Bear-flag upper-band guard:
-                    # When the market is down on the day (drift < -5) but trading near its
-                    # upper Bollinger Band (bb > 0.90), the market is in a "bear flag" where
-                    # a temporary bounce has pushed price to resistance.  A call spread here
-                    # bets on a capped market — extremely risky if the bounce fails and the
-                    # market resumes its downtrend.
-                    if day_drift < -5 and indicators.bb_position > 0.90:
-                        call_spread_blocked = True
+                        # Moderate-decline put spread guard
+                        if day_drift < 0 and day_drift > -50 and indicators.rsi < 30:
+                            put_spread_blocked = True
 
-                    # Oversold call spread guard:
-                    # When RSI < 40 on a declining day (drift < -5), the market is
-                    # approaching oversold territory — a bounce is plausible.  Entering
-                    # a call spread bets against that bounce.  Block call spreads.
-                    # Also block when RSI is extremely oversold (< 30) regardless of drift —
-                    # an RSI this low signals the market is in a free-fall where even a
-                    # flat-to-up bet (call spread) is dangerous.
-                    if indicators.rsi < 40 and day_drift < -5:
-                        call_spread_blocked = True
-                    if indicators.rsi < 30:
-                        call_spread_blocked = True
+                        # Extreme panic selling guard
+                        if indicators.rsi < 12:
+                            put_spread_blocked = True
 
-                    # Strong uptrend + low RSI guard:
-                    # When the market has already surged significantly from open (> 12 pts)
-                    # but RSI is still below 40, the market is in a strong momentum move.
-                    # Selling a call spread attempts to fade that momentum — high risk.
-                    if day_drift > 12 and indicators.rsi < 40:
-                        call_spread_blocked = True
+                        # Deep crash continuation guard
+                        if day_drift < -50 and indicators.rsi < 20:
+                            put_spread_blocked = True
 
-                    # Intraday reversal guard:
-                    # If the market has reversed ≥ INTRADAY_CALL_REVERSAL_POINTS from its
-                    # intraday peak (was up, now rolling over), volatility is elevated —
-                    # block call spreads.
-                    # If the market has bounced ≥ INTRADAY_PUT_REVERSAL_POINTS from its
-                    # intraday trough, the market has not stabilised — block put spreads.
-                    # (Tighter put threshold: a smaller bounce still means elevated
-                    #  downside risk on a volatile down day.)
-                    if (_intraday_max_drift - day_drift) >= INTRADAY_CALL_REVERSAL_POINTS:
-                        call_spread_blocked = True
-                    if (day_drift - _intraday_min_drift) >= INTRADAY_PUT_REVERSAL_POINTS:
-                        put_spread_blocked = True
+                        # Extreme overbought call spread guard
+                        if indicators.rsi > CALL_SPREAD_MAX_ENTRY_RSI:
+                            call_spread_blocked = True
 
-                    # No call spread re-entry on a declining day guard:
-                    # If a call spread was already opened today and the market is currently
-                    # below its opening price, do not attempt another call spread.
-                    # Rationale: on declining days a first call spread may win by luck
-                    # (e.g. taken-profit quickly before the down-move accelerated), but
-                    # re-entering doubles the risk on an already-bearish day.
-                    if _had_call_spread_today and day_drift < 0:
-                        call_spread_blocked = True
+                        # Bear-flag upper-band guard
+                        if day_drift < -5 and indicators.bb_position > 0.90:
+                            call_spread_blocked = True
 
-                    # No call spread re-entry after a big run-up guard:
-                    # If a call spread was already opened today and drift has since extended
-                    # further upward (> 15 pts), the market is in a strong bull run.
-                    # Re-entering a second call spread chases momentum at the worst time —
-                    # stop losses on call spreads are triggered by further upside.
-                    if _had_call_spread_today and day_drift > 15:
-                        call_spread_blocked = True
+                        # Oversold call spread guard
+                        if indicators.rsi < 40 and day_drift < -5:
+                            call_spread_blocked = True
+                        if indicators.rsi < 30:
+                            call_spread_blocked = True
 
-                    # Sub-zero Bollinger Band guard:
-                    # BB position < 0 (below the lower band) signals an extreme bearish
-                    # breakdown. Selling a call spread in this environment bets against
-                    # continued selling — extremely risky in a true breakdown.
-                    if indicators.bb_position < 0.10:
-                        call_spread_blocked = True
+                        # Strong uptrend + low RSI guard
+                        if day_drift > 12 and indicators.rsi < 40:
+                            call_spread_blocked = True
 
-                    # Expanded bear-flag guard (extended drift threshold):
-                    # Even a modest negative drift (-3 pts) combined with price near the
-                    # upper Bollinger Band (> 0.82) is a bear-flag pattern — block call spreads.
-                    if day_drift < -3 and indicators.bb_position > 0.82:
-                        call_spread_blocked = True
+                        # Intraday reversal guard
+                        if (_intraday_max_drift - day_drift) >= INTRADAY_CALL_REVERSAL_POINTS:
+                            call_spread_blocked = True
+                        if (day_drift - _intraday_min_drift) >= INTRADAY_PUT_REVERSAL_POINTS:
+                            put_spread_blocked = True
 
-                    # Low RSI guard (expanded from RSI < 30):
-                    # RSI below 32 means the market is deeply oversold — any call spread
-                    # bet against further downside is extremely risky at these levels.
-                    if indicators.rsi < 32:
-                        call_spread_blocked = True
+                        # No call spread re-entry on a declining day guard
+                        if _had_call_spread_today and day_drift < 0:
+                            call_spread_blocked = True
 
-                    # Post-winning-call-spread put guard:
-                    # If a call spread already closed profitably today, do not open a new
-                    # put spread unless the market is at extreme oversold levels (RSI ≤ 20).
-                    # Rationale: the CS already secured the day's premium target.  Chasing
-                    # a PS with RSI still above 20 means the oversold signal is not strong
-                    # enough to justify the additional risk — the market may not have found
-                    # its floor yet.
-                    if _had_call_spread_win_today and indicators.rsi > 20:
-                        put_spread_blocked = True
+                        # No call spread re-entry after a big run-up guard
+                        if _had_call_spread_today and day_drift > 15:
+                            call_spread_blocked = True
 
-                    # Post-winning-put-spread call guard:
-                    # If a put spread already closed profitably today and the market is
-                    # still oversold (RSI < 40) and below the mid-Bollinger Band (< 0.50),
-                    # do not open a call spread.
-                    # Rationale: the market is in a confirmed downtrend; a call spread bets
-                    # on a capped market when all indicators still point downward.
-                    if _had_put_spread_win_today and indicators.rsi < 40 and indicators.bb_position < 0.50:
-                        call_spread_blocked = True
+                        # Sub-zero Bollinger Band guard
+                        if indicators.bb_position < 0.10:
+                            call_spread_blocked = True
 
-                    # Concurrent call-spread / oversold guard:
-                    # If a call spread is currently open and RSI drops below 40, the market
-                    # is moving against the CS while also signaling oversold conditions.
-                    # Opening a put spread in this state creates an unintended IC-like
-                    # exposure where both legs are under simultaneous stress.
-                    if open_call_spread is not None and indicators.rsi < 40:
-                        put_spread_blocked = True
+                        # Expanded bear-flag guard
+                        if day_drift < -3 and indicators.bb_position > 0.82:
+                            call_spread_blocked = True
 
-                    # Concurrent put-spread / oversold guard:
-                    # If a put spread is currently open and the market is still oversold
-                    # (RSI < 40) with price below the mid-Bollinger Band (< 0.50), the
-                    # downtrend is not resolved.  Opening a call spread creates unbalanced
-                    # IC exposure on a clearly directional day.
-                    if open_put_spread is not None and indicators.rsi < 40 and indicators.bb_position < 0.50:
-                        call_spread_blocked = True
+                        # Low RSI guard
+                        if indicators.rsi < 32:
+                            call_spread_blocked = True
 
-                    # Concurrent put-spread / recovered market guard:
-                    # If a put spread is currently open and RSI has rebounded above 65,
-                    # the market has bounced enough to threaten the put spread's short leg.
-                    # Opening a call spread now creates unintended IC exposure at the exact
-                    # moment when both legs are under simultaneous pressure.
-                    if open_put_spread is not None and indicators.rsi > 65:
-                        call_spread_blocked = True
+                        # Post-winning-call-spread put guard
+                        if _had_call_spread_win_today and indicators.rsi > 20:
+                            put_spread_blocked = True
 
-                    # Overbought RSI on declining day guard:
-                    # When the market is below its opening level (negative day_drift) but
-                    # RSI is in overbought territory (> 74), the technical picture is
-                    # contradictory: price has already declined yet momentum is "overbought".
-                    # This typically indicates a late-day reversal that pushed RSI high on
-                    # a declining day — a very risky setup for a call spread.
-                    if day_drift < 0 and indicators.rsi > 74:
-                        call_spread_blocked = True
+                        # Post-winning-put-spread call guard
+                        if _had_put_spread_win_today and indicators.rsi < 40 and indicators.bb_position < 0.50:
+                            call_spread_blocked = True
+
+                        # Concurrent call-spread / oversold guard
+                        if open_call_spread is not None and indicators.rsi < 40:
+                            put_spread_blocked = True
+
+                        # Concurrent put-spread / oversold guard
+                        if open_put_spread is not None and indicators.rsi < 40 and indicators.bb_position < 0.50:
+                            call_spread_blocked = True
+
+                        # Concurrent put-spread / recovered market guard
+                        if open_put_spread is not None and indicators.rsi > 65:
+                            call_spread_blocked = True
+
+                        # Overbought RSI on declining day guard
+                        if day_drift < 0 and indicators.rsi > 74:
+                            call_spread_blocked = True
+
+                    # --- Entry evaluation log ---
+                    # Fired once per bar in the entry window, after all guard checks.
+                    # Shows the signal, key indicators, and exactly which strategies
+                    # are blocked so it is clear why no entry happened.
+                    _sig = (
+                        selection.strategy_type.value
+                        if hasattr(selection.strategy_type, "value")
+                        else str(selection.strategy_type)
+                    )
+                    _guard_summary = []
+                    if ic_blocked_by_drift:
+                        _guard_summary.append("IC:drift-extreme")
+                    if put_spread_blocked:
+                        _guard_summary.append("put:BLOCKED")
+                    if call_spread_blocked:
+                        _guard_summary.append("call:BLOCKED")
+                    if not _guard_summary:
+                        _guard_summary.append("all-clear")
+                    if is_trending:
+                        _guard_summary.append(f"trend:{trend_dir}")
+                    if _had_call_spread_win_today:
+                        _guard_summary.append("had-CS-win")
+                    if _had_put_spread_win_today:
+                        _guard_summary.append("had-PS-win")
+                    if not skip_indicators:
+                        logger.info(
+                            f"  Entry eval {current_time} | "
+                            f"signal={_sig} conf={selection.confidence:.0%} | "
+                            f"rsi={indicators.rsi:.1f} bb={indicators.bb_position:.2f} | "
+                            f"drift={day_drift:+.1f} | "
+                            f"allow: IC={allow_ic} spreads={allow_spreads} | "
+                            f"guards: {' '.join(_guard_summary)}"
+                        )
+
+                    _spx_history_arg = spx_history if not skip_indicators else None
+
+                    # In simple mode indicators is unset — provide a neutral sentinel
+                    # so that entry rationale dicts can safely reference it without
+                    # crashing.  All guard logic already bypasses these values.
+                    if skip_indicators:
+                        indicators = TechnicalIndicators(
+                            rsi=50.0, macd_line=0.0, macd_signal=0.0, macd_histogram=0.0,
+                            bb_upper=entry_spx, bb_middle=entry_spx, bb_lower=entry_spx,
+                            bb_position=0.5,
+                        )
+
+                    # Skip entry attempt when no SPX price is available yet
+                    if entry_spx <= 0:
+                        continue
 
                     if selection.strategy_type == StrategyType.IRON_CONDOR and allow_ic:
                         if open_ic is None and open_put_spread is None and open_call_spread is None:
                             strategy = self._try_open_strategy(
                                 date, current_time, StrategyType.IRON_CONDOR,
                                 target_delta, target_prob_itm, min_spread_width, quantity,
-                                target_credit=target_credit, spx_history=spx_history
+                                target_credit=target_credit, spx_history=_spx_history_arg
                             )
                             if strategy:
                                 open_ic = strategy
@@ -912,7 +975,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                 ic_entry_meta = {
                                     'entry_time': current_time,
                                     'entry_spx': entry_spx,
-                                    'indicators': indicators,
+                                    'indicators': indicators if not skip_indicators else None,
                                     'strike_selection': self._last_strike_selection or StrikeSelection(0,0,0,0,0),
                                     'market_signal': selection.market_signal,
                                     'confidence': selection.confidence,
@@ -947,18 +1010,11 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                        'strategy_obj': strategy})
 
                     elif selection.strategy_type == StrategyType.PUT_SPREAD and allow_spreads and not put_spread_blocked:
-                        # RSI conviction is required for ALL put spread entries.
-                        # On negative-drift days three conditions must hold:
-                        #   1. Drift guard: call_spread_blocked must be True (drift <= -20 pts)
-                        #   2. RSI guard: RSI <= PUT_SPREAD_MAX_RSI_ON_NEG_DRIFT (45)
-                        #   3. Cooldown: PUT_SPREAD_DRIFT_CONFIRM_MINUTES since block latched
-                        # On flat/positive drift days a stricter RSI threshold applies:
-                        #   RSI <= PUT_SPREAD_MAX_RSI_ON_POS_DRIFT (30)
-                        #   Rationale: on an up/neutral day, only extreme oversold readings
-                        #   (RSI < 30) provide enough conviction that the put spread is safe.
-                        #   An RSI between 30-45 on a positive-drift day means the market is
-                        #   not clearly oversold and a further drop is equally possible.
-                        if day_drift < 0:
+                        # In simple mode skip the RSI conviction check — drift guards
+                        # already protect against dangerous entries.
+                        if skip_indicators:
+                            put_ok = True
+                        elif day_drift < 0:
                             rsi_ok = indicators.rsi <= PUT_SPREAD_MAX_RSI_ON_NEG_DRIFT
                             if call_spread_blocked and _call_blocked_latch_time:
                                 latch_dt   = pd.Timestamp(f"{date} {_call_blocked_latch_time}")
@@ -974,14 +1030,14 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                             strategy = self._try_open_strategy(
                                 date, current_time, StrategyType.PUT_SPREAD,
                                 target_delta, target_prob_itm, min_spread_width, quantity,
-                                target_credit=target_credit, spx_history=spx_history
+                                target_credit=target_credit, spx_history=_spx_history_arg
                             )
                             if strategy:
                                 open_put_spread = strategy
                                 put_spread_meta = {
                                     'entry_time': current_time,
                                     'entry_spx': entry_spx,
-                                    'indicators': indicators,
+                                    'indicators': indicators if not skip_indicators else None,
                                     'strike_selection': self._last_strike_selection or StrikeSelection(0,0,0,0,0),
                                     'market_signal': selection.market_signal,
                                     'confidence': selection.confidence,
@@ -1020,7 +1076,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                             strategy = self._try_open_strategy(
                                 date, current_time, StrategyType.CALL_SPREAD,
                                 target_delta, target_prob_itm, min_spread_width, quantity,
-                                target_credit=target_credit, spx_history=spx_history
+                                target_credit=target_credit, spx_history=_spx_history_arg
                             )
                             if strategy:
                                 open_call_spread = strategy
@@ -1028,7 +1084,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                 call_spread_meta = {
                                     'entry_time': current_time,
                                     'entry_spx': entry_spx,
-                                    'indicators': indicators,
+                                    'indicators': indicators if not skip_indicators else None,
                                     'strike_selection': self._last_strike_selection or StrikeSelection(0,0,0,0,0),
                                     'market_signal': selection.market_signal,
                                     'confidence': selection.confidence,
@@ -1675,7 +1731,7 @@ if __name__ == "__main__":
 
 
 print("Enhanced Multi-Strategy Backtesting Engine Complete - Part 3/3")
-print("\\n✅ All enhancements implemented:")
+print("✅ All enhancements implemented:")
 print("1. ✅ Multi-strategy selection (IC, Put Spreads, Call Spreads)")
 print("2. ✅ Technical indicators (RSI, MACD, Bollinger Bands)")
 print("3. ✅ Delta/Probability ITM based strike selection") 

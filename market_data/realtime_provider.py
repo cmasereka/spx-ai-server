@@ -82,7 +82,7 @@ class RealtimeMarketDataProvider(MarketDataProvider):
         now = time.time()
         if now < target:
             sleep_secs = target - now
-            logger.debug(
+            logger.info(
                 f"RealtimeProvider: waiting {sleep_secs:.1f}s for bar at {timestamp}"
             )
             time.sleep(sleep_secs)

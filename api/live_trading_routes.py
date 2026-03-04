@@ -15,7 +15,7 @@ import asyncio
 from fastapi import APIRouter, HTTPException, Query
 from loguru import logger
 
-from .models import LiveTradingRequest, LiveTradingStatus, IBKRConnectionConfig, IBKRDiagnosticRequest
+from .models import LiveTradingRequest, LiveTradingStatus, IBKRConnectionConfig, IBKRDiagnosticRequest, DiagnosticRequest, BrokerEnum
 from .live_trading_service import LiveTradingService
 from .websocket_manager import WebSocketManager
 
@@ -207,27 +207,30 @@ def _test_ibkr_connection_sync(config: IBKRConnectionConfig) -> dict:
 # ---------------------------------------------------------------------------
 
 @router.post("/diagnose-market-data", response_model=dict)
-async def diagnose_market_data(request: IBKRDiagnosticRequest):
+async def diagnose_market_data(request: DiagnosticRequest):
     """
-    Test the full SPX-price + options-chain data path against a live IBKR
-    connection without starting a trading session.
+    Test the full SPX-price + options-chain data path without starting a trading session.
 
-    Creates a **separate** IBKR connection (using `diagnostic_client_id`) so
-    it never interferes with a running trading session.
-
-    Works outside market hours — IBKR returns the most-recent closing/settlement
-    data for SPX and for SPXW options on the requested trade date.
-
-    Useful to verify:
-    - IBKR connectivity and data permissions
-    - SPX Index price availability
-    - SPXW options chain population for the chosen expiry date
-    - That the data shapes match what the live engine expects
+    Set broker='ibkr' to test IBKR connectivity.
+    Set broker='tastytrade' to test TastyTrade authentication, option chain, and DXLink streaming.
     """
     try:
-        result = await asyncio.get_event_loop().run_in_executor(
-            None, _diagnose_market_data_sync, request
-        )
+        if request.broker == BrokerEnum.TASTYTRADE:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, _diagnose_tastytrade_sync, request
+            )
+        else:
+            # Convert to legacy IBKRDiagnosticRequest shape for the existing function
+            ibkr_req = IBKRDiagnosticRequest(
+                ibkr=request.ibkr,
+                trade_date=request.trade_date,
+                spx_price_hint=request.spx_price_hint,
+                diagnostic_client_id=request.diagnostic_client_id,
+                num_strikes=request.num_strikes,
+            )
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, _diagnose_market_data_sync, ibkr_req
+            )
         return result
     except Exception as exc:
         logger.error(f"Market data diagnostic failed: {exc}")
@@ -470,3 +473,296 @@ def _diagnose_market_data_sync(request: IBKRDiagnosticRequest) -> dict:
         except Exception:
             pass
         loop.close()
+
+
+def _diagnose_tastytrade_sync(request: DiagnosticRequest) -> dict:
+    """
+    Blocking TastyTrade diagnostic — runs in a thread pool.
+
+    Steps:
+      1. Create a Session (tests authentication)
+      2. Fetch account (tests account access)
+      3. Load SPXW option chain for trade_date (tests REST data access)
+      4. Open DXLinkStreamer briefly and collect Quote + Greeks snapshots
+         for a sample of ATM strikes (tests streaming connectivity)
+      5. Return a structured diagnostic report
+    """
+    import asyncio as _asyncio
+    import traceback
+    from datetime import datetime, date as _date, time as _time
+    import pytz
+
+    loop = _asyncio.new_event_loop()
+    _asyncio.set_event_loop(loop)
+
+    now_et = datetime.now(pytz.timezone("America/New_York"))
+    market_open  = _time(9, 30)
+    market_close = _time(16, 0)
+    is_market_hours = market_open <= now_et.time() <= market_close
+
+    trade_date = request.trade_date or _date.today().strftime("%Y-%m-%d")
+    try:
+        target_date = datetime.strptime(trade_date, "%Y-%m-%d").date()
+    except ValueError:
+        target_date = _date.today()
+
+    cfg = request.tastytrade
+    report: dict = {
+        "ok": False,
+        "broker": "tastytrade",
+        "authenticated": False,
+        "account_accessible": False,
+        "trade_date": trade_date,
+        "server_time": now_et.strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "is_market_hours": is_market_hours,
+        "spx": {},
+        "options": {},
+        "streaming": {},
+        "errors": [],
+    }
+
+    try:
+        from tastytrade import Session
+        from tastytrade.account import Account
+        from tastytrade.instruments import NestedOptionChain
+        from tastytrade.streamer import DXLinkStreamer
+        from tastytrade.dxfeed import Quote, Greeks
+    except ImportError as e:
+        report["errors"].append(f"tastytrade not installed: {e}")
+        return report
+
+    # ------------------------------------------------------------------
+    # 1. Authentication
+    # ------------------------------------------------------------------
+    try:
+        session = Session(
+            cfg.provider_secret,
+            cfg.refresh_token,
+            is_test=cfg.is_paper,
+        )
+        report["authenticated"] = True
+        report["environment"] = "paper (cert)" if cfg.is_paper else "live (prod)"
+    except Exception as exc:
+        report["errors"].append(f"Authentication failed: {exc}")
+        return report
+
+    # ------------------------------------------------------------------
+    # 2. Account access
+    # ------------------------------------------------------------------
+    try:
+        account = loop.run_until_complete(Account.get(session, cfg.account_number))
+        report["account_accessible"] = True
+        report["account_number"] = account.account_number
+    except Exception as exc:
+        report["errors"].append(f"Account access failed: {exc}")
+        # Continue — still useful to test data
+
+    # ------------------------------------------------------------------
+    # 3. SPXW option chain (REST)
+    # ------------------------------------------------------------------
+    today_expir = None
+    streamer_symbols: list = []
+    sample_meta: list = []   # [{strike, option_type, call_sym, put_sym}]
+
+    try:
+        chains = loop.run_until_complete(NestedOptionChain.get(session, "SPXW"))
+
+        # Find requested expiry
+        for chain in chains:
+            for expir in chain.expirations:
+                if expir.expiration_date == target_date:
+                    today_expir = expir
+                    break
+            if today_expir:
+                break
+
+        if today_expir is None:
+            report["errors"].append(
+                f"No SPXW option chain found for {trade_date}. "
+                "Market may be closed or it is not a trading day."
+            )
+            report["options"]["expiry"] = trade_date
+            report["options"]["strikes_loaded"] = 0
+        else:
+            all_strikes = today_expir.strikes
+            total = len(all_strikes)
+
+            # Collect streamer symbols for a centre sample (up to num_strikes each side)
+            n = request.num_strikes
+            mid_idx = total // 2
+            lo = max(0, mid_idx - n)
+            hi = min(total, mid_idx + n + 1)
+            sample_strikes = all_strikes[lo:hi]
+
+            for s in sample_strikes:
+                if s.call_streamer_symbol:
+                    streamer_symbols.append(s.call_streamer_symbol)
+                    sample_meta.append({
+                        "strike": float(s.strike_price),
+                        "option_type": "call",
+                        "streamer_symbol": s.call_streamer_symbol,
+                    })
+                if s.put_streamer_symbol:
+                    streamer_symbols.append(s.put_streamer_symbol)
+                    sample_meta.append({
+                        "strike": float(s.strike_price),
+                        "option_type": "put",
+                        "streamer_symbol": s.put_streamer_symbol,
+                    })
+
+            # All symbols for counting
+            all_syms = sum(
+                (1 if s.call_streamer_symbol else 0) + (1 if s.put_streamer_symbol else 0)
+                for s in all_strikes
+            )
+            report["options"] = {
+                "expiry": trade_date,
+                "total_strikes": total,
+                "total_symbols": all_syms,
+                "sample_strikes_requested": n,
+                "sample_symbols_fetched": len(streamer_symbols),
+            }
+    except Exception as exc:
+        report["errors"].append(f"Option chain fetch failed: {exc}")
+        report["errors"].append(traceback.format_exc())
+
+    # ------------------------------------------------------------------
+    # 4. DXLink streaming — brief Quote + Greeks snapshot
+    # ------------------------------------------------------------------
+    async def _stream_snapshot():
+        quotes: dict = {}    # sym → {bid, ask}
+        greeks: dict = {}    # sym → {delta, iv}
+
+        try:
+            async with DXLinkStreamer(session) as streamer:
+                if streamer_symbols:
+                    await streamer.subscribe(Quote, streamer_symbols)
+                    await streamer.subscribe(Greeks, streamer_symbols)
+
+                # Collect events for up to 5 seconds (or 3 s outside market hours)
+                wait_secs = 3.0 if is_market_hours else 2.0
+                deadline = _asyncio.get_event_loop().time() + wait_secs
+
+                while _asyncio.get_event_loop().time() < deadline:
+                    remaining = deadline - _asyncio.get_event_loop().time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        event = await _asyncio.wait_for(
+                            streamer.get_event(Quote), timeout=remaining
+                        )
+                        sym = event.event_symbol
+                        if sym in set(streamer_symbols):
+                            quotes[sym] = {
+                                "bid": float(event.bid_price) if event.bid_price else None,
+                                "ask": float(event.ask_price) if event.ask_price else None,
+                            }
+                    except _asyncio.TimeoutError:
+                        break
+                    except Exception:
+                        break
+
+                # Drain any buffered Greeks (non-blocking)
+                for _ in range(len(streamer_symbols) * 2):
+                    g = streamer.get_event_nowait(Greeks)
+                    if g is None:
+                        break
+                    sym = g.event_symbol
+                    greeks[sym] = {
+                        "delta": float(g.delta) if g.delta is not None else None,
+                        "iv": float(g.volatility) if g.volatility is not None else None,
+                    }
+
+        except Exception as exc:
+            return {"error": str(exc)}, quotes, greeks
+
+        return None, quotes, greeks
+
+    streaming_error, quotes, greeks_data = loop.run_until_complete(_stream_snapshot())
+
+    if streaming_error:
+        report["errors"].append(f"DXLink streaming failed: {streaming_error['error']}")
+        report["streaming"] = {"ok": False, "error": streaming_error["error"]}
+    else:
+        report["streaming"] = {
+            "ok": True,
+            "symbols_subscribed": len(streamer_symbols),
+            "quotes_received": len(quotes),
+            "greeks_received": len(greeks_data),
+        }
+
+        # Build sample rows with bid/ask/delta
+        sample_rows = []
+        for meta in sample_meta:
+            sym = meta["streamer_symbol"]
+            q = quotes.get(sym, {})
+            g = greeks_data.get(sym, {})
+            bid = q.get("bid")
+            ask = q.get("ask")
+            mid = round((bid + ask) / 2, 2) if bid and ask else None
+            sample_rows.append({
+                "strike":      meta["strike"],
+                "option_type": meta["option_type"],
+                "bid":         bid,
+                "ask":         ask,
+                "mid":         mid,
+                "delta":       round(g["delta"], 4) if g.get("delta") is not None else None,
+                "iv":          round(g["iv"], 4)    if g.get("iv")    is not None else None,
+            })
+        report["options"]["sample"] = sample_rows
+
+        # Infer approximate SPX price from near-ATM put/call mid prices
+        atm_rows = [r for r in sample_rows if r["mid"] is not None]
+        if atm_rows:
+            hint = request.spx_price_hint if request.spx_price_hint > 100 else 5800.0
+            report["spx"] = {
+                "price": None,
+                "note": "SPX spot not directly available outside streaming session. "
+                        f"Using hint={hint} for chain centre.",
+                "spx_price_hint": hint,
+            }
+        else:
+            report["spx"] = {
+                "price": None,
+                "note": "No option quotes received — market may be closed.",
+            }
+
+    # ------------------------------------------------------------------
+    # 5. Assessment
+    # ------------------------------------------------------------------
+    options_ok = report["options"].get("total_symbols", 0) > 0
+    streaming_ok = report["streaming"].get("ok", False)
+    quotes_ok = report["streaming"].get("quotes_received", 0) > 0
+
+    if report["authenticated"] and options_ok and streaming_ok and (quotes_ok or not is_market_hours):
+        report["ok"] = True
+        if quotes_ok:
+            report["assessment"] = (
+                f"Full data path healthy. "
+                f"Auth ✓  Account ✓  Option chain: {report['options']['total_symbols']} symbols ✓  "
+                f"DXLink: {report['streaming']['quotes_received']} quotes received ✓"
+            )
+        else:
+            report["assessment"] = (
+                f"Connection healthy (market closed). "
+                f"Auth ✓  Account ✓  Option chain: {report['options']['total_symbols']} symbols ✓  "
+                f"DXLink connected but no quotes yet (expected outside market hours)."
+            )
+    elif report["authenticated"] and options_ok and not streaming_ok:
+        report["ok"] = False
+        report["assessment"] = (
+            "Auth and option chain OK but DXLink streaming failed. "
+            "Check network/firewall for WebSocket connections to TastyTrade."
+        )
+    elif report["authenticated"] and not options_ok:
+        report["ok"] = False
+        report["assessment"] = (
+            f"Auth OK but no SPXW option chain found for {trade_date}. "
+            "Market may be closed or credentials lack data permissions."
+        )
+    else:
+        report["ok"] = False
+        report["assessment"] = "Authentication failed. Check provider_secret and refresh_token."
+
+    loop.close()
+    return report

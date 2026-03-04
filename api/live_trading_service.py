@@ -1,10 +1,11 @@
 """
-Live Trading Service for IBKR paper / live trading sessions.
+Live Trading Service — multi-broker paper / live trading sessions.
 
-Manages live trading sessions that execute real orders via IBKR.
-Each session uses a LiveTradingSession (trading/session.py) running in a
-thread pool, with the IBKRMarketDataProvider + RealtimeMarketDataProvider
-for real-time bars and IBKRBrokerAdapter for order submission.
+Manages live trading sessions that execute real orders via a selected broker
+(IBKR or TastyTrade).  Each session uses a LiveTradingSession (trading/session.py)
+running in a thread pool, with a broker-appropriate MarketDataProvider wrapped by
+RealtimeMarketDataProvider for real-time bars and a matching BrokerAdapter for
+order submission.
 
 Session lifecycle:  pending → connecting → running → completed | stopped | failed
 """
@@ -19,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from loguru import logger
 
 from .models import (
-    LiveTradingRequest, LiveTradingStatus,
+    LiveTradingRequest, LiveTradingStatus, BrokerEnum,
     PaperPosition, BacktestResult, StrategyDetails, OrderSlippage,
 )
 from .websocket_manager import WebSocketManager
@@ -31,7 +32,7 @@ from market_data.realtime_provider import RealtimeMarketDataProvider
 from broker.null_adapter import NullBrokerAdapter
 from trading.session import LiveTradingSession
 from src.database.connection import db_manager
-from src.database.models import PaperTradingRun, IBKROrder, Trade
+from src.database.models import PaperTradingRun, BrokerOrder, Trade
 
 
 class _LiveSessionState:
@@ -43,7 +44,8 @@ class _LiveSessionState:
         self.trade_date = trade_date
         self.request = request
         self.status = "pending"
-        self.ibkr_connected = False
+        self.broker_type: str = request.broker.value if request else "ibkr"
+        self.broker_connected = False
         self.open_positions: List[PaperPosition] = []
         self.completed_trades: List[BacktestResult] = []
         self.day_pnl: float = 0.0
@@ -62,7 +64,8 @@ class _LiveSessionState:
                 mode=self.mode,
                 trade_date=self.trade_date,
                 status=self.status,
-                ibkr_connected=self.ibkr_connected,
+                broker_type=self.broker_type,
+                broker_connected=self.broker_connected,
                 open_positions=list(self.open_positions),
                 completed_trades=list(self.completed_trades),
                 day_pnl=round(self.day_pnl, 2),
@@ -102,31 +105,58 @@ class LiveTradingService:
                 for run in runs:
                     # Reconstruct a minimal LiveTradingRequest from stored parameters
                     params = run.parameters or {}
-                    from .models import IBKRConnectionConfig, BacktestStrategyEnum
+                    broker_str = run.broker_type or params.get("broker_type", "ibkr")
+                    from .models import IBKRConnectionConfig, BacktestStrategyEnum, TastyTradeConfig
                     try:
-                        request = LiveTradingRequest(
-                            ibkr=IBKRConnectionConfig(
-                                host=params.get("ibkr_host", "127.0.0.1"),
-                                port=params.get("ibkr_port", 7497),
-                                client_id=params.get("ibkr_client_id", 1),
-                                account=params.get("ibkr_account", ""),
-                            ),
-                            trade_date=run.trade_date,
-                            strategy=params.get("strategy", BacktestStrategyEnum.CREDIT_SPREADS),
-                            target_credit=params.get("target_credit", 0.35),
-                            spread_width=params.get("spread_width", 10),
-                            contracts=params.get("contracts", 1),
-                            take_profit=params.get("take_profit", 0.05),
-                            stop_loss=params.get("stop_loss", 3.0),
-                            monitor_interval=params.get("monitor_interval", 5),
-                            entry_start_time=params.get("entry_start_time", "10:00:00"),
-                            last_entry_time=params.get("last_entry_time", "14:00:00"),
-                            stale_loss_minutes=params.get("stale_loss_minutes", 120),
-                            stale_loss_threshold=params.get("stale_loss_threshold", 1.5),
-                            stagnation_window=params.get("stagnation_window", 30),
-                            min_improvement=params.get("min_improvement", 0.05),
-                            enable_stale_loss_exit=params.get("enable_stale_loss_exit", False),
-                        )
+                        if broker_str == "tastytrade":
+                            request = LiveTradingRequest(
+                                broker=BrokerEnum.TASTYTRADE,
+                                tastytrade=TastyTradeConfig(
+                                    provider_secret="",   # credentials not stored in DB
+                                    refresh_token="",     # credentials not stored in DB
+                                    account_number=params.get("tt_account", ""),
+                                    is_paper=params.get("tt_is_paper", True),
+                                ),
+                                trade_date=run.trade_date,
+                                strategy=params.get("strategy", BacktestStrategyEnum.CREDIT_SPREADS),
+                                target_credit=params.get("target_credit", 0.35),
+                                spread_width=params.get("spread_width", 10),
+                                contracts=params.get("contracts", 1),
+                                take_profit=params.get("take_profit", 0.05),
+                                stop_loss=params.get("stop_loss", 3.0),
+                                monitor_interval=params.get("monitor_interval", 5),
+                                entry_start_time=params.get("entry_start_time", "10:00:00"),
+                                last_entry_time=params.get("last_entry_time", "14:00:00"),
+                                stale_loss_minutes=params.get("stale_loss_minutes", 120),
+                                stale_loss_threshold=params.get("stale_loss_threshold", 1.5),
+                                stagnation_window=params.get("stagnation_window", 30),
+                                min_improvement=params.get("min_improvement", 0.05),
+                                enable_stale_loss_exit=params.get("enable_stale_loss_exit", False),
+                            )
+                        else:
+                            request = LiveTradingRequest(
+                                ibkr=IBKRConnectionConfig(
+                                    host=params.get("ibkr_host", "127.0.0.1"),
+                                    port=params.get("ibkr_port", 7497),
+                                    client_id=params.get("ibkr_client_id", 1),
+                                    account=params.get("ibkr_account", ""),
+                                ),
+                                trade_date=run.trade_date,
+                                strategy=params.get("strategy", BacktestStrategyEnum.CREDIT_SPREADS),
+                                target_credit=params.get("target_credit", 0.35),
+                                spread_width=params.get("spread_width", 10),
+                                contracts=params.get("contracts", 1),
+                                take_profit=params.get("take_profit", 0.05),
+                                stop_loss=params.get("stop_loss", 3.0),
+                                monitor_interval=params.get("monitor_interval", 5),
+                                entry_start_time=params.get("entry_start_time", "10:00:00"),
+                                last_entry_time=params.get("last_entry_time", "14:00:00"),
+                                stale_loss_minutes=params.get("stale_loss_minutes", 120),
+                                stale_loss_threshold=params.get("stale_loss_threshold", 1.5),
+                                stagnation_window=params.get("stagnation_window", 30),
+                                min_improvement=params.get("min_improvement", 0.05),
+                                enable_stale_loss_exit=params.get("enable_stale_loss_exit", False),
+                            )
                     except Exception as exc:
                         logger.warning(
                             f"Could not reconstruct request for session {run.session_id}: {exc}"
@@ -138,6 +168,7 @@ class LiveTradingService:
                         trade_date=str(run.trade_date),
                         request=request,
                     )
+                    state.broker_type = run.broker_type or broker_str
                     state.status = run.status
                     state.created_at = run.created_at
                     state.started_at = run.started_at
@@ -270,7 +301,7 @@ class LiveTradingService:
 
         logger.info(
             f"Live trading session started: {session_id} date={trade_date} "
-            f"ibkr={request.ibkr.host}:{request.ibkr.port}"
+            f"broker={request.broker.value}"
         )
         return session_id
 
@@ -288,7 +319,7 @@ class LiveTradingService:
         backtest_id = state.session_id
         req = state.request
 
-        # --- Connect to IBKR ---
+        # --- Create market data provider (broker-specific) ---
         with state._lock:
             state.status = "connecting"
         await websocket_manager.send_backtest_update(
@@ -296,76 +327,69 @@ class LiveTradingService:
             {"status": "connecting", "session_id": backtest_id}
         )
 
-        ibkr_provider = IBKRMarketDataProvider(
-            host=req.ibkr.host,
-            port=req.ibkr.port,
-            client_id=req.ibkr.client_id,
-            account=req.ibkr.account,
-        )
+        provider = _create_market_data_provider(req)
 
         # Shared container so the worker thread can report back connect result
         connect_result: dict = {}
 
         def _run_session_in_thread():
             """
-            Connect to IBKR and run the full trading session in a single thread.
+            Connect to the broker and run the full trading session in a single thread.
 
-            ib_insync's IB object binds its asyncio event loop to the thread that
-            calls connect().  All subsequent reqMktData / sleep / cancelMktData
-            calls must happen in that same thread.  Previously connect() ran in
-            one run_in_executor call and session.run() ran in another, putting
-            them in different threads — the event loop was unreachable from the
-            session thread, so real-time bar callbacks and snapshot responses
+            For IBKR: ib_insync's IB object binds its asyncio event loop to the thread
+            that calls connect().  All subsequent reqMktData / sleep / cancelMktData
+            calls must happen in that same thread.
 
-            A fresh event loop is created at the top of this function and set as
-            the current thread's loop so that ib_insync always finds a clean,
-            running loop regardless of what ThreadPoolExecutor may have left behind.
+            For TastyTrade: the DXLink streamer runs its own background thread internally,
+            but order submission is synchronous REST — no special event-loop binding needed.
+
+            A fresh event loop is created at the top of this function and set as the
+            current thread's loop so that ib_insync always finds a clean, running loop.
             """
             import asyncio as _asyncio
             _thread_loop = _asyncio.new_event_loop()
             _asyncio.set_event_loop(_thread_loop)
 
-            from broker.ibkr_adapter import IBKRBrokerAdapter
-
-            logger.info(
-                f"Session {backtest_id}: connecting to IBKR "
-                f"{req.ibkr.host}:{req.ibkr.port} clientId={req.ibkr.client_id}"
-            )
-            connected = ibkr_provider.connect()
+            broker_label = req.broker.value
+            logger.info(f"Session {backtest_id}: connecting to {broker_label}")
+            connected = provider.connect()
             connect_result["connected"] = connected
             if not connected:
                 connect_result["error"] = (
-                    f"Could not connect to IBKR at {req.ibkr.host}:{req.ibkr.port}. "
-                    "Ensure TWS / IB Gateway is running and API connections are enabled."
+                    f"Could not connect to {broker_label}. "
+                    "Check credentials / connection settings and try again."
                 )
                 return None
 
-            # Override trade date (connect() sets _today = datetime.now())
-            ibkr_provider._today = state.trade_date
+            # For IBKR, override trade date (connect() sets _today = datetime.now())
+            if hasattr(provider, "_today"):
+                provider._today = state.trade_date
             logger.info(
-                f"Session {backtest_id}: IBKR connected — trade_date={state.trade_date} "
-                f"provider dates: {ibkr_provider.available_dates}"
+                f"Session {backtest_id}: {broker_label} market data connected — "
+                f"trade_date={state.trade_date} "
+                f"provider dates: {provider.available_dates}"
             )
 
-            broker_adapter = IBKRBrokerAdapter(
-                host=req.ibkr.host,
-                port=req.ibkr.port,
-                # Use client_id + 1 so order submission never shares a connection
-                # with the market data provider and avoids the 10197 flood conflict.
-                client_id=req.ibkr.client_id + 1,
-                account=req.ibkr.account,
-            )
+            broker_adapter = _create_broker_adapter(req)
             broker_connected = broker_adapter.connect()
             if not broker_connected:
-                logger.warning(
-                    f"Session {backtest_id}: broker adapter connection failed — "
-                    "orders will not be submitted to IBKR (NullAdapter fallback)"
+                logger.critical(
+                    f"╔══ BROKER CONNECTION FAILED ══╗\n"
+                    f"  Session  : {backtest_id}\n"
+                    f"  Broker   : {broker_label}\n"
+                    f"  ORDERS WILL NOT BE SUBMITTED — falling back to NullAdapter\n"
+                    f"╚══════════════════════════════╝"
                 )
                 from broker.null_adapter import NullBrokerAdapter
                 broker_adapter = NullBrokerAdapter()
+            else:
+                logger.info(
+                    f"Session {backtest_id}: broker adapter connected "
+                    f"({broker_label}) — orders WILL be submitted"
+                )
 
             rt_provider = RealtimeMarketDataProvider(
-                ibkr_provider,
+                provider,
                 trade_date=state.trade_date,
             )
 
@@ -402,6 +426,7 @@ class LiveTradingService:
                     stagnation_window=req.stagnation_window,
                     min_improvement=req.min_improvement,
                     enable_stale_loss_exit=req.enable_stale_loss_exit,
+                    skip_indicators=True,  # Live sessions use drift-only guards until RSI/BB warmup is resolved
                 )
             finally:
                 try:
@@ -414,7 +439,7 @@ class LiveTradingService:
         if not connect_result.get("connected", False):
             with state._lock:
                 state.status = "failed"
-                state.error_message = connect_result.get("error", "IBKR connection failed")
+                state.error_message = connect_result.get("error", "Broker connection failed")
                 state.completed_at = datetime.now()
             await self._update_session_db_status(state)
             await websocket_manager.send_backtest_error(backtest_id, state.error_message)
@@ -423,7 +448,7 @@ class LiveTradingService:
         with state._lock:
             state.status = "running"
             state.started_at = datetime.now()
-            state.ibkr_connected = True
+            state.broker_connected = True
 
         await self._update_session_db_status(state)
         await websocket_manager.send_backtest_update(
@@ -493,7 +518,7 @@ class LiveTradingService:
         finally:
             self._running_tasks.pop(state.session_id, None)
             try:
-                ibkr_provider.disconnect()
+                provider.disconnect()
             except Exception:
                 pass
 
@@ -691,12 +716,30 @@ class LiveTradingService:
     def _save_session_sync(self, state: _LiveSessionState):
         with db_manager.get_session() as session:
             req = state.request
+
+            # Build broker-specific connection parameters (no passwords stored)
+            if req.broker == BrokerEnum.TASTYTRADE and req.tastytrade:
+                broker_params = {
+                    # Do not store provider_secret or refresh_token in DB
+                    "tt_account": req.tastytrade.account_number,
+                    "tt_is_paper": req.tastytrade.is_paper,
+                }
+            else:
+                broker_params = {
+                    "ibkr_host": req.ibkr.host,
+                    "ibkr_port": req.ibkr.port,
+                    "ibkr_client_id": req.ibkr.client_id,
+                    "ibkr_account": req.ibkr.account,
+                }
+
             run = PaperTradingRun(
                 session_id=state.session_id,
                 mode="live",
                 trade_date=datetime.strptime(state.trade_date, "%Y-%m-%d").date(),
                 strategy_type=req.strategy.value,
+                broker_type=req.broker.value,
                 parameters={
+                    "broker_type": req.broker.value,
                     "strategy": req.strategy.value,
                     "target_credit": req.target_credit,
                     "spread_width": req.spread_width,
@@ -711,10 +754,7 @@ class LiveTradingService:
                     "stagnation_window": req.stagnation_window,
                     "min_improvement": req.min_improvement,
                     "enable_stale_loss_exit": req.enable_stale_loss_exit,
-                    "ibkr_host": req.ibkr.host,
-                    "ibkr_port": req.ibkr.port,
-                    "ibkr_client_id": req.ibkr.client_id,
-                    "ibkr_account": req.ibkr.account,
+                    **broker_params,
                 },
                 status=state.status,
                 created_at=state.created_at,
@@ -805,9 +845,10 @@ class LiveTradingService:
                     session.add(trade)
                 session.commit()
             for order in state.orders:
-                ibkr_rec = IBKROrder(
+                broker_rec = BrokerOrder(
                     order_id=order.order_id,
                     session_id=state.session_id,
+                    broker_type=state.broker_type,
                     symbol="SPXW",
                     strategy_type=order.strategy_type,
                     is_entry=order.is_entry,
@@ -818,13 +859,62 @@ class LiveTradingService:
                     success=order.success,
                     timestamp=order.timestamp,
                 )
-                session.merge(ibkr_rec)
+                session.merge(broker_rec)
             session.commit()
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _create_market_data_provider(req: LiveTradingRequest):
+    """
+    Instantiate the appropriate MarketDataProvider for the requested broker.
+    connect() is called separately (inside _run_session_in_thread) so that
+    ib_insync's event loop binds to the correct thread.
+    """
+    if req.broker == BrokerEnum.TASTYTRADE:
+        from market_data.tastytrade_provider import TastyTradeMarketDataProvider
+        cfg = req.tastytrade
+        return TastyTradeMarketDataProvider(
+            provider_secret=cfg.provider_secret,
+            refresh_token=cfg.refresh_token,
+            is_paper=cfg.is_paper,
+        )
+    # Default: IBKR
+    return IBKRMarketDataProvider(
+        host=req.ibkr.host,
+        port=req.ibkr.port,
+        client_id=req.ibkr.client_id,
+        account=req.ibkr.account,
+    )
+
+
+def _create_broker_adapter(req: LiveTradingRequest):
+    """
+    Instantiate the appropriate BrokerAdapter for the requested broker.
+    For IBKR, uses client_id + 1 to avoid conflicting with the market data connection.
+    """
+    if req.broker == BrokerEnum.TASTYTRADE:
+        from broker.tastytrade_adapter import TastyTradeBrokerAdapter
+        cfg = req.tastytrade
+        return TastyTradeBrokerAdapter(
+            provider_secret=cfg.provider_secret,
+            refresh_token=cfg.refresh_token,
+            account_number=cfg.account_number,
+            is_paper=cfg.is_paper,
+        )
+    # Default: IBKR
+    from broker.ibkr_adapter import IBKRBrokerAdapter
+    return IBKRBrokerAdapter(
+        host=req.ibkr.host,
+        port=req.ibkr.port,
+        # Use client_id + 1 so order submission never shares a connection
+        # with the market data provider and avoids the 10197 flood conflict.
+        client_id=req.ibkr.client_id + 1,
+        account=req.ibkr.account,
+    )
+
 
 def _strikes_from_selection(sel) -> dict:
     """Convert a StrikeSelection or IronCondorStrikeSelection to a plain dict."""

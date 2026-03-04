@@ -190,6 +190,7 @@ class LiveTradingSession:
         stagnation_window: int = 30,
         min_improvement: float = 0.05,
         enable_stale_loss_exit: bool = False,
+        skip_indicators: bool = False,
     ) -> DayBacktestResult:
         """
         Run the full trading day and return a DayBacktestResult.
@@ -254,6 +255,7 @@ class LiveTradingSession:
                 stagnation_window=stagnation_window,
                 min_improvement=min_improvement,
                 enable_stale_loss_exit=enable_stale_loss_exit,
+                skip_indicators=skip_indicators,
             )
         finally:
             # Always restore the original providers/engines
