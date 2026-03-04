@@ -274,14 +274,29 @@ class IBKRConnectionConfig(BaseModel):
 
 
 class TastyTradeConfig(BaseModel):
-    """TastyTrade OAuth2 credentials and account settings (tastytrade v12+)."""
-    provider_secret: str = Field(..., description="OAuth2 provider secret (client secret)")
-    refresh_token: str = Field(..., description="OAuth2 refresh token for the user")
-    account_number: str = Field(..., description="TastyTrade account number (e.g. 5WT00000)")
+    """
+    TastyTrade OAuth2 credentials and account settings (tastytrade v12+).
+
+    All three credential fields are optional in the request body — when omitted
+    (or left as empty strings) the server falls back to the environment variables
+    TASTYTRADE_PROVIDER_SECRET, TASTYTRADE_REFRESH_TOKEN, and
+    TASTYTRADE_ACCOUNT_NUMBER respectively.
+    """
+    provider_secret: str = Field(
+        "", description="OAuth2 provider secret — omit to use TASTYTRADE_PROVIDER_SECRET env var"
+    )
+    refresh_token: str = Field(
+        "", description="OAuth2 refresh token — omit to use TASTYTRADE_REFRESH_TOKEN env var"
+    )
+    account_number: str = Field(
+        "", description="Account number (e.g. 5WT00000) — omit to use TASTYTRADE_ACCOUNT_NUMBER env var"
+    )
     is_paper: bool = Field(
         True,
-        description="True = use certification (paper) API at api.cert.tastyworks.com; "
-                    "False = use production API at api.tastyworks.com"
+        description="True = account_number is a TastyTrade paper trading account. "
+                    "Both paper and live accounts connect to the production API "
+                    "(api.tastyworks.com) — paper trading in TastyTrade is handled "
+                    "via a paper account number, not the cert sandbox."
     )
 
 
@@ -314,6 +329,67 @@ class IBKRDiagnosticRequest(BaseModel):
         ge=1, le=20,
         description="Number of strikes on each side (put/call) to sample from the chain."
     )
+
+
+class DiagnosticRequest(BaseModel):
+    """
+    Broker-agnostic request body for POST /api/v1/trading/diagnose-market-data.
+
+    Set broker='ibkr' to test an IBKR connection (ibkr fields required).
+    Set broker='tastytrade' to test a TastyTrade connection (tastytrade fields required).
+    """
+    broker: BrokerEnum = Field(BrokerEnum.IBKR, description="Broker to diagnose")
+
+    # IBKR fields (used when broker=ibkr)
+    ibkr: IBKRConnectionConfig = Field(default_factory=IBKRConnectionConfig)
+    diagnostic_client_id: int = Field(
+        50, ge=1, le=999,
+        description="IBKR clientId for the diagnostic connection"
+    )
+
+    # TastyTrade fields (required when broker=tastytrade)
+    tastytrade: Optional[TastyTradeConfig] = Field(
+        None, description="TastyTrade credentials (required when broker=tastytrade)"
+    )
+
+    # Shared fields
+    trade_date: Optional[str] = Field(
+        None, description="Date for options expiry (YYYY-MM-DD). Defaults to today."
+    )
+    spx_price_hint: float = Field(
+        5800.0,
+        description="Fallback SPX level for options chain centre when live price unavailable."
+    )
+    num_strikes: int = Field(
+        5, ge=1, le=20,
+        description="Number of strikes on each side (put/call) to sample."
+    )
+
+    @model_validator(mode="after")
+    def validate_broker_config(self) -> "DiagnosticRequest":
+        import os
+        if self.broker == BrokerEnum.TASTYTRADE:
+            if self.tastytrade is None:
+                self.tastytrade = TastyTradeConfig()
+            cfg = self.tastytrade
+            if not cfg.provider_secret:
+                cfg.provider_secret = os.getenv("TASTYTRADE_PROVIDER_SECRET", "")
+            if not cfg.refresh_token:
+                cfg.refresh_token = os.getenv("TASTYTRADE_REFRESH_TOKEN", "")
+            if not cfg.account_number:
+                cfg.account_number = os.getenv("TASTYTRADE_ACCOUNT_NUMBER", "")
+            missing = [k for k, v in [
+                ("provider_secret", cfg.provider_secret),
+                ("refresh_token",   cfg.refresh_token),
+                ("account_number",  cfg.account_number),
+            ] if not v]
+            if missing:
+                raise ValueError(
+                    f"TastyTrade credentials missing: {missing}. "
+                    "Set TASTYTRADE_PROVIDER_SECRET / TASTYTRADE_REFRESH_TOKEN / "
+                    "TASTYTRADE_ACCOUNT_NUMBER environment variables."
+                )
+        return self
 
 
 class LiveTradingRequest(BaseModel):
@@ -406,11 +482,32 @@ class LiveTradingRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_broker_config(self) -> "LiveTradingRequest":
-        if self.broker == BrokerEnum.TASTYTRADE and self.tastytrade is None:
-            raise ValueError(
-                "tastytrade config is required when broker='tastytrade'. "
-                "Provide provider_secret, refresh_token, account_number, and is_paper."
-            )
+        import os
+        if self.broker == BrokerEnum.TASTYTRADE:
+            if self.tastytrade is None:
+                # Auto-build from env vars if the field was omitted entirely
+                self.tastytrade = TastyTradeConfig()
+            cfg = self.tastytrade
+            # Fill empty credential fields from env vars
+            if not cfg.provider_secret:
+                cfg.provider_secret = os.getenv("TASTYTRADE_PROVIDER_SECRET", "")
+            if not cfg.refresh_token:
+                cfg.refresh_token = os.getenv("TASTYTRADE_REFRESH_TOKEN", "")
+            if not cfg.account_number:
+                cfg.account_number = os.getenv("TASTYTRADE_ACCOUNT_NUMBER", "")
+            # Final check — at least the essential credentials must be present
+            missing = [k for k, v in [
+                ("provider_secret", cfg.provider_secret),
+                ("refresh_token",   cfg.refresh_token),
+                ("account_number",  cfg.account_number),
+            ] if not v]
+            if missing:
+                raise ValueError(
+                    f"TastyTrade credentials missing: {missing}. "
+                    "Provide them in the request body or set "
+                    "TASTYTRADE_PROVIDER_SECRET / TASTYTRADE_REFRESH_TOKEN / "
+                    "TASTYTRADE_ACCOUNT_NUMBER environment variables."
+                )
         return self
 
 

@@ -18,8 +18,9 @@ Architecture
 
 Paper vs Live
 -------------
-is_paper=True  → Session(is_test=True)   (api.cert.tastyworks.com)
-is_paper=False → Session(is_test=False)  (api.tastyworks.com)
+Both paper and live accounts use the production session (api.tastyworks.com).
+DXLink streaming requires a production session — the cert sandbox has no live
+market data feed.  Paper trading is handled by using a paper account number.
 
 Authentication
 --------------
@@ -41,10 +42,11 @@ provider.disconnect()
 """
 
 import asyncio
+import os
 import threading
 import time
 from collections import defaultdict, deque
-from datetime import datetime, date as date_type, timedelta
+from datetime import datetime, date as date_type
 from typing import Dict, List, Optional, Deque
 
 import pandas as pd
@@ -58,8 +60,9 @@ _ET = pytz.timezone("America/New_York")
 try:
     from tastytrade import Session
     from tastytrade.instruments import NestedOptionChain
+    from tastytrade.market_data import get_market_data_by_type
     from tastytrade.streamer import DXLinkStreamer
-    from tastytrade.dxfeed import Candle, Quote, Greeks
+    from tastytrade.dxfeed import Quote, Greeks
     TT_AVAILABLE = True
 except ImportError:
     TT_AVAILABLE = False
@@ -230,18 +233,22 @@ class TastyTradeMarketDataProvider(MarketDataProvider):
     async def _stream_async(self):
         """
         Main async streaming coroutine.  Creates the Session, loads the option
-        chain, subscribes to SPX candles and SPXW 0DTE option quotes/greeks,
-        then dispatches events until _stop_event is set.
+        chain, subscribes to SPXW 0DTE option quotes/greeks via DXLink, and
+        polls the SPX spot price via REST every 30 seconds.
 
-        Everything runs on the same event loop so the Session's httpx.AsyncClient
-        is never used across loop boundaries.
+        DXLink candle subscriptions are not used — TastyTrade's server does not
+        deliver candle events via the streaming API.  SPX price comes from the
+        REST endpoint: GET /market-data/by-type?index=SPX.
         """
         try:
-            # Create the session here so its httpx.AsyncClient is bound to this loop
+            # Always use the production session (is_test=False).
+            # TastyTrade paper trading uses a paper account number on the production
+            # API — the cert environment (is_test=True) is a developer sandbox with
+            # no live market data feed, so DXLink streaming requires production.
             self._session = Session(
                 self._provider_secret,
                 self._refresh_token,
-                is_test=self._is_paper,
+                is_test=False,
             )
             await self._load_option_chain_async()
         except Exception as exc:
@@ -254,19 +261,6 @@ class TastyTradeMarketDataProvider(MarketDataProvider):
 
         try:
             async with DXLinkStreamer(self._session) as streamer:
-                # Subscribe to SPX 1-minute candles.
-                # Start from 10 hours ago to capture the full trading session even
-                # when connecting after market close (market hours 09:30–16:00 ET).
-                candle_start = datetime.now() - timedelta(hours=10)
-                logger.info(
-                    f"TastyTrade: subscribing to SPX candles from {candle_start.strftime('%H:%M')} ET"
-                )
-                await streamer.subscribe_candle(
-                    ["$SPX"],
-                    interval="1m",
-                    start_time=candle_start,
-                    extended_trading_hours=True,  # use $SPX{=1m} without tho=true
-                )
                 # Subscribe to option quotes and greeks
                 if option_symbols:
                     logger.info(
@@ -280,7 +274,7 @@ class TastyTradeMarketDataProvider(MarketDataProvider):
 
                 # Fan out to concurrent listeners
                 tasks = [
-                    asyncio.create_task(self._listen_candles(streamer)),
+                    asyncio.create_task(self._poll_spx_price()),
                     asyncio.create_task(self._listen_quotes(streamer)),
                     asyncio.create_task(self._listen_greeks(streamer)),
                     asyncio.create_task(self._chain_reload_monitor(streamer)),
@@ -289,6 +283,14 @@ class TastyTradeMarketDataProvider(MarketDataProvider):
                 done, pending = await asyncio.wait(
                     tasks, return_when=asyncio.FIRST_COMPLETED
                 )
+                for t in done:
+                    if not self._stop_event.is_set():
+                        name = getattr(t, 'get_name', lambda: repr(t))()
+                        exc = t.exception() if not t.cancelled() else None
+                        logger.warning(
+                            f"TastyTrade: stream task completed unexpectedly — "
+                            f"task={name} exc={exc}"
+                        )
                 for t in pending:
                     t.cancel()
                     try:
@@ -333,18 +335,60 @@ class TastyTradeMarketDataProvider(MarketDataProvider):
                 except Exception as exc:
                     logger.error(f"TastyTrade chain reload failed: {exc}")
 
-    async def _listen_candles(self, streamer: "DXLinkStreamer"):
-        """Process SPX 1-minute candle events → update price buffer."""
-        try:
-            async for event in streamer.listen(Candle):
-                if self._stop_event.is_set():
-                    break
-                self._handle_candle(event)
-        except asyncio.CancelledError:
-            pass
-        except Exception as exc:
-            if not self._stop_event.is_set():
-                logger.error(f"TastyTrade candle listener error: {exc}")
+    async def _poll_spx_price(self):
+        """
+        Poll the SPX spot price via the TastyTrade REST API every 30 seconds
+        and write it into _price_buffer[date][timestamp].
+
+        Uses GET /market-data/by-type?index=SPX (symbol "SPX", not the DXFeed
+        streaming symbol "$SPX.X").  This is the only reliable way to get the
+        SPX cash index price from TastyTrade — DXLink candle subscriptions are
+        silently ignored by the server.
+        """
+        logger.info("TastyTrade: SPX price poll started (REST, every 30s)")
+        count = 0
+        while not self._stop_event.is_set():
+            try:
+                results = await get_market_data_by_type(self._session, indices=["SPX"])
+                spx_data = results[0] if results else None
+                spx = float(spx_data.mark) if spx_data and float(spx_data.mark) > 0 else 0.0
+
+                if spx > 0:
+                    now_et = datetime.now(_ET)
+                    date_str = now_et.strftime("%Y-%m-%d")
+                    time_str = now_et.strftime("%H:%M") + ":00"
+
+                    with self._lock:
+                        self._price_buffer[date_str][time_str] = spx
+                        self._price_keys.append((date_str, time_str))
+
+                    count += 1
+                    logger.info(f"TT SPX price: {date_str} {time_str} spx={spx:.2f}")
+
+                    # Set centre price on first poll (for drift monitoring)
+                    if self._options_center_price is None:
+                        self._options_center_price = spx
+
+                    # Check if options chain needs resubscription due to SPX drift
+                    if abs(spx - self._options_center_price) > _OPTION_RESUBSCRIBE_THRESHOLD:
+                        logger.info(
+                            f"SPX moved {spx - self._options_center_price:+.0f} pts from "
+                            f"options subscription centre — scheduling option chain reload"
+                        )
+                        self._options_center_price = spx
+                        self._needs_chain_reload = True
+                else:
+                    logger.warning("TastyTrade: SPX REST poll returned 0 or unavailable")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                if not self._stop_event.is_set():
+                    logger.warning(f"TastyTrade SPX poll error: {exc}")
+
+            await asyncio.sleep(30)
+
+        logger.info(f"TastyTrade: SPX price poll stopped (polled {count} times)")
 
     async def _listen_quotes(self, streamer: "DXLinkStreamer"):
         """Process option Quote events → update _options_cache bid/ask."""
@@ -375,41 +419,6 @@ class TastyTradeMarketDataProvider(MarketDataProvider):
     # ------------------------------------------------------------------
     # Event handlers
     # ------------------------------------------------------------------
-
-    def _handle_candle(self, event):
-        """Handle a DXLink Candle event for $SPX (1-minute bar)."""
-        try:
-            close = float(event.close or 0)
-            if close <= 0:
-                return
-
-            # event.time is milliseconds since epoch in DXFeed
-            ts_ms = getattr(event, "time", None)
-            if ts_ms is None:
-                return
-
-            bar_dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=_ET).replace(tzinfo=None)
-            date_str = bar_dt.strftime("%Y-%m-%d")
-            time_str = bar_dt.strftime("%H:%M") + ":00"  # snap to minute
-
-            with self._lock:
-                self._price_buffer[date_str][time_str] = close
-                self._price_keys.append((date_str, time_str))
-
-            logger.debug(f"TT SPX bar: {date_str} {time_str} close={close:.2f}")
-
-            # Check if we should re-subscribe to options due to SPX drift
-            if (self._options_center_price is not None
-                    and abs(close - self._options_center_price) > _OPTION_RESUBSCRIBE_THRESHOLD):
-                logger.info(
-                    f"SPX moved {close - self._options_center_price:+.0f} pts from "
-                    f"options subscription centre — scheduling option chain reload"
-                )
-                self._options_center_price = close
-                self._needs_chain_reload = True
-
-        except Exception as exc:
-            logger.debug(f"TT _handle_candle error: {exc}")
 
     def _handle_quote(self, event):
         """Handle a DXLink Quote event for an option symbol."""

@@ -426,6 +426,7 @@ class LiveTradingService:
                     stagnation_window=req.stagnation_window,
                     min_improvement=req.min_improvement,
                     enable_stale_loss_exit=req.enable_stale_loss_exit,
+                    skip_indicators=True,  # Live sessions use drift-only guards until RSI/BB warmup is resolved
                 )
             finally:
                 try:
