@@ -166,7 +166,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                 try:
                     progress_callback(event)
                 except Exception as _cb_err:
-                    logger.debug(f"progress_callback error (ignored): {_cb_err}")
+                    logger.error(f"progress_callback error: {_cb_err}")
 
         # For live/paper sessions: warn if all scan bars are already in the past.
         # This happens when the session is started after market close or on a
@@ -1675,7 +1675,7 @@ if __name__ == "__main__":
 
 
 print("Enhanced Multi-Strategy Backtesting Engine Complete - Part 3/3")
-print("\\n✅ All enhancements implemented:")
+print("✅ All enhancements implemented:")
 print("1. ✅ Multi-strategy selection (IC, Put Spreads, Call Spreads)")
 print("2. ✅ Technical indicators (RSI, MACD, Bollinger Bands)")
 print("3. ✅ Delta/Probability ITM based strike selection") 

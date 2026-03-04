@@ -6,7 +6,7 @@ Pydantic models for request/response validation and serialization.
 from datetime import datetime, date
 from enum import Enum
 from typing import Dict, List, Optional, Any, Union
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class BacktestModeEnum(str, Enum):
@@ -257,6 +257,12 @@ class PaperPosition(BaseModel):
 # Live / IBKR Trading models
 # ---------------------------------------------------------------------------
 
+class BrokerEnum(str, Enum):
+    """Supported order-execution brokers."""
+    IBKR = "ibkr"
+    TASTYTRADE = "tastytrade"
+
+
 class IBKRConnectionConfig(BaseModel):
     """IBKR TWS / IB Gateway connection parameters."""
     host: str = Field("127.0.0.1", description="TWS / Gateway host")
@@ -265,6 +271,18 @@ class IBKRConnectionConfig(BaseModel):
                                   "4002 = Gateway paper, 4001 = Gateway live")
     client_id: int = Field(1, ge=1, le=999, description="IBKR client ID (must be unique per connection)")
     account: str = Field("", description="IBKR account string (e.g. DU123456 for paper)")
+
+
+class TastyTradeConfig(BaseModel):
+    """TastyTrade OAuth2 credentials and account settings (tastytrade v12+)."""
+    provider_secret: str = Field(..., description="OAuth2 provider secret (client secret)")
+    refresh_token: str = Field(..., description="OAuth2 refresh token for the user")
+    account_number: str = Field(..., description="TastyTrade account number (e.g. 5WT00000)")
+    is_paper: bool = Field(
+        True,
+        description="True = use certification (paper) API at api.cert.tastyworks.com; "
+                    "False = use production API at api.tastyworks.com"
+    )
 
 
 class IBKRDiagnosticRequest(BaseModel):
@@ -299,12 +317,24 @@ class IBKRDiagnosticRequest(BaseModel):
 
 
 class LiveTradingRequest(BaseModel):
-    """Request model for starting a live / IBKR paper trading session."""
+    """Request model for starting a live / paper trading session."""
 
-    # IBKR connection
+    # Broker selection
+    broker: BrokerEnum = Field(
+        BrokerEnum.IBKR,
+        description="Which broker to use for order execution and market data"
+    )
+
+    # IBKR connection (used when broker=ibkr)
     ibkr: IBKRConnectionConfig = Field(
         default_factory=IBKRConnectionConfig,
-        description="IBKR connection settings"
+        description="IBKR connection settings (only used when broker=ibkr)"
+    )
+
+    # TastyTrade credentials (required when broker=tastytrade)
+    tastytrade: Optional[TastyTradeConfig] = Field(
+        None,
+        description="TastyTrade credentials (required when broker=tastytrade)"
     )
 
     # Optional date: defaults to today when omitted
@@ -374,9 +404,18 @@ class LiveTradingRequest(BaseModel):
         # Live trading can target today or a future date — no restriction needed
         return v
 
+    @model_validator(mode="after")
+    def validate_broker_config(self) -> "LiveTradingRequest":
+        if self.broker == BrokerEnum.TASTYTRADE and self.tastytrade is None:
+            raise ValueError(
+                "tastytrade config is required when broker='tastytrade'. "
+                "Provide provider_secret, refresh_token, account_number, and is_paper."
+            )
+        return self
+
 
 class OrderSlippage(BaseModel):
-    """Slippage record for a single IBKR order."""
+    """Slippage record for a single broker order."""
     order_id: str
     strategy_type: str
     is_entry: bool
@@ -388,12 +427,13 @@ class OrderSlippage(BaseModel):
 
 
 class LiveTradingStatus(BaseModel):
-    """Full status of a live / IBKR paper trading session."""
+    """Full status of a live / paper trading session."""
     session_id: str = Field(..., description="Unique session identifier")
     mode: str = Field(..., description="live")
     trade_date: str = Field(..., description="Date being traded YYYY-MM-DD")
     status: str = Field(..., description="pending | connecting | running | completed | stopped | failed")
-    ibkr_connected: bool = Field(False, description="Whether IBKR connection is active")
+    broker_type: str = Field("ibkr", description="Broker used: ibkr | tastytrade")
+    broker_connected: bool = Field(False, description="Whether the broker connection is active")
 
     # Live position state
     open_positions: List[PaperPosition] = Field(default_factory=list)
@@ -403,7 +443,7 @@ class LiveTradingStatus(BaseModel):
 
     # Slippage tracking
     orders: List[OrderSlippage] = Field(default_factory=list,
-                                        description="All IBKR orders with fill details")
+                                        description="All broker orders with fill details")
     total_slippage: float = Field(0.0, description="Cumulative slippage across all orders")
 
     # Timing

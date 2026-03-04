@@ -186,6 +186,9 @@ class PaperTradingRun(Base):
     trade_date = Column(Date, nullable=False)
     strategy_type = Column(String(20), nullable=False)
 
+    # Broker used for this session
+    broker_type = Column(String(20), nullable=True)  # 'ibkr' | 'tastytrade'
+
     # Strategy parameters
     parameters = Column(JSONB, nullable=True)
 
@@ -202,15 +205,18 @@ class PaperTradingRun(Base):
     total_pnl = Column(Float, nullable=True)
 
     def __repr__(self):
-        return f"<PaperTradingRun(session_id={self.session_id}, date={self.trade_date}, status={self.status})>"
+        return f"<PaperTradingRun(session_id={self.session_id}, date={self.trade_date}, status={self.status}, broker={self.broker_type})>"
 
 
-class IBKROrder(Base):
+class BrokerOrder(Base):
     """
-    Records every order submitted to IBKR during a live / paper trading session.
+    Records every order submitted to a broker during a live / paper trading session.
 
     Captures both the intended price (from the model) and the actual fill so
-    that slippage can be tracked and compared against backtest assumptions.
+    that slippage can be tracked and compared across brokers.
+
+    Previously named IBKROrder; the table name 'ibkr_orders' is kept unchanged
+    to avoid a data migration.
     """
     __tablename__ = 'ibkr_orders'
 
@@ -220,6 +226,9 @@ class IBKROrder(Base):
     # Session linkage
     session_id = Column(String(50), nullable=False, index=True)
 
+    # Which broker submitted this order
+    broker_type = Column(String(20), nullable=False, server_default='ibkr')  # 'ibkr' | 'tastytrade'
+
     # Order details
     symbol = Column(String(20), nullable=False, default='SPXW')
     strategy_type = Column(String(30), nullable=False)
@@ -227,7 +236,7 @@ class IBKROrder(Base):
 
     # Pricing
     limit_price = Column(Float, nullable=False)   # Price we requested (model mid)
-    fill_price = Column(Float, nullable=False)     # Actual IBKR fill
+    fill_price = Column(Float, nullable=False)     # Actual fill
     slippage = Column(Float, nullable=False)       # fill_price - limit_price
     quantity = Column(Integer, nullable=False)
 
@@ -245,9 +254,13 @@ class IBKROrder(Base):
     def __repr__(self):
         direction = "OPEN" if self.is_entry else "CLOSE"
         return (
-            f"<IBKROrder(id={self.order_id}, {direction} {self.strategy_type}, "
+            f"<BrokerOrder(id={self.order_id}, broker={self.broker_type}, {direction} {self.strategy_type}, "
             f"fill={self.fill_price:.2f}, slippage={self.slippage:+.2f})>"
         )
+
+
+# Backward-compat alias so any remaining references to IBKROrder still resolve.
+IBKROrder = BrokerOrder
 
 
 class SystemLog(Base):

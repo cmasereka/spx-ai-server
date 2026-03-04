@@ -33,3 +33,4 @@ cache/
 # Backup files
 *.bak
 *.backup
+venv_py38_backup/
