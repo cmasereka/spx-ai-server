@@ -297,7 +297,7 @@ def _diagnose_market_data_sync(request: IBKRDiagnosticRequest) -> dict:
             return report
 
         report["connected"] = True
-        ib.reqMarketDataType(1)  # Live data
+        ib.reqMarketDataType(3)  # Delayed data
 
         # ------------------------------------------------------------------
         # 1. SPX Index price

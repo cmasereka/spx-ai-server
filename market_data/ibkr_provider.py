@@ -135,8 +135,8 @@ class IBKRMarketDataProvider(MarketDataProvider):
                 raise last_exc or ConnectionError("IBKR connect failed after 3 attempts")
             self._connected = self._ib.isConnected()
             if self._connected:
-                # Request live market data (requires active CBOE options subscription).
-                self._ib.reqMarketDataType(1)
+                # Request delayed market data (type 3 = delayed, no subscription needed).
+                self._ib.reqMarketDataType(3)
                 self._today = datetime.now().strftime("%Y-%m-%d")
                 self._spx_contract = Index("SPX", "CBOE", "USD")
                 self._ib.qualifyContracts(self._spx_contract)
