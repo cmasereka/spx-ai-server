@@ -7,12 +7,11 @@ accounts (port 7496) — the only difference is the port number.
 
 Order execution strategy
 ------------------------
-1. Calculate mid-price of the combo from current bid/ask.
-2. Submit a limit order at mid-price.
-3. Wait up to INITIAL_WAIT_SECS for a fill.
-4. If no fill, improve the price by IMPROVE_STEP toward the market and resubmit.
-5. After MAX_IMPROVE_ATTEMPTS, switch to a market order as a last resort.
-6. Time out after TOTAL_TIMEOUT_SECS — treat as failed fill.
+1. Calculate the mid-price of the combo from the current bid/ask.
+2. Submit a single limit order at the mid-price.
+3. Wait up to ENTRY_FILL_WAIT_SECS (entries) or EXIT_FILL_WAIT_SECS (exits).
+4. If no fill within the timeout, return OrderResult(success=False).
+   No price chasing, no market orders.
 
 Connection model
 ----------------
@@ -33,19 +32,15 @@ from .adapter import BrokerAdapter, OrderResult
 
 try:
     from ib_insync import (
-        IB, Contract, Order, ComboLeg, TagValue,
-        LimitOrder, MarketOrder,
+        IB, Contract, Order, ComboLeg, TagValue, LimitOrder,
     )
     IB_AVAILABLE = True
 except ImportError:
     IB_AVAILABLE = False
 
 # Order fill timing constants
-INITIAL_WAIT_SECS    = 30   # Wait this long for initial limit order fill
-IMPROVE_STEP         = 0.05  # How much to move the limit price per improvement step
-MAX_IMPROVE_ATTEMPTS = 3    # Number of price improvements before going to market
-IMPROVE_WAIT_SECS    = 15   # Wait between each improvement attempt
-TOTAL_TIMEOUT_SECS   = 120  # Give up after this many seconds
+ENTRY_FILL_WAIT_SECS = 60   # How long to wait for an opening limit order
+EXIT_FILL_WAIT_SECS  = 45   # How long to wait for a closing limit order
 
 
 class IBKRBrokerAdapter(BrokerAdapter):
@@ -161,7 +156,7 @@ class IBKRBrokerAdapter(BrokerAdapter):
         )
 
     def close_all(self, open_strategies: List, timestamp: str) -> List[OrderResult]:
-        """Force-close all open positions at market price."""
+        """Force-close all open positions using aggressive limit orders."""
         results = []
         for strat in open_strategies:
             try:
@@ -171,7 +166,6 @@ class IBKRBrokerAdapter(BrokerAdapter):
                     timestamp=timestamp,
                     is_entry=False,
                     target_price=0.0,
-                    use_market=True,
                 )
                 results.append(result)
             except Exception as exc:
@@ -190,17 +184,12 @@ class IBKRBrokerAdapter(BrokerAdapter):
                 ))
         return results
 
-    @property
-    def is_connected(self) -> bool:
-        return bool(self._ib) and self._ib.isConnected()
-
     # ------------------------------------------------------------------
     # Internal order construction and submission
     # ------------------------------------------------------------------
 
     def _execute_combo_order(self, strategy, quantity: int, timestamp: str,
-                              is_entry: bool, target_price: float,
-                              use_market: bool = False) -> OrderResult:
+                              is_entry: bool, target_price: float) -> OrderResult:
         """
         Build and submit a BAG (combo) order for the given OptionsStrategy.
 
@@ -221,12 +210,13 @@ class IBKRBrokerAdapter(BrokerAdapter):
             # target_price is the total dollar amount (entry_credit / exit_cost × 100 × qty).
             # IBKR combo lmtPrice is expressed as per-share price (before the 100 multiplier).
             per_share_price = abs(target_price) / (100.0 * max(quantity, 1))
-            fill_price = self._submit_with_retry(
+            wait_secs = ENTRY_FILL_WAIT_SECS if is_entry else EXIT_FILL_WAIT_SECS
+            fill_price = self._submit_limit_order(
                 combo=combo,
                 action=action,
                 quantity=quantity,
-                target_price=per_share_price,
-                use_market=use_market,
+                limit_price=per_share_price,
+                wait_secs=wait_secs,
             )
 
             return OrderResult(
@@ -317,55 +307,31 @@ class IBKRBrokerAdapter(BrokerAdapter):
             logger.error(f"_build_combo_contract failed: {exc}")
             return None
 
-    def _submit_with_retry(self, combo: "Contract", action: str,
-                           quantity: int, target_price: float,
-                           use_market: bool = False) -> Optional[float]:
+    def _submit_limit_order(self, combo: "Contract", action: str,
+                            quantity: int, limit_price: float,
+                            wait_secs: int) -> Optional[float]:
         """
-        Submit a limit order and retry with price improvements.
-        Returns the fill price, or None if it timed out.
+        Submit a single limit order at the given price and wait up to wait_secs.
+        Returns the fill price, or None if the order did not fill in time.
         """
-        if use_market:
-            order = MarketOrder(action, quantity)
-            if self._account:
-                order.account = self._account
-            trade = self._ib.placeOrder(combo, order)
-            return self._wait_for_fill(trade)
-
-        limit_price = target_price
-        for attempt in range(MAX_IMPROVE_ATTEMPTS + 1):
-            order = LimitOrder(action, quantity, round(limit_price, 2))
-            if self._account:
-                order.account = self._account
-            trade = self._ib.placeOrder(combo, order)
-            fill = self._wait_for_fill(trade, timeout=INITIAL_WAIT_SECS)
-            if fill is not None:
-                return fill
-
-            # Improve the limit price toward the market
-            if action == "SELL":
-                limit_price -= IMPROVE_STEP   # Accept a lower credit
-            else:
-                limit_price += IMPROVE_STEP   # Offer a higher debit
-            logger.debug(
-                f"No fill after {INITIAL_WAIT_SECS}s, improving to {limit_price:.2f} "
-                f"(attempt {attempt + 1}/{MAX_IMPROVE_ATTEMPTS})"
+        order = LimitOrder(action, quantity, round(limit_price, 2))
+        if self._account:
+            order.account = self._account
+        trade = self._ib.placeOrder(combo, order)
+        logger.debug(f"Placed {action} limit @ {limit_price:.2f} — waiting up to {wait_secs}s")
+        fill = self._wait_for_fill(trade, timeout=wait_secs)
+        if fill is None:
+            logger.warning(
+                f"No fill after {wait_secs}s for {action} limit @ {limit_price:.2f} — cancelling"
             )
-            # Cancel the unfilled order before retrying
             try:
                 self._ib.cancelOrder(order)
                 self._ib.sleep(1)
             except Exception:
                 pass
+        return fill
 
-        # Final attempt: market order
-        logger.warning("All limit attempts failed, submitting market order")
-        market_order = MarketOrder(action, quantity)
-        if self._account:
-            market_order.account = self._account
-        trade = self._ib.placeOrder(combo, market_order)
-        return self._wait_for_fill(trade, timeout=IMPROVE_WAIT_SECS)
-
-    def _wait_for_fill(self, trade, timeout: int = INITIAL_WAIT_SECS) -> Optional[float]:
+    def _wait_for_fill(self, trade, timeout: int = ENTRY_FILL_WAIT_SECS) -> Optional[float]:
         """Poll until the trade is filled or timeout expires. Returns fill price or None."""
         start = time.time()
         while time.time() - start < timeout:

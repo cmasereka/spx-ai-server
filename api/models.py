@@ -264,13 +264,39 @@ class BrokerEnum(str, Enum):
 
 
 class IBKRConnectionConfig(BaseModel):
-    """IBKR TWS / IB Gateway connection parameters."""
-    host: str = Field("127.0.0.1", description="TWS / Gateway host")
-    port: int = Field(7497, ge=1, le=65535,
+    """
+    IBKR TWS / IB Gateway connection parameters.
+
+    All fields are optional in the request body — when omitted (or left as
+    empty / zero) the server falls back to environment variables:
+      IBKR_HOST        (default: 127.0.0.1)
+      IBKR_PORT        (default: 7497)
+      IBKR_CLIENT_ID   (default: 1)
+      IBKR_ACCOUNT     (default: "")
+    """
+    host: str = Field("", description="TWS / Gateway host — omit to use IBKR_HOST env var")
+    port: int = Field(0, ge=0, le=65535,
                       description="7497 = TWS paper, 7496 = TWS live, "
-                                  "4002 = Gateway paper, 4001 = Gateway live")
-    client_id: int = Field(1, ge=1, le=999, description="IBKR client ID (must be unique per connection)")
-    account: str = Field("", description="IBKR account string (e.g. DU123456 for paper)")
+                                  "4002 = Gateway paper, 4001 = Gateway live — "
+                                  "omit to use IBKR_PORT env var")
+    client_id: int = Field(0, ge=0, le=999,
+                           description="IBKR client ID — omit to use IBKR_CLIENT_ID env var")
+    account: str = Field("", description="IBKR account string (e.g. DU123456) — omit to use IBKR_ACCOUNT env var")
+
+    @model_validator(mode="before")
+    @classmethod
+    def fill_from_env(cls, data):
+        import os
+        if isinstance(data, dict):
+            if not data.get("host"):
+                data["host"] = os.getenv("IBKR_HOST", "127.0.0.1")
+            if not data.get("port"):
+                data["port"] = int(os.getenv("IBKR_PORT", "7497"))
+            if not data.get("client_id"):
+                data["client_id"] = int(os.getenv("IBKR_CLIENT_ID", "1"))
+            if not data.get("account"):
+                data["account"] = os.getenv("IBKR_ACCOUNT", "")
+        return data
 
 
 class TastyTradeConfig(BaseModel):
@@ -472,6 +498,12 @@ class LiveTradingRequest(BaseModel):
         0.05, ge=0.01, le=1.0,
         description="Minimum cost improvement ($/share) required in the stagnation window to "
                     "keep the position open. Default $0.05/share."
+    )
+
+    skip_indicators: bool = Field(
+        True,
+        description="When True, skip RSI/MACD/Bollinger warmup and use drift-only entry guards. "
+                    "Useful for debugging or when indicator data is unavailable at session start."
     )
 
     @field_validator("trade_date")

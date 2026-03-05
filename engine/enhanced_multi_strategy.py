@@ -138,7 +138,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                               stagnation_window: int = 30,
                               min_improvement: float = 0.05,
                               enable_stale_loss_exit: bool = False,
-                              skip_indicators: bool = False) -> DayBacktestResult:
+                              skip_indicators: bool = True) -> DayBacktestResult:
         """
         Full intraday scan loop for one trading day.
         strategy_mode controls which entry types are allowed:
