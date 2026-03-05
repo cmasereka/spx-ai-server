@@ -2,7 +2,7 @@
 Live Trading Service — multi-broker paper / live trading sessions.
 
 Manages live trading sessions that execute real orders via a selected broker
-(IBKR or TastyTrade).  Each session uses a LiveTradingSession (trading/session.py)
+(IBKR or TastyTrade).  Each session uses a LiveTradingLoop (trading/live_trading_loop.py)
 running in a thread pool, with a broker-appropriate MarketDataProvider wrapped by
 RealtimeMarketDataProvider for real-time bars and a matching BrokerAdapter for
 order submission.
@@ -26,11 +26,10 @@ from .models import (
 from .websocket_manager import WebSocketManager
 from enhanced_multi_strategy import EnhancedBacktestingEngine
 from enhanced_backtest import EnhancedBacktestResult, StrategyType as ST
-from delta_strike_selector import IronCondorStrikeSelection
+from strike_selector import IronCondorStrikeSelection
 from market_data.ibkr_provider import IBKRMarketDataProvider
 from market_data.realtime_provider import RealtimeMarketDataProvider
 from broker.null_adapter import NullBrokerAdapter
-from trading.session import LiveTradingSession
 from src.database.connection import db_manager
 from src.database.models import PaperTradingRun, BrokerOrder, Trade
 
@@ -377,11 +376,15 @@ class LiveTradingService:
                     f"╔══ BROKER CONNECTION FAILED ══╗\n"
                     f"  Session  : {backtest_id}\n"
                     f"  Broker   : {broker_label}\n"
-                    f"  ORDERS WILL NOT BE SUBMITTED — falling back to NullAdapter\n"
+                    f"  Session will be marked as FAILED — no orders will be submitted\n"
                     f"╚══════════════════════════════╝"
                 )
-                from broker.null_adapter import NullBrokerAdapter
-                broker_adapter = NullBrokerAdapter()
+                connect_result["broker_connected"] = False
+                connect_result["error"] = (
+                    f"Could not connect to {broker_label} broker. "
+                    "Check credentials / TWS connection settings and try again."
+                )
+                return None
             else:
                 logger.info(
                     f"Session {backtest_id}: broker adapter connected "
@@ -400,33 +403,19 @@ class LiveTradingService:
                 f"tp={req.take_profit} sl={req.stop_loss}"
             )
 
-            session = LiveTradingSession(
-                engine=self.engine,
-                market_data_provider=rt_provider,
-                broker_adapter=broker_adapter,
-            )
-
             callback = self._make_callback(state, loop, websocket_manager, backtest_id)
 
             try:
-                return session.run(
+                from trading.live_trading_loop import LiveTradingLoop
+                runner = LiveTradingLoop(
+                    engine=self.engine,
+                    market_data_provider=rt_provider,
+                    broker_adapter=broker_adapter,
+                )
+                return runner.run_day(
                     date=state.trade_date,
-                    take_profit=req.take_profit,
-                    stop_loss=req.stop_loss,
-                    monitor_interval=req.monitor_interval,
-                    min_spread_width=req.spread_width,
-                    target_credit=req.target_credit,
-                    strategy_mode=req.strategy.value,
-                    quantity=req.contracts,
+                    config=req,
                     progress_callback=callback,
-                    entry_start_time=req.entry_start_time,
-                    last_entry_time=req.last_entry_time,
-                    stale_loss_minutes=req.stale_loss_minutes,
-                    stale_loss_threshold=req.stale_loss_threshold,
-                    stagnation_window=req.stagnation_window,
-                    min_improvement=req.min_improvement,
-                    enable_stale_loss_exit=req.enable_stale_loss_exit,
-                    skip_indicators=True,  # Live sessions use drift-only guards until RSI/BB warmup is resolved
                 )
             finally:
                 try:
@@ -435,8 +424,8 @@ class LiveTradingService:
                     pass
 
         day_result = await loop.run_in_executor(self._executor, _run_session_in_thread)
-        # Handle connect failure reported from the worker thread
-        if not connect_result.get("connected", False):
+        # Handle connect failure reported from the worker thread (market data or broker)
+        if not connect_result.get("connected", False) or connect_result.get("broker_connected") is False:
             with state._lock:
                 state.status = "failed"
                 state.error_message = connect_result.get("error", "Broker connection failed")

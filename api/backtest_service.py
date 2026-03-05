@@ -43,15 +43,28 @@ class BacktestService:
     async def initialize(self):
         """Initialize the backtest service"""
         try:
-            # Initialize the enhanced backtesting engine
-            # Set LOAD_PARQUET_DATA = False to skip historical data (live-trading-only mode)
-            LOAD_PARQUET_DATA = False
-            data_path = "data/processed/parquet_1m" if LOAD_PARQUET_DATA else ""
-            logger.info(f"Initializing Enhanced Backtesting Engine (parquet={'on' if LOAD_PARQUET_DATA else 'off'})...")
-            self.engine = EnhancedBacktestingEngine(data_path)
-            
+            data_path = "data/processed/parquet_1m"
+            logger.info(
+                "Initializing Enhanced Backtesting Engine "
+                "(lazy Parquet loading — data files are read on first request)..."
+            )
+            try:
+                self.engine = EnhancedBacktestingEngine(data_path)
+                available = len(self.engine.available_dates)
+                logger.info(
+                    f"✅ Engine ready — {available} trading date(s) available in Parquet store. "
+                    "No data loaded yet; files will be indexed on first request for each date."
+                )
+            except FileNotFoundError:
+                logger.warning(
+                    f"Parquet data directory '{data_path}' not found. "
+                    "Backtest functionality will be unavailable until the data directory exists. "
+                    "Live trading is unaffected."
+                )
+                self.engine = EnhancedBacktestingEngine("")  # engine with empty available_dates
+
             logger.info("✅ Backtest service initialized successfully")
-            
+
         except Exception as e:
             logger.error(f"Failed to initialize backtest service: {e}")
             raise
@@ -450,7 +463,7 @@ class BacktestService:
                               backtest_id: str) -> BacktestResult:
         """Convert engine result to API format"""
         from enhanced_backtest import StrategyType as ST
-        from delta_strike_selector import IronCondorStrikeSelection
+        from strike_selector import IronCondorStrikeSelection
 
         ss = result.strike_selection
         is_ic = (result.strategy_type == ST.IRON_CONDOR)
@@ -540,7 +553,6 @@ class BacktestService:
                 single_date=request.single_date,
 
                 # Strategy parameters
-                target_delta=0.0,
                 put_distance=0,
                 call_distance=0,
                 spread_width=request.spread_width,

@@ -94,7 +94,7 @@ class MarketDataProvider(ABC):
         Return the raw options chain centred around *center_strike*, spanning
         [center_strike - strike_range, center_strike + strike_range].
 
-        This is the low-level method used by DeltaStrikeSelector for strike
+        This is the low-level method used by StrikeSelector for strike
         selection; it returns data in the raw Parquet / IBKR format rather
         than the normalised format produced by get_options_data().
 

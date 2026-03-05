@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Tuple, Union
 from datetime import datetime, time
 from functools import lru_cache
 import bisect
+import threading
 from loguru import logger
 
 from .parquet_loader import ParquetDataLoader
@@ -26,9 +27,52 @@ class BacktestQueryEngine:
         self._strike_index = {}
         self._atm_index = {}
         self._volume_index = {}
-        
-        # Build indexes on initialization
-        self._build_indexes()
+        self._index_lock = threading.Lock()  # guards concurrent on-demand indexing
+
+        # Indexes are built lazily per date — no upfront loading at startup.
+        # Call _ensure_date_indexed(date_str) before any per-date query.
+
+    def _ensure_date_indexed(self, date_str: str) -> bool:
+        """
+        Ensure a specific date has its indexes built, loading from Parquet on
+        first access.  Safe for concurrent callers (double-checked lock).
+
+        Returns True if the date is now indexed, False if no data found.
+        """
+        # Fast path: already indexed
+        if date_str in self._time_index:
+            return True
+
+        with self._index_lock:
+            # Re-check inside the lock — another thread may have loaded it
+            if date_str in self._time_index:
+                return True
+
+            try:
+                date_obj = pd.to_datetime(date_str)
+            except Exception:
+                return False
+
+            if date_obj not in self.loader.available_dates:
+                return False
+
+            try:
+                spx_data     = self.loader.load_spx_data(date_obj)
+                options_data = self.loader.load_options_data(date_obj)
+
+                if spx_data.empty or options_data.empty:
+                    logger.warning(f"No data found for {date_str}")
+                    return False
+
+                self._build_time_index(date_str, spx_data, options_data)
+                self._build_strike_index(date_str, options_data)
+                self._build_atm_index(date_str, spx_data, options_data)
+                logger.debug(f"Indexed {date_str} on demand")
+                return True
+
+            except Exception as exc:
+                logger.error(f"Failed to index {date_str} on demand: {exc}")
+                return False
     
     def _build_indexes(self):
         """Build optimized indexes for fast querying"""
@@ -110,7 +154,7 @@ class BacktestQueryEngine:
         else:
             date_str = str(date)
         
-        if date_str not in self._time_index:
+        if not self._ensure_date_indexed(date_str):
             return None
         
         # Convert target_time to datetime for comparison
@@ -152,7 +196,7 @@ class BacktestQueryEngine:
         else:
             date_str = str(date)
         
-        if date_str not in self._atm_index:
+        if not self._ensure_date_indexed(date_str):
             return pd.DataFrame()
         
         # Convert target_time to datetime
@@ -214,57 +258,6 @@ class BacktestQueryEngine:
         liquid_options['spread_pct'] = (liquid_options['spread_dollars'] / liquid_options['bid']) * 100
         
         return liquid_options.sort_values('spread_pct')
-    
-    def get_option_by_delta(self, date: Union[str, datetime],
-                          target_time: Union[str, datetime, time],
-                          target_delta: float,
-                          option_type: str = 'call',
-                          tolerance: float = 0.05) -> Optional[pd.Series]:
-        """
-        Find option closest to target delta.
-        
-        Args:
-            date: Trading date
-            target_time: Target time
-            target_delta: Target delta value (0.0 to 1.0 for calls, -1.0 to 0.0 for puts)
-            option_type: 'call' or 'put' (or 'C'/'P')
-            tolerance: Maximum delta difference tolerance
-            
-        Returns:
-            Option data as Series or None
-        """
-        # Normalize option type
-        option_type = option_type.upper()
-        if option_type in ['CALL', 'CALLS']:
-            option_type = 'C'
-        elif option_type in ['PUT', 'PUTS']:
-            option_type = 'P'
-        
-        options_chain = self.loader.get_options_chain_at_time(date, target_time)
-        
-        if options_chain.empty:
-            return None
-        
-        # Filter by option type
-        type_filtered = options_chain[options_chain['right'] == option_type]
-        
-        if type_filtered.empty:
-            return None
-        
-        # Find closest delta (if delta column exists)
-        if 'delta' not in type_filtered.columns:
-            logger.warning("Delta column not found in options data")
-            return None
-        
-        # Calculate delta differences
-        delta_diff = (type_filtered['delta'] - target_delta).abs()
-        closest_idx = delta_diff.idxmin()
-        
-        # Check if within tolerance
-        if delta_diff.loc[closest_idx] <= tolerance:
-            return type_filtered.loc[closest_idx]
-        
-        return None
     
     def get_option_by_moneyness(self, date: Union[str, datetime],
                               target_time: Union[str, datetime, time],
@@ -382,13 +375,11 @@ class BacktestQueryEngine:
 # Convenience function for quick setup
 def create_fast_query_engine(data_path: str = "data/processed/parquet_1m") -> BacktestQueryEngine:
     """
-    Create a fully indexed query engine ready for fast backtesting.
-    
-    Args:
-        data_path: Path to parquet data directory
-        
-    Returns:
-        Configured BacktestQueryEngine with pre-built indexes
+    Create a query engine for backtesting.
+
+    Scans the data directory for available dates at startup (fast — filename
+    only), but does NOT load any Parquet files.  Per-date indexes are built
+    the first time a query is made for that date (lazy / on-demand loading).
     """
     loader = ParquetDataLoader(data_path)
     engine = BacktestQueryEngine(loader)

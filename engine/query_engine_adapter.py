@@ -10,127 +10,10 @@ sys.path.append('.')
 
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 from loguru import logger
 
 from src.data.query_engine import BacktestQueryEngine
-
-
-# ---------------------------------------------------------------------------
-# Black-Scholes helpers
-# ---------------------------------------------------------------------------
-
-RISK_FREE_RATE = 0.045  # 4.5% — approximate Fed funds / short-term Treasury rate
-
-
-def _norm_cdf(x: float) -> float:
-    """Standard normal CDF via error function."""
-    return 0.5 * (1.0 + np.math.erf(x / np.sqrt(2.0)))
-
-
-def _bs_price(S: float, K: float, T: float, r: float, sigma: float,
-              is_call: bool) -> float:
-    """Black-Scholes price for a European option."""
-    if T <= 0 or sigma <= 0:
-        # At expiry: intrinsic value only
-        if is_call:
-            return max(S - K, 0.0)
-        return max(K - S, 0.0)
-
-    sqrt_T = np.sqrt(T)
-    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * sqrt_T)
-    d2 = d1 - sigma * sqrt_T
-
-    if is_call:
-        return S * _norm_cdf(d1) - K * np.exp(-r * T) * _norm_cdf(d2)
-    return K * np.exp(-r * T) * _norm_cdf(-d2) - S * _norm_cdf(-d1)
-
-
-def _bs_delta(S: float, K: float, T: float, r: float, sigma: float,
-              is_call: bool) -> float:
-    """Black-Scholes delta."""
-    if T <= 0 or sigma <= 0:
-        if is_call:
-            return 1.0 if S > K else 0.0
-        return -1.0 if S < K else 0.0
-
-    sqrt_T = np.sqrt(T)
-    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * sqrt_T)
-
-    if is_call:
-        return _norm_cdf(d1)
-    return _norm_cdf(d1) - 1.0  # negative for puts
-
-
-def _implied_vol(S: float, K: float, T: float, r: float,
-                 market_price: float, is_call: bool,
-                 tol: float = 1e-6, max_iter: int = 100) -> Optional[float]:
-    """
-    Solve for implied volatility using Newton-Raphson.
-    Returns None if no solution is found (e.g. price below intrinsic).
-    """
-    # Check that market_price is above intrinsic — otherwise IV is undefined
-    intrinsic = max(S - K, 0.0) if is_call else max(K - S, 0.0)
-    if market_price <= intrinsic + 1e-8:
-        return None
-
-    # Initial guess: simple Brenner-Subrahmanyam approximation
-    sigma = np.sqrt(2 * abs(np.log(S / K)) / T) if T > 0 else 0.2
-    sigma = max(sigma, 0.01)
-
-    for _ in range(max_iter):
-        price = _bs_price(S, K, T, r, sigma, is_call)
-        # Vega = S * sqrt(T) * N'(d1)
-        sqrt_T = np.sqrt(T)
-        d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * sqrt_T)
-        vega = S * sqrt_T * np.exp(-0.5 * d1 ** 2) / np.sqrt(2 * np.pi)
-
-        if abs(vega) < 1e-10:
-            break
-
-        diff = price - market_price
-        if abs(diff) < tol:
-            break
-
-        sigma -= diff / vega
-        if sigma <= 0:
-            sigma = 1e-4  # clamp before next iteration
-
-    if sigma <= 0 or sigma > 20:  # sanity check
-        return None
-    return sigma
-
-
-def _compute_bs_delta(S: float, K: float, T: float, r: float,
-                      mid_price: float, is_call: bool) -> float:
-    """
-    Compute Black-Scholes delta by first solving for IV, then computing delta.
-    Falls back to a sign-correct zero if IV cannot be solved.
-    """
-    if mid_price <= 0 or S <= 0 or K <= 0 or T < 0:
-        return 0.0
-
-    iv = _implied_vol(S, K, T, r, mid_price, is_call)
-    if iv is None:
-        return 0.0
-
-    return _bs_delta(S, K, T, r, iv, is_call)
-
-
-def _time_to_expiry_years(timestamp_str: str, expiration_str: str) -> float:
-    """
-    Fraction of a year from timestamp to market close (4 PM ET) on expiration date.
-    Minimum floor of 1 minute to avoid division-by-zero at the final bar.
-    """
-    try:
-        ts = datetime.strptime(timestamp_str, "%H:%M:%S")
-        market_close = datetime.strptime("16:00:00", "%H:%M:%S")
-        minutes_remaining = max((market_close - ts).total_seconds() / 60.0, 1.0)
-        # Trading year ≈ 252 days × 390 minutes/day
-        return minutes_remaining / (252 * 390)
-    except Exception:
-        return 1.0 / 252  # fallback: ~1 trading day
 
 
 # ---------------------------------------------------------------------------
@@ -187,8 +70,9 @@ class EnhancedQueryEngineAdapter:
 
     def get_options_data(self, date: str, timestamp: str) -> Optional[pd.DataFrame]:
         """
-        Get options data with Black-Scholes delta computed from bid/ask mid-price.
-        Filters out zero-bid rows (illiquid / pre-open quotes).
+        Get options chain at the given timestamp.
+        Returns strike, option_type, expiration, bid, ask for all liquid options.
+        Filters out rows with no valid ask (illiquid / pre-open quotes).
         """
         try:
             spx_price = self.query_engine.get_fastest_spx_price(date, timestamp)
@@ -202,7 +86,6 @@ class EnhancedQueryEngineAdapter:
             if options_chain is None or len(options_chain) == 0:
                 return None
 
-            T = _time_to_expiry_years(timestamp, date)
             options_list = []
 
             for _, row in options_chain.iterrows():
@@ -214,35 +97,19 @@ class EnhancedQueryEngineAdapter:
                     continue
 
                 right_value = str(row.get('right', 'C')).upper()
-                is_call = right_value in ('C', 'CALL')
-                option_type = 'call' if is_call else 'put'
+                option_type = 'call' if right_value in ('C', 'CALL') else 'put'
 
                 strike = float(row.get('strike', 0))
                 if strike <= 0:
                     continue
 
-                mid_price = (bid + ask) / 2.0
-
-                delta = _compute_bs_delta(
-                    S=spx_price,
-                    K=strike,
-                    T=T,
-                    r=RISK_FREE_RATE,
-                    mid_price=mid_price,
-                    is_call=is_call
-                )
-
                 options_list.append({
-                    'strike': strike,
+                    'strike':      strike,
                     'option_type': option_type,
-                    'expiration': date,
-                    'bid': bid,
-                    'ask': ask,
-                    'delta': delta,
-                    'gamma': row.get('gamma', 0),
-                    'theta': row.get('theta', 0),
-                    'vega': row.get('vega', 0),
-                    'volume': row.get('volume', 0)
+                    'expiration':  date,
+                    'bid':         bid,
+                    'ask':         ask,
+                    'volume':      row.get('volume', 0),
                 })
 
             if options_list:

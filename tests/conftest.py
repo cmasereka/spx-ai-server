@@ -165,9 +165,7 @@ def assert_valid_strike_selection(strike_selection, spx_price: float):
     assert strike_selection.short_strike > 0
     assert strike_selection.long_strike > 0
     assert strike_selection.spread_width > 0
-    assert -1 <= strike_selection.short_delta <= 1
-    assert 0 <= strike_selection.short_prob_itm <= 1
-    
+
     # Strikes should be reasonable relative to SPX price
     assert abs(strike_selection.short_strike - spx_price) < spx_price * 0.2  # Within 20%
     assert abs(strike_selection.long_strike - spx_price) < spx_price * 0.2

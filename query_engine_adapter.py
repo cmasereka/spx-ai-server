@@ -1,8 +1,3 @@
 # Compatibility shim — re-exports everything from engine.query_engine_adapter
 from engine.query_engine_adapter import *  # noqa: F401, F403
-from engine.query_engine_adapter import (
-    EnhancedQueryEngineAdapter,
-    RISK_FREE_RATE,
-    _time_to_expiry_years,
-    _compute_bs_delta,
-)
+from engine.query_engine_adapter import EnhancedQueryEngineAdapter

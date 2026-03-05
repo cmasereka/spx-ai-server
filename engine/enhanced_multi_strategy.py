@@ -20,7 +20,7 @@ from engine.enhanced_backtest import (
     EnhancedBacktestResult, TechnicalAnalyzer, StrategySelector,
     EnhancedMultiStrategyBacktester, IronCondorLegStatus, DayBacktestResult
 )
-from engine.delta_strike_selector import DeltaStrikeSelector, PositionMonitor, IntradayPositionMonitor, StrikeSelection, IronCondorStrikeSelection
+from engine.strike_selector import StrikeSelector, IntradayPositionMonitor, StrikeSelection, IronCondorStrikeSelection
 from engine.query_engine_adapter import EnhancedQueryEngineAdapter
 
 
@@ -28,7 +28,7 @@ from engine.query_engine_adapter import EnhancedQueryEngineAdapter
 ENTRY_SCAN_START    = "10:00:00"   # Wait 30 min for opening volatility to settle
 LAST_ENTRY_TIME     = "14:00:00"   # No new entries at or after 2 PM
 FINAL_EXIT_TIME     = "16:00:00"   # Hold to expiry (market close)
-MIN_DISTANCE_IC     = 50.0         # IC short strike must be >= $50 away from SPX
+MIN_DISTANCE_IC     = 25.0         # IC short strike must be >= $25 away from SPX
 MIN_DISTANCE_SPREAD = 25.0         # Single spread short strike must be >= $25 away from SPX
 
 # Trend filter
@@ -86,8 +86,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
         super().__init__(data_path)
         # Wrap query engine with enhanced adapter
         self.enhanced_query_engine = EnhancedQueryEngineAdapter(self.query_engine)
-        self.delta_selector = DeltaStrikeSelector(self.enhanced_query_engine, self.ic_loader)
-        self.position_monitor = PositionMonitor(self.enhanced_query_engine, self.strategy_builder)
+        self.strike_selector = StrikeSelector(self.enhanced_query_engine, self.ic_loader)
         self.intraday_monitor = IntradayPositionMonitor(self.enhanced_query_engine, self.strategy_builder)
 
     # ------------------------------------------------------------------
@@ -121,8 +120,6 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
 
     def backtest_day_intraday(self,
                               date: str,
-                              target_delta: float = 0.15,
-                              target_prob_itm: float = 0.15,
                               min_spread_width: int = 10,
                               take_profit: float = 0.10,
                               stop_loss: float = 2.0,
@@ -138,7 +135,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                               stagnation_window: int = 30,
                               min_improvement: float = 0.05,
                               enable_stale_loss_exit: bool = False,
-                              skip_indicators: bool = False) -> DayBacktestResult:
+                              skip_indicators: bool = True) -> DayBacktestResult:
         """
         Full intraday scan loop for one trading day.
         strategy_mode controls which entry types are allowed:
@@ -146,1069 +143,37 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
           credit_spreads    — put/call spreads only
           ic_credit_spreads — all types
 
-        skip_indicators: when True, bypasses RSI/BB analysis entirely and uses
-          only drift-from-open guards for entry decisions. Useful for live sessions
-          where price history hasn't accumulated yet. Indicators will be added back
-          once the warmup period issue is resolved.
-
-        entry_start_time: first bar at which entries are considered (default 10:00:00)
-        last_entry_time:  no new entries at or after this time (default 14:00:00)
+        Delegates to LiveTradingLoop(is_live=False) so that all guard and
+        entry logic is shared with the live trading path.  Import is done
+        inside the method body to avoid the circular import that would occur
+        if live_trading_loop.py were imported at module level (it imports
+        from this module).
         """
-        logger.info(
-            f"Intraday scan: {date} | mode={strategy_mode} credit={target_credit} "
-            f"contracts={quantity} tp={take_profit} sl={stop_loss} interval={monitor_interval}m "
-            f"entry_window={entry_start_time}–{last_entry_time} "
-            f"stale_loss={'ON' if enable_stale_loss_exit else 'OFF'}"
-            + (f" ({stale_loss_minutes}m×{stale_loss_threshold}× stagnation={stagnation_window}m/${min_improvement})"
-               if enable_stale_loss_exit else "")
+        # Import inside body to break circular import:
+        # live_trading_loop.py imports EnhancedBacktestingEngine from this module.
+        from trading.live_trading_loop import LiveTradingLoop, TradingDayConfig
+        cfg = TradingDayConfig(
+            strategy_mode          = strategy_mode,
+            target_credit          = target_credit,
+            spread_width           = min_spread_width,
+            quantity               = quantity,
+            take_profit            = take_profit,
+            stop_loss              = stop_loss,
+            monitor_interval       = monitor_interval,
+            entry_start_time       = entry_start_time,
+            last_entry_time        = last_entry_time,
+            enable_stale_loss_exit = enable_stale_loss_exit,
+            stale_loss_minutes     = stale_loss_minutes,
+            stale_loss_threshold   = stale_loss_threshold,
+            stagnation_window      = stagnation_window,
+            min_improvement        = min_improvement,
+            skip_indicators        = skip_indicators,
         )
+        loop = LiveTradingLoop(engine=self, is_live=False)
+        return loop.run_day(date=date, config=cfg, progress_callback=progress_callback)
 
-        scan_times = _build_minute_grid(date, entry_start_time, FINAL_EXIT_TIME)
-        trades: List[EnhancedBacktestResult] = []
-
-        def _fire(event: dict):
-            """Invoke progress_callback safely — never let it crash the backtest."""
-            if progress_callback:
-                try:
-                    progress_callback(event)
-                except Exception as _cb_err:
-                    logger.error(f"progress_callback error: {_cb_err}")
-
-        # For live/paper sessions: warn if all scan bars are already in the past.
-        # This happens when the session is started after market close or on a
-        # non-trading day — the loop will iterate instantly with no real waits.
-        try:
-            from datetime import datetime as _dt
-            _now_time = _dt.now().strftime("%H:%M:%S")
-            if date == _dt.now().strftime("%Y-%m-%d") and _now_time >= FINAL_EXIT_TIME:
-                logger.warning(
-                    f"Session started after market close ({_now_time} >= {FINAL_EXIT_TIME}) "
-                    f"for date {date}. All scan bars are in the past — the scan will complete "
-                    f"instantly with 0 trades. Start the session before {FINAL_EXIT_TIME} on a "
-                    f"trading day."
-                )
-        except Exception:
-            pass
-
-        if date not in self.available_dates:
-            # Also accept dates the currently-injected provider knows about.
-            # This is essential for live trading: the engine's cached available_dates
-            # only covers historical Parquet data; the live IBKR provider returns
-            # today's date via its own available_dates property.
-            provider_dates = getattr(self.enhanced_query_engine, 'available_dates', None) or []
-            if date not in provider_dates:
-                logger.warning(
-                    f"Date {date} not found in Parquet dataset or injected provider — skipping. "
-                    f"Parquet has {len(self.available_dates)} dates "
-                    f"(latest: {self.available_dates[-1] if self.available_dates else 'none'}). "
-                    f"Provider dates: {provider_dates}"
-                )
-                return DayBacktestResult(date=date, trades=[], total_pnl=0.0,
-                                         trade_count=0, scan_minutes_checked=0)
-
-        # Fetch opening SPX price for daily-drift guards.
-        # Try several early bars; keep as None (not 0) so the guard stays
-        # disabled rather than computing a nonsense drift if all fail.
-        # The scan loop will latch the first valid entry_spx if still None.
-        spx_open: Optional[float] = None
-        for _t in ("09:30:00", "09:31:00", "09:32:00", "09:35:00"):
-            _p = self.enhanced_query_engine.get_fastest_spx_price(date, _t)
-            if _p and _p > 0:
-                spx_open = float(_p)
-                break
-        logger.debug(f"Drift guard: SPX open = {spx_open}")
-
-        # Sticky drift flags — once set True they stay True for the whole day.
-        # Only the dangerous-side spread is blocked; the safe side stays open.
-        #   Large DOWN move → block call spreads (mean-reversion bounce risk)
-        #   Large UP move   → block put spreads  (mean-reversion pullback risk)
-        #   Extreme move (either dir) → block IC
-        _put_spread_ever_blocked  = False   # latched True on large UP drift
-        _call_spread_ever_blocked = False   # latched True on large DOWN drift
-        _ic_ever_blocked          = False   # latched True on extreme drift (either direction)
-        _call_blocked_latch_time  = None    # HH:MM:SS when call_spread block first latched
-        # Intraday reversal tracking: peak positive / peak negative drift seen so
-        # far today.  If the market has reversed sharply from an intraday extreme,
-        # selling against the new direction carries elevated volatility risk.
-        _intraday_max_drift       = 0.0    # highest drift reached today
-        _intraday_min_drift       = 0.0    # lowest drift reached today
-
-        # Pre-scan drift check: evaluate every bar from 09:31 up to (but not
-        # including) ENTRY_SCAN_START so that the sticky flags are already
-        # latched correctly when the first entry bar is evaluated.
-        # This matters when ENTRY_SCAN_START > 09:35 — without this, a large
-        # opening move that crosses the threshold before 10:00 would be invisible
-        # to the guards at the first entry bar.
-        if spx_open and spx_open > 0:
-            pre_scan_times = _build_minute_grid(date, "09:31:00", entry_start_time)
-            # Exclude the first bar of the actual scan to avoid double-counting
-            pre_scan_times = [t for t in pre_scan_times if t < entry_start_time]
-            for _pt in pre_scan_times:
-                _pp = self.enhanced_query_engine.get_fastest_spx_price(date, _pt)
-                if not _pp or _pp <= 0:
-                    continue
-                _pre_drift = float(_pp) - spx_open
-                if _pre_drift >= DRIFT_BLOCK_POINTS:         # large UP → block put spreads
-                    _put_spread_ever_blocked = True
-                if _pre_drift <= -DRIFT_BLOCK_POINTS:        # large DOWN → block call spreads
-                    if not _call_spread_ever_blocked:
-                        _call_blocked_latch_time = _pt   # record when it first latched
-                    _call_spread_ever_blocked = True
-                if abs(_pre_drift) >= DRIFT_IC_BLOCK_POINTS:  # extreme → block IC
-                    _ic_ever_blocked = True
-                # Track intraday extremes during the pre-scan window too
-                _intraday_max_drift = max(_intraday_max_drift, _pre_drift)
-                _intraday_min_drift = min(_intraday_min_drift, _pre_drift)
-            logger.debug(
-                f"Pre-scan drift check complete: put_blocked={_put_spread_ever_blocked} "
-                f"call_blocked={_call_spread_ever_blocked} ic_blocked={_ic_ever_blocked}"
-            )
-
-        # Build a per-run monitor with the request's risk params
-        monitor = IntradayPositionMonitor(
-            self.enhanced_query_engine,
-            self.strategy_builder,
-            take_profit=take_profit,
-            stop_loss=stop_loss,
-            monitor_interval=monitor_interval,
-            stale_loss_minutes=stale_loss_minutes,
-            stale_loss_threshold=stale_loss_threshold,
-            stagnation_window=stagnation_window,
-            min_improvement=min_improvement,
-        )
-
-        # Open position slots
-        open_put_spread  = None
-        open_call_spread = None
-        open_ic          = None
-        ic_leg_status    = None
-        ic_entry_meta    = {}
-        put_spread_meta  = {}
-        call_spread_meta = {}
-
-        # Track whether a call spread was opened at any point today.
-        # Used to prevent re-entry on a declining day after the first call spread closes.
-        _had_call_spread_today = False
-
-        # Track whether a call spread closed with a profit today.
-        # Used to prevent entering a put spread after a winning CS on an up/flat day
-        # (the CS win is enough premium for the day; a subsequent PS risks giving it back).
-        _had_call_spread_win_today = False
-
-        # Track whether a put spread closed with a profit today.
-        # Used to prevent entering a call spread after a winning PS on a declining day
-        # (the PS win is enough premium for the day; a subsequent CS bets against an
-        # already-falling market with low RSI, which is extremely risky).
-        _had_put_spread_win_today = False
-
-        # Checkpoint lists — built up while a position is open, flushed on close
-        ic_checkpoints        : list = []
-        put_spread_checkpoints: list = []
-        call_spread_checkpoints: list = []
-
-        for bar_index, current_time in enumerate(scan_times):
-            is_past_entry_cutoff = current_time >= last_entry_time
-            is_final_bar         = current_time >= FINAL_EXIT_TIME
-
-            # Respect monitor_interval; always process the final bar for the hard close.
-            is_check_bar = (bar_index % monitor_interval == 0) or is_final_bar
-
-            # Pace the loop to wall-clock time for real-time (live/paper) sessions.
-            # RealtimeMarketDataProvider._wait_for_bar() blocks until the bar minute
-            # has elapsed; for historical simulations this is a fast dictionary lookup.
-            # This call must be unconditional so the wait fires even on bars where no
-            # position is open and the entry window has closed (otherwise those bars
-            # iterate instantly and the session appears to end immediately).
-            _bar_spx = self.enhanced_query_engine.get_fastest_spx_price(date, current_time)
-
-            _drift_from_open = (_bar_spx - spx_open) if (_bar_spx and spx_open) else None
-            _drift_str = f" drift={_drift_from_open:+.1f}" if _drift_from_open is not None else ""
-
-            _pos_parts = []
-            if open_ic:
-                _pos_parts.append(f"IC=open(entry={ic_entry_meta.get('entry_time', '?')})")
-            if open_put_spread:
-                _pos_parts.append(f"put=open(entry={put_spread_meta.get('entry_time', '?')})")
-            if open_call_spread:
-                _pos_parts.append(f"call=open(entry={call_spread_meta.get('entry_time', '?')})")
-            _pos_str = " | ".join(_pos_parts) if _pos_parts else "no position open"
-
-            _phase = "FINAL-BAR" if is_final_bar else ("past-entry [monitoring only]" if is_past_entry_cutoff else "entry-window")
-            logger.info(
-                f"Bar {current_time} | "
-                f"SPX={f'{_bar_spx:.2f}' if _bar_spx else 'N/A'}{_drift_str} | "
-                f"{_pos_str} | {_phase}"
-            )
-
-            # --- 1. Monitor IC legs independently ---
-            if open_ic is not None and ic_leg_status is not None and is_check_bar:
-                ic_leg_status = monitor.check_ic_leg_decay(
-                    open_ic, date, current_time, ic_leg_status
-                )
-
-                # Snapshot this bar
-                ic_entry_credit = getattr(open_ic, 'entry_credit', 0)
-                ic_quantity = getattr(open_ic, 'quantity', 1)
-                spx_now = self.enhanced_query_engine.get_fastest_spx_price(date, current_time) or 0
-
-                if is_final_bar:
-                    # Use intrinsic settlement values at expiry
-                    raw_put  = self._expiry_exit_cost(open_ic, StrategyType.PUT_SPREAD,  spx_now)
-                    raw_call = self._expiry_exit_cost(open_ic, StrategyType.CALL_SPREAD, spx_now)
-                    # Force both sides closed at intrinsic cost
-                    if not ic_leg_status.put_side_closed:
-                        ic_leg_status.put_side_closed = True
-                        ic_leg_status.put_side_exit_time = current_time
-                        ic_leg_status.put_side_exit_cost = raw_put
-                        ic_leg_status.put_side_exit_reason = "Expired at market close"
-                    if not ic_leg_status.call_side_closed:
-                        ic_leg_status.call_side_closed = True
-                        ic_leg_status.call_side_exit_time = current_time
-                        ic_leg_status.call_side_exit_cost = raw_call
-                        ic_leg_status.call_side_exit_reason = "Expired at market close"
-                else:
-                    try:
-                        _, _, raw_put, raw_call = monitor._check_ic_leg_decay_values(open_ic)
-                    except Exception:
-                        raw_put, raw_call = 0.0, 0.0
-
-                put_cost_ps  = round(raw_put  / (100.0 * ic_quantity), 4)
-                call_cost_ps = round(raw_call / (100.0 * ic_quantity), 4)
-                total_cost_ps   = round((put_cost_ps + call_cost_ps), 4)
-                entry_credit_ps = round(ic_entry_credit / (100.0 * ic_quantity), 4)
-                ic_checkpoints.append({
-                    "time": current_time,
-                    "spx": round(spx_now, 2),
-                    "cost_per_share": total_cost_ps,
-                    "pnl_per_share": round(entry_credit_ps - total_cost_ps, 4),
-                    "put_cost_per_share": put_cost_ps,
-                    "call_cost_per_share": call_cost_ps,
-                })
-                _fire({
-                    'event': 'monitor_tick',
-                    'strategy_type': 'Iron Condor',
-                    'entry_time': ic_entry_meta.get('entry_time', ''),
-                    'time': current_time,
-                    'spx': round(spx_now, 2),
-                    'pnl_per_share': round(entry_credit_ps - total_cost_ps, 4),
-                    'entry_credit_per_share': entry_credit_ps,
-                })
-
-                # Stale-loss check per IC leg (skip the hard-close final bar)
-                if enable_stale_loss_exit and not is_final_bar:
-                    put_credit_ps, call_credit_ps = monitor._get_ic_side_entry_credits(open_ic, ic_quantity)
-                    if not ic_leg_status.put_side_closed:
-                        stale, stale_reason = monitor.check_stale_loss(
-                            ic_checkpoints, put_credit_ps, cost_key="put_cost_per_share"
-                        )
-                        if stale:
-                            ic_leg_status.put_side_closed = True
-                            ic_leg_status.put_side_exit_time = current_time
-                            ic_leg_status.put_side_exit_cost = raw_put
-                            ic_leg_status.put_side_exit_reason = stale_reason
-                            logger.info(f"IC put-side stale-loss exit at {current_time}: {stale_reason}")
-                    if not ic_leg_status.call_side_closed:
-                        stale, stale_reason = monitor.check_stale_loss(
-                            ic_checkpoints, call_credit_ps, cost_key="call_cost_per_share"
-                        )
-                        if stale:
-                            ic_leg_status.call_side_closed = True
-                            ic_leg_status.call_side_exit_time = current_time
-                            ic_leg_status.call_side_exit_cost = raw_call
-                            ic_leg_status.call_side_exit_reason = stale_reason
-                            logger.info(f"IC call-side stale-loss exit at {current_time}: {stale_reason}")
-
-                # If both sides closed → finalize IC trade
-                if ic_leg_status.put_side_closed and ic_leg_status.call_side_closed:
-                    total_exit_cost = ic_leg_status.put_side_exit_cost + ic_leg_status.call_side_exit_cost
-                    entry_credit = ic_entry_credit
-                    pnl = entry_credit - total_exit_cost
-                    pnl_pct = (pnl / entry_credit * 100) if entry_credit > 0 else 0
-                    exit_spx = spx_now or ic_entry_meta.get('entry_spx', 0)
-                    later_side_time = max(
-                        ic_leg_status.put_side_exit_time or "00:00:00",
-                        ic_leg_status.call_side_exit_time or "00:00:00"
-                    )
-                    _ic_entry_spx = ic_entry_meta.get('entry_spx', 0)
-                    ic_exit_rationale = {
-                        'exit_trigger': 'IC both sides closed (decay threshold)',
-                        'put_side_exit_time': ic_leg_status.put_side_exit_time,
-                        'put_side_exit_reason': ic_leg_status.put_side_exit_reason,
-                        'call_side_exit_time': ic_leg_status.call_side_exit_time,
-                        'call_side_exit_reason': ic_leg_status.call_side_exit_reason,
-                        'put_side_exit_cost': round(ic_leg_status.put_side_exit_cost, 2),
-                        'call_side_exit_cost': round(ic_leg_status.call_side_exit_cost, 2),
-                        'total_exit_cost': round(total_exit_cost, 2),
-                        'entry_credit': round(entry_credit, 2),
-                        'spx_at_exit': round(exit_spx, 2),
-                        'spx_move_since_entry': round(exit_spx - _ic_entry_spx, 2) if _ic_entry_spx else None,
-                        'pnl': round(pnl, 2),
-                        'pnl_pct': round(pnl_pct, 2),
-                    }
-                    trades.append(EnhancedBacktestResult(
-                        date=date,
-                        strategy_type=StrategyType.IRON_CONDOR,
-                        market_signal=ic_entry_meta.get('market_signal', MarketSignal.NEUTRAL),
-                        entry_time=ic_entry_meta.get('entry_time', current_time),
-                        exit_time=later_side_time,
-                        exit_reason="IC both sides closed",
-                        entry_spx_price=_ic_entry_spx,
-                        exit_spx_price=exit_spx,
-                        technical_indicators=ic_entry_meta.get('indicators', TechnicalIndicators(0,0,0,0,0,0,0,0.5)),
-                        strike_selection=ic_entry_meta.get('strike_selection', StrikeSelection(0,0,0,0,0)),
-                        entry_credit=entry_credit,
-                        exit_cost=total_exit_cost,
-                        pnl=pnl,
-                        pnl_pct=pnl_pct,
-                        max_profit=getattr(open_ic, 'max_profit', entry_credit),
-                        max_loss=getattr(open_ic, 'max_loss', -total_exit_cost),
-                        monitoring_points=ic_checkpoints,
-                        success=True,
-                        confidence=ic_entry_meta.get('confidence', 0),
-                        notes=ic_entry_meta.get('notes', ''),
-                        entry_rationale=ic_entry_meta.get('entry_rationale'),
-                        exit_rationale=ic_exit_rationale,
-                        ic_leg_status=ic_leg_status
-                    ))
-                    _closed_strategy = open_ic
-                    open_ic = None
-                    ic_leg_status = None
-                    ic_entry_meta = {}
-                    ic_checkpoints = []
-                    _fire({'event': 'position_closed', 'strategy_type': 'Iron Condor',
-                           'result': trades[-1], 'strategy_obj': _closed_strategy})
-
-            # --- 2. Monitor put spread ---
-            if open_put_spread is not None and is_check_bar:
-                should_exit, current_cost, reason = monitor.check_decay_at_time(
-                    open_put_spread, StrategyType.PUT_SPREAD, date, current_time
-                )
-
-                # At final bar use intrinsic settlement value, not stale market price
-                spx_now = self.enhanced_query_engine.get_fastest_spx_price(date, current_time) or 0
-                if is_final_bar:
-                    current_cost = self._expiry_exit_cost(open_put_spread, StrategyType.PUT_SPREAD, spx_now)
-                    should_exit = True
-                    reason = "Expired at market close"
-
-                # Snapshot this bar
-                ps_entry_credit = getattr(open_put_spread, 'entry_credit', 0)
-                ps_quantity = getattr(open_put_spread, 'quantity', 1)
-                entry_credit_ps = round(ps_entry_credit / (100.0 * ps_quantity), 4)
-                cost_ps = round(current_cost / (100.0 * ps_quantity), 4)
-                put_spread_checkpoints.append({
-                    "time": current_time,
-                    "spx": round(spx_now, 2),
-                    "cost_per_share": cost_ps,
-                    "pnl_per_share": round(entry_credit_ps - cost_ps, 4),
-                })
-                _fire({
-                    'event': 'monitor_tick',
-                    'strategy_type': 'Put Spread',
-                    'entry_time': put_spread_meta.get('entry_time', current_time),
-                    'time': current_time,
-                    'spx': round(spx_now, 2),
-                    'pnl_per_share': round(entry_credit_ps - cost_ps, 4),
-                    'entry_credit_per_share': entry_credit_ps,
-                })
-
-                # Stale-loss check (skip regular take-profit / stop-loss hits and final bar)
-                if enable_stale_loss_exit and not is_final_bar and not should_exit:
-                    stale, stale_reason = monitor.check_stale_loss(put_spread_checkpoints, entry_credit_ps)
-                    if stale:
-                        should_exit = True
-                        reason = stale_reason
-                        logger.info(f"Put spread stale-loss exit at {current_time}: {stale_reason}")
-
-                if should_exit or is_final_bar:
-                    exit_reason = reason if should_exit else "Expired at market close"
-                    entry_credit = ps_entry_credit
-                    pnl = entry_credit - current_cost
-                    pnl_pct = (pnl / entry_credit * 100) if entry_credit > 0 else 0
-                    exit_spx = spx_now or put_spread_meta.get('entry_spx', 0)
-                    _ps_entry_spx = put_spread_meta.get('entry_spx', 0)
-                    ps_exit_rationale = {
-                        'exit_trigger': exit_reason,
-                        'exit_cost': round(current_cost, 2),
-                        'entry_credit': round(entry_credit, 2),
-                        'spx_at_exit': round(exit_spx, 2),
-                        'spx_move_since_entry': round(exit_spx - _ps_entry_spx, 2) if _ps_entry_spx else None,
-                        'pnl': round(pnl, 2),
-                        'pnl_pct': round(pnl_pct, 2),
-                    }
-                    trades.append(EnhancedBacktestResult(
-                        date=date,
-                        strategy_type=StrategyType.PUT_SPREAD,
-                        market_signal=put_spread_meta.get('market_signal', MarketSignal.BULLISH),
-                        entry_time=put_spread_meta.get('entry_time', current_time),
-                        exit_time=current_time,
-                        exit_reason=exit_reason,
-                        entry_spx_price=_ps_entry_spx,
-                        exit_spx_price=exit_spx,
-                        technical_indicators=put_spread_meta.get('indicators', TechnicalIndicators(0,0,0,0,0,0,0,0.5)),
-                        strike_selection=put_spread_meta.get('strike_selection', StrikeSelection(0,0,0,0,0)),
-                        entry_credit=entry_credit,
-                        exit_cost=current_cost,
-                        pnl=pnl,
-                        pnl_pct=pnl_pct,
-                        max_profit=getattr(open_put_spread, 'max_profit', entry_credit),
-                        max_loss=getattr(open_put_spread, 'max_loss', -current_cost),
-                        monitoring_points=put_spread_checkpoints,
-                        success=True,
-                        confidence=put_spread_meta.get('confidence', 0),
-                        notes=put_spread_meta.get('notes', ''),
-                        entry_rationale=put_spread_meta.get('entry_rationale'),
-                        exit_rationale=ps_exit_rationale,
-                    ))
-                    _closed_strategy = open_put_spread
-                    open_put_spread = None
-                    put_spread_meta = {}
-                    put_spread_checkpoints = []
-                    # Latch win flag for post-PS call spread guard
-                    if pnl > 0:
-                        _had_put_spread_win_today = True
-                    _fire({'event': 'position_closed', 'strategy_type': 'Put Spread',
-                           'result': trades[-1], 'strategy_obj': _closed_strategy})
-
-            # --- 3. Monitor call spread ---
-            if open_call_spread is not None and is_check_bar:
-                should_exit, current_cost, reason = monitor.check_decay_at_time(
-                    open_call_spread, StrategyType.CALL_SPREAD, date, current_time
-                )
-
-                # At final bar use intrinsic settlement value, not stale market price
-                spx_now = self.enhanced_query_engine.get_fastest_spx_price(date, current_time) or 0
-                if is_final_bar:
-                    current_cost = self._expiry_exit_cost(open_call_spread, StrategyType.CALL_SPREAD, spx_now)
-                    should_exit = True
-                    reason = "Expired at market close"
-
-                # Snapshot this bar
-                cs_entry_credit = getattr(open_call_spread, 'entry_credit', 0)
-                cs_quantity = getattr(open_call_spread, 'quantity', 1)
-                entry_credit_ps = round(cs_entry_credit / (100.0 * cs_quantity), 4)
-                cost_ps = round(current_cost / (100.0 * cs_quantity), 4)
-                call_spread_checkpoints.append({
-                    "time": current_time,
-                    "spx": round(spx_now, 2),
-                    "cost_per_share": cost_ps,
-                    "pnl_per_share": round(entry_credit_ps - cost_ps, 4),
-                })
-                _fire({
-                    'event': 'monitor_tick',
-                    'strategy_type': 'Call Spread',
-                    'entry_time': call_spread_meta.get('entry_time', current_time),
-                    'time': current_time,
-                    'spx': round(spx_now, 2),
-                    'pnl_per_share': round(entry_credit_ps - cost_ps, 4),
-                    'entry_credit_per_share': entry_credit_ps,
-                })
-
-                # Stale-loss check (skip regular take-profit / stop-loss hits and final bar)
-                if enable_stale_loss_exit and not is_final_bar and not should_exit:
-                    stale, stale_reason = monitor.check_stale_loss(call_spread_checkpoints, entry_credit_ps)
-                    if stale:
-                        should_exit = True
-                        reason = stale_reason
-                        logger.info(f"Call spread stale-loss exit at {current_time}: {stale_reason}")
-
-                if should_exit or is_final_bar:
-                    exit_reason = reason if should_exit else "Expired at market close"
-                    entry_credit = cs_entry_credit
-                    pnl = entry_credit - current_cost
-                    pnl_pct = (pnl / entry_credit * 100) if entry_credit > 0 else 0
-                    exit_spx = spx_now or call_spread_meta.get('entry_spx', 0)
-                    _cs_entry_spx = call_spread_meta.get('entry_spx', 0)
-                    cs_exit_rationale = {
-                        'exit_trigger': exit_reason,
-                        'exit_cost': round(current_cost, 2),
-                        'entry_credit': round(entry_credit, 2),
-                        'spx_at_exit': round(exit_spx, 2),
-                        'spx_move_since_entry': round(exit_spx - _cs_entry_spx, 2) if _cs_entry_spx else None,
-                        'pnl': round(pnl, 2),
-                        'pnl_pct': round(pnl_pct, 2),
-                    }
-                    trades.append(EnhancedBacktestResult(
-                        date=date,
-                        strategy_type=StrategyType.CALL_SPREAD,
-                        market_signal=call_spread_meta.get('market_signal', MarketSignal.BEARISH),
-                        entry_time=call_spread_meta.get('entry_time', current_time),
-                        exit_time=current_time,
-                        exit_reason=exit_reason,
-                        entry_spx_price=_cs_entry_spx,
-                        exit_spx_price=exit_spx,
-                        technical_indicators=call_spread_meta.get('indicators', TechnicalIndicators(0,0,0,0,0,0,0,0.5)),
-                        strike_selection=call_spread_meta.get('strike_selection', StrikeSelection(0,0,0,0,0)),
-                        entry_credit=entry_credit,
-                        exit_cost=current_cost,
-                        pnl=pnl,
-                        pnl_pct=pnl_pct,
-                        max_profit=getattr(open_call_spread, 'max_profit', entry_credit),
-                        max_loss=getattr(open_call_spread, 'max_loss', -current_cost),
-                        monitoring_points=call_spread_checkpoints,
-                        success=True,
-                        confidence=call_spread_meta.get('confidence', 0),
-                        notes=call_spread_meta.get('notes', ''),
-                        entry_rationale=call_spread_meta.get('entry_rationale'),
-                        exit_rationale=cs_exit_rationale,
-                    ))
-                    _closed_strategy = open_call_spread
-                    open_call_spread = None
-                    call_spread_meta = {}
-                    call_spread_checkpoints = []
-                    # Latch win flag for post-CS put spread guard
-                    if pnl > 0:
-                        _had_call_spread_win_today = True
-                    _fire({'event': 'position_closed', 'strategy_type': 'Call Spread',
-                           'result': trades[-1], 'strategy_obj': _closed_strategy})
-            if not is_past_entry_cutoff and not is_final_bar:
-                try:
-                    entry_spx = self.enhanced_query_engine.get_fastest_spx_price(date, current_time) or 0
-
-                    if skip_indicators:
-                        # --- Simple mode: no RSI/BB dependency ---
-                        # Use drift direction only to select strategy type.
-                        # All RSI/BB-based guards are skipped; only drift and
-                        # intraday-reversal guards apply.
-                        if spx_open is None and entry_spx > 0:
-                            spx_open = entry_spx
-                            logger.debug(f"Drift guard: latched open = {spx_open} at {current_time}")
-                        day_drift = (entry_spx - spx_open) if (spx_open and spx_open > 0) else 0.0
-                        _intraday_max_drift = max(_intraday_max_drift, day_drift)
-                        _intraday_min_drift = min(_intraday_min_drift, day_drift)
-
-                        if day_drift >= DRIFT_BLOCK_POINTS:
-                            _put_spread_ever_blocked = True
-                        if day_drift <= -DRIFT_BLOCK_POINTS:
-                            if not _call_spread_ever_blocked:
-                                _call_blocked_latch_time = current_time
-                            _call_spread_ever_blocked = True
-                        if abs(day_drift) >= DRIFT_IC_BLOCK_POINTS:
-                            _ic_ever_blocked = True
-
-                        ic_blocked_by_drift = _ic_ever_blocked
-                        put_spread_blocked  = _put_spread_ever_blocked
-                        call_spread_blocked = _call_spread_ever_blocked
-
-                        # Intraday reversal guards (no RSI needed)
-                        if (_intraday_max_drift - day_drift) >= INTRADAY_CALL_REVERSAL_POINTS:
-                            call_spread_blocked = True
-                        if (day_drift - _intraday_min_drift) >= INTRADAY_PUT_REVERSAL_POINTS:
-                            put_spread_blocked = True
-
-                        # Re-entry guards (no RSI needed)
-                        if _had_call_spread_today and day_drift < 0:
-                            call_spread_blocked = True
-                        if _had_call_spread_today and day_drift > 15:
-                            call_spread_blocked = True
-
-                        allow_ic      = strategy_mode in (STRATEGY_IRON_CONDOR, STRATEGY_IC_CREDIT_SPREADS) and not ic_blocked_by_drift
-                        allow_spreads = strategy_mode in (STRATEGY_CREDIT_SPREADS, STRATEGY_IC_CREDIT_SPREADS)
-                        is_trending   = False
-                        trend_dir     = "neutral"
-
-                        # Strategy type: IC for IC modes; for spread modes pick direction from drift
-                        if strategy_mode in (STRATEGY_IRON_CONDOR, STRATEGY_IC_CREDIT_SPREADS):
-                            _sel_type = StrategyType.IRON_CONDOR
-                        elif day_drift < -5:
-                            _sel_type = StrategyType.CALL_SPREAD  # market fell → sell above
-                        else:
-                            _sel_type = StrategyType.PUT_SPREAD    # flat/up → sell below
-                        selection = StrategySelection(
-                            strategy_type=_sel_type,
-                            market_signal=MarketSignal.NEUTRAL,
-                            confidence=0.5,
-                            reason=f"simple-mode drift={day_drift:+.1f}",
-                        )
-
-                        _guard_summary = []
-                        if ic_blocked_by_drift:   _guard_summary.append("IC:drift-extreme")
-                        if put_spread_blocked:     _guard_summary.append("put:BLOCKED")
-                        if call_spread_blocked:    _guard_summary.append("call:BLOCKED")
-                        if not _guard_summary:     _guard_summary.append("all-clear")
-                        logger.info(
-                            f"  Entry eval {current_time} [simple] | "
-                            f"signal={_sel_type.value if hasattr(_sel_type, 'value') else _sel_type} | "
-                            f"drift={day_drift:+.1f} | "
-                            f"allow: IC={allow_ic} spreads={allow_spreads} | "
-                            f"guards: {' '.join(_guard_summary)}"
-                        )
-
-                    else:
-                        # --- Full mode: RSI/BB indicators ---
-                        spx_history = self.get_spx_price_history(date, current_time, lookback_minutes=60)
-                        indicators  = self.technical_analyzer.analyze_market_conditions(spx_history)
-
-                        # Skip bars where indicators are at sentinel fallback values —
-                        # these occur when there isn't enough price history to compute
-                        # real RSI/BB values (RSI defaults to 50.0, BB position to 0.5).
-                        # Entering on sentinel values is indistinguishable from noise.
-                        if indicators.rsi == 50.0 and indicators.bb_position == 0.5:
-                            _bar_count = len(spx_history) if spx_history is not None else 0
-                            logger.info(
-                                f"  Entry eval {current_time} | warming up "
-                                f"({_bar_count} price bars) — need ~15 for RSI"
-                            )
-                            continue
-
-                        selection = self.strategy_selector.select_strategy(indicators)
-
-                        # --- Trend filter (30-min momentum window) ---
-                        is_trending, trend_dir = self._get_trend_state(date, current_time, spx_history)
-                        if is_trending:
-                            logger.debug(
-                                f"Trend detected at {current_time}: {trend_dir} "
-                                f"({TREND_FILTER_POINTS}+ pts over {TREND_FILTER_LOOKBACK_MINUTES}m)"
-                            )
-
-                    if not skip_indicators:
-                        # --- Daily-drift guard (anchored to opening price, sticky) ---
-                        # Latch the first valid SPX price as the open reference if
-                        # pre-scan fetch failed (09:30 bar often has price=0 in data).
-                        if spx_open is None and entry_spx > 0:
-                            spx_open = entry_spx
-                            logger.debug(f"Drift guard: latched open = {spx_open} at {current_time}")
-                        day_drift = (entry_spx - spx_open) if (spx_open and spx_open > 0) else 0.0
-
-                        # Once the dangerous threshold is crossed, latch the flag for the day.
-                        # A temporary bounce does NOT re-enable the blocked side.
-                        if day_drift >= DRIFT_BLOCK_POINTS:          # large UP → block put spreads
-                            _put_spread_ever_blocked = True
-                        if day_drift <= -DRIFT_BLOCK_POINTS:         # large DOWN → block call spreads
-                            if not _call_spread_ever_blocked:
-                                _call_blocked_latch_time = current_time  # record first latch
-                            _call_spread_ever_blocked = True
-                        if abs(day_drift) >= DRIFT_IC_BLOCK_POINTS:  # extreme → block IC
-                            _ic_ever_blocked = True
-                        # Update intraday extreme trackers (used for reversal guard below)
-                        _intraday_max_drift = max(_intraday_max_drift, day_drift)
-                        _intraday_min_drift = min(_intraday_min_drift, day_drift)
-
-                        ic_blocked_by_drift   = _ic_ever_blocked
-                        put_spread_blocked    = _put_spread_ever_blocked
-                        call_spread_blocked   = _call_spread_ever_blocked
-                        if ic_blocked_by_drift or put_spread_blocked or call_spread_blocked:
-                            logger.debug(
-                                f"Drift guard at {current_time}: drift={day_drift:+.1f} "
-                                f"ic_blocked={ic_blocked_by_drift} put_blocked={put_spread_blocked} "
-                                f"call_blocked={call_spread_blocked}"
-                            )
-
-                        # Determine which entry types are permitted by this strategy mode.
-                        # On trend days, IC is blocked; asymmetric spread is used instead
-                        # (call spread on down-trend — sell premium above a falling market;
-                        #  put spread on up-trend — sell premium below a rising market).
-                        allow_ic      = strategy_mode in (STRATEGY_IRON_CONDOR, STRATEGY_IC_CREDIT_SPREADS) and not is_trending and not ic_blocked_by_drift
-                        allow_spreads = strategy_mode in (STRATEGY_CREDIT_SPREADS, STRATEGY_IC_CREDIT_SPREADS)
-                        # Trend override: apply when the short-term trend direction agrees with
-                        # the day's drift. Applies in all strategy modes so the trend signal is
-                        # always respected (in credit_spreads mode the trend would otherwise be ignored).
-                        trend_agrees_with_drift = (
-                            (trend_dir == 'down' and day_drift <= 0) or
-                            (trend_dir == 'up'   and day_drift >= 0) or
-                            day_drift == 0.0
-                        )
-                        if is_trending and trend_agrees_with_drift:
-                            allow_spreads = True
-                            # Override selection to the safe-side spread
-                            if trend_dir == 'down':
-                                selection = StrategySelection(
-                                    strategy_type=StrategyType.CALL_SPREAD,
-                                    market_signal=MarketSignal.BEARISH,
-                                    confidence=selection.confidence,
-                                    reason=f"Trend override (down {trend_dir}) → Call Credit Spread only"
-                                )
-                            else:
-                                selection = StrategySelection(
-                                    strategy_type=StrategyType.PUT_SPREAD,
-                                    market_signal=MarketSignal.BULLISH,
-                                    confidence=selection.confidence,
-                                    reason=f"Trend override (up {trend_dir}) → Put Credit Spread only"
-                                )
-
-                        # Bollinger Band breakout guard
-                        if indicators.bb_position > 0.94:
-                            call_spread_blocked = True
-                        if indicators.bb_position < 0.05:
-                            put_spread_blocked = True
-
-                        # Moderate-decline put spread guard
-                        if day_drift < 0 and day_drift > -50 and indicators.rsi < 30:
-                            put_spread_blocked = True
-
-                        # Extreme panic selling guard
-                        if indicators.rsi < 12:
-                            put_spread_blocked = True
-
-                        # Deep crash continuation guard
-                        if day_drift < -50 and indicators.rsi < 20:
-                            put_spread_blocked = True
-
-                        # Extreme overbought call spread guard
-                        if indicators.rsi > CALL_SPREAD_MAX_ENTRY_RSI:
-                            call_spread_blocked = True
-
-                        # Bear-flag upper-band guard
-                        if day_drift < -5 and indicators.bb_position > 0.90:
-                            call_spread_blocked = True
-
-                        # Oversold call spread guard
-                        if indicators.rsi < 40 and day_drift < -5:
-                            call_spread_blocked = True
-                        if indicators.rsi < 30:
-                            call_spread_blocked = True
-
-                        # Strong uptrend + low RSI guard
-                        if day_drift > 12 and indicators.rsi < 40:
-                            call_spread_blocked = True
-
-                        # Intraday reversal guard
-                        if (_intraday_max_drift - day_drift) >= INTRADAY_CALL_REVERSAL_POINTS:
-                            call_spread_blocked = True
-                        if (day_drift - _intraday_min_drift) >= INTRADAY_PUT_REVERSAL_POINTS:
-                            put_spread_blocked = True
-
-                        # No call spread re-entry on a declining day guard
-                        if _had_call_spread_today and day_drift < 0:
-                            call_spread_blocked = True
-
-                        # No call spread re-entry after a big run-up guard
-                        if _had_call_spread_today and day_drift > 15:
-                            call_spread_blocked = True
-
-                        # Sub-zero Bollinger Band guard
-                        if indicators.bb_position < 0.10:
-                            call_spread_blocked = True
-
-                        # Expanded bear-flag guard
-                        if day_drift < -3 and indicators.bb_position > 0.82:
-                            call_spread_blocked = True
-
-                        # Low RSI guard
-                        if indicators.rsi < 32:
-                            call_spread_blocked = True
-
-                        # Post-winning-call-spread put guard
-                        if _had_call_spread_win_today and indicators.rsi > 20:
-                            put_spread_blocked = True
-
-                        # Post-winning-put-spread call guard
-                        if _had_put_spread_win_today and indicators.rsi < 40 and indicators.bb_position < 0.50:
-                            call_spread_blocked = True
-
-                        # Concurrent call-spread / oversold guard
-                        if open_call_spread is not None and indicators.rsi < 40:
-                            put_spread_blocked = True
-
-                        # Concurrent put-spread / oversold guard
-                        if open_put_spread is not None and indicators.rsi < 40 and indicators.bb_position < 0.50:
-                            call_spread_blocked = True
-
-                        # Concurrent put-spread / recovered market guard
-                        if open_put_spread is not None and indicators.rsi > 65:
-                            call_spread_blocked = True
-
-                        # Overbought RSI on declining day guard
-                        if day_drift < 0 and indicators.rsi > 74:
-                            call_spread_blocked = True
-
-                    # --- Entry evaluation log ---
-                    # Fired once per bar in the entry window, after all guard checks.
-                    # Shows the signal, key indicators, and exactly which strategies
-                    # are blocked so it is clear why no entry happened.
-                    _sig = (
-                        selection.strategy_type.value
-                        if hasattr(selection.strategy_type, "value")
-                        else str(selection.strategy_type)
-                    )
-                    _guard_summary = []
-                    if ic_blocked_by_drift:
-                        _guard_summary.append("IC:drift-extreme")
-                    if put_spread_blocked:
-                        _guard_summary.append("put:BLOCKED")
-                    if call_spread_blocked:
-                        _guard_summary.append("call:BLOCKED")
-                    if not _guard_summary:
-                        _guard_summary.append("all-clear")
-                    if is_trending:
-                        _guard_summary.append(f"trend:{trend_dir}")
-                    if _had_call_spread_win_today:
-                        _guard_summary.append("had-CS-win")
-                    if _had_put_spread_win_today:
-                        _guard_summary.append("had-PS-win")
-                    if not skip_indicators:
-                        logger.info(
-                            f"  Entry eval {current_time} | "
-                            f"signal={_sig} conf={selection.confidence:.0%} | "
-                            f"rsi={indicators.rsi:.1f} bb={indicators.bb_position:.2f} | "
-                            f"drift={day_drift:+.1f} | "
-                            f"allow: IC={allow_ic} spreads={allow_spreads} | "
-                            f"guards: {' '.join(_guard_summary)}"
-                        )
-
-                    _spx_history_arg = spx_history if not skip_indicators else None
-
-                    # In simple mode indicators is unset — provide a neutral sentinel
-                    # so that entry rationale dicts can safely reference it without
-                    # crashing.  All guard logic already bypasses these values.
-                    if skip_indicators:
-                        indicators = TechnicalIndicators(
-                            rsi=50.0, macd_line=0.0, macd_signal=0.0, macd_histogram=0.0,
-                            bb_upper=entry_spx, bb_middle=entry_spx, bb_lower=entry_spx,
-                            bb_position=0.5,
-                        )
-
-                    # Skip entry attempt when no SPX price is available yet
-                    if entry_spx <= 0:
-                        continue
-
-                    if selection.strategy_type == StrategyType.IRON_CONDOR and allow_ic:
-                        if open_ic is None and open_put_spread is None and open_call_spread is None:
-                            strategy = self._try_open_strategy(
-                                date, current_time, StrategyType.IRON_CONDOR,
-                                target_delta, target_prob_itm, min_spread_width, quantity,
-                                target_credit=target_credit, spx_history=_spx_history_arg
-                            )
-                            if strategy:
-                                open_ic = strategy
-                                ic_leg_status = IronCondorLegStatus()
-                                ic_entry_meta = {
-                                    'entry_time': current_time,
-                                    'entry_spx': entry_spx,
-                                    'indicators': indicators if not skip_indicators else None,
-                                    'strike_selection': self._last_strike_selection or StrikeSelection(0,0,0,0,0),
-                                    'market_signal': selection.market_signal,
-                                    'confidence': selection.confidence,
-                                    'notes': selection.reason,
-                                    'entry_rationale': {
-                                        'strategy_selected': 'iron_condor',
-                                        'selection_reason': selection.reason,
-                                        'confidence': round(selection.confidence, 3),
-                                        'market_signal': selection.market_signal.value,
-                                        'spx_open': round(spx_open, 2) if spx_open else None,
-                                        'spx_at_entry': round(entry_spx, 2),
-                                        'day_drift_pts': round(day_drift, 2),
-                                        'is_trending': is_trending,
-                                        'trend_direction': trend_dir,
-                                        'trend_override': False,
-                                        'ic_blocked_by_drift': ic_blocked_by_drift,
-                                        'put_spread_blocked': put_spread_blocked,
-                                        'call_spread_blocked': call_spread_blocked,
-                                        'rsi': round(indicators.rsi, 2),
-                                        'bb_position': round(indicators.bb_position, 3),
-                                        'bb_upper': round(indicators.bb_upper, 2),
-                                        'bb_lower': round(indicators.bb_lower, 2),
-                                        'macd_histogram': round(indicators.macd_histogram, 4),
-                                    }
-                                }
-                                logger.info(f"Opened IC at {current_time}")
-                                _fire({'event': 'position_opened', 'strategy_type': 'Iron Condor',
-                                       'entry_time': current_time, 'entry_spx': entry_spx,
-                                       'entry_credit': getattr(strategy, 'entry_credit', 0),
-                                       'strikes': ic_entry_meta.get('strike_selection'),
-                                       'entry_rationale': ic_entry_meta.get('entry_rationale'),
-                                       'strategy_obj': strategy})
-
-                    elif selection.strategy_type == StrategyType.PUT_SPREAD and allow_spreads and not put_spread_blocked:
-                        # In simple mode skip the RSI conviction check — drift guards
-                        # already protect against dangerous entries.
-                        if skip_indicators:
-                            put_ok = True
-                        elif day_drift < 0:
-                            rsi_ok = indicators.rsi <= PUT_SPREAD_MAX_RSI_ON_NEG_DRIFT
-                            if call_spread_blocked and _call_blocked_latch_time:
-                                latch_dt   = pd.Timestamp(f"{date} {_call_blocked_latch_time}")
-                                current_dt = pd.Timestamp(f"{date} {current_time}")
-                                cooldown_ok = (current_dt - latch_dt).seconds / 60 >= PUT_SPREAD_DRIFT_CONFIRM_MINUTES
-                            else:
-                                cooldown_ok = False
-                            put_ok = call_spread_blocked and rsi_ok and cooldown_ok
-                        else:
-                            # Positive or zero drift: require strong oversold conviction.
-                            put_ok = indicators.rsi <= PUT_SPREAD_MAX_RSI_ON_POS_DRIFT
-                        if open_put_spread is None and open_ic is None and put_ok:
-                            strategy = self._try_open_strategy(
-                                date, current_time, StrategyType.PUT_SPREAD,
-                                target_delta, target_prob_itm, min_spread_width, quantity,
-                                target_credit=target_credit, spx_history=_spx_history_arg
-                            )
-                            if strategy:
-                                open_put_spread = strategy
-                                put_spread_meta = {
-                                    'entry_time': current_time,
-                                    'entry_spx': entry_spx,
-                                    'indicators': indicators if not skip_indicators else None,
-                                    'strike_selection': self._last_strike_selection or StrikeSelection(0,0,0,0,0),
-                                    'market_signal': selection.market_signal,
-                                    'confidence': selection.confidence,
-                                    'notes': selection.reason,
-                                    'entry_rationale': {
-                                        'strategy_selected': 'put_spread',
-                                        'selection_reason': selection.reason,
-                                        'confidence': round(selection.confidence, 3),
-                                        'market_signal': selection.market_signal.value,
-                                        'spx_open': round(spx_open, 2) if spx_open else None,
-                                        'spx_at_entry': round(entry_spx, 2),
-                                        'day_drift_pts': round(day_drift, 2),
-                                        'is_trending': is_trending,
-                                        'trend_direction': trend_dir,
-                                        'trend_override': 'trend override' in selection.reason.lower(),
-                                        'ic_blocked_by_drift': ic_blocked_by_drift,
-                                        'put_spread_blocked': put_spread_blocked,
-                                        'call_spread_blocked': call_spread_blocked,
-                                        'rsi': round(indicators.rsi, 2),
-                                        'bb_position': round(indicators.bb_position, 3),
-                                        'bb_upper': round(indicators.bb_upper, 2),
-                                        'bb_lower': round(indicators.bb_lower, 2),
-                                        'macd_histogram': round(indicators.macd_histogram, 4),
-                                    }
-                                }
-                                logger.info(f"Opened put spread at {current_time}")
-                                _fire({'event': 'position_opened', 'strategy_type': 'Put Spread',
-                                       'entry_time': current_time, 'entry_spx': entry_spx,
-                                       'entry_credit': getattr(strategy, 'entry_credit', 0),
-                                       'strikes': put_spread_meta.get('strike_selection'),
-                                       'entry_rationale': put_spread_meta.get('entry_rationale'),
-                                       'strategy_obj': strategy})
-
-                    elif selection.strategy_type == StrategyType.CALL_SPREAD and allow_spreads and not call_spread_blocked:
-                        if open_call_spread is None and open_ic is None:
-                            strategy = self._try_open_strategy(
-                                date, current_time, StrategyType.CALL_SPREAD,
-                                target_delta, target_prob_itm, min_spread_width, quantity,
-                                target_credit=target_credit, spx_history=_spx_history_arg
-                            )
-                            if strategy:
-                                open_call_spread = strategy
-                                _had_call_spread_today = True   # latch: used by re-entry guard
-                                call_spread_meta = {
-                                    'entry_time': current_time,
-                                    'entry_spx': entry_spx,
-                                    'indicators': indicators if not skip_indicators else None,
-                                    'strike_selection': self._last_strike_selection or StrikeSelection(0,0,0,0,0),
-                                    'market_signal': selection.market_signal,
-                                    'confidence': selection.confidence,
-                                    'notes': selection.reason,
-                                    'entry_rationale': {
-                                        'strategy_selected': 'call_spread',
-                                        'selection_reason': selection.reason,
-                                        'confidence': round(selection.confidence, 3),
-                                        'market_signal': selection.market_signal.value,
-                                        'spx_open': round(spx_open, 2) if spx_open else None,
-                                        'spx_at_entry': round(entry_spx, 2),
-                                        'day_drift_pts': round(day_drift, 2),
-                                        'is_trending': is_trending,
-                                        'trend_direction': trend_dir,
-                                        'trend_override': 'trend override' in selection.reason.lower(),
-                                        'ic_blocked_by_drift': ic_blocked_by_drift,
-                                        'put_spread_blocked': put_spread_blocked,
-                                        'call_spread_blocked': call_spread_blocked,
-                                        'rsi': round(indicators.rsi, 2),
-                                        'bb_position': round(indicators.bb_position, 3),
-                                        'bb_upper': round(indicators.bb_upper, 2),
-                                        'bb_lower': round(indicators.bb_lower, 2),
-                                        'macd_histogram': round(indicators.macd_histogram, 4),
-                                    }
-                                }
-                                logger.info(f"Opened call spread at {current_time}")
-                                _fire({'event': 'position_opened', 'strategy_type': 'Call Spread',
-                                       'entry_time': current_time, 'entry_spx': entry_spx,
-                                       'entry_credit': getattr(strategy, 'entry_credit', 0),
-                                       'strikes': call_spread_meta.get('strike_selection'),
-                                       'entry_rationale': call_spread_meta.get('entry_rationale'),
-                                       'strategy_obj': strategy})
-
-                except Exception as e:
-                    logger.debug(f"Entry scan error at {current_time}: {e}")
-                    continue
-
-        # --- 5. Force-close remaining positions at FINAL_EXIT_TIME ---
-        for (open_pos, meta, stype, checkpoints) in [
-            (open_ic,          ic_entry_meta,    StrategyType.IRON_CONDOR, ic_checkpoints),
-            (open_put_spread,  put_spread_meta,  StrategyType.PUT_SPREAD,  put_spread_checkpoints),
-            (open_call_spread, call_spread_meta, StrategyType.CALL_SPREAD, call_spread_checkpoints),
-        ]:
-            if open_pos is not None:
-                exit_spx = self.enhanced_query_engine.get_fastest_spx_price(date, FINAL_EXIT_TIME) or meta.get('entry_spx', 0)
-                # Use intrinsic value at expiry — options settle to $0 if OTM
-                exit_cost = self._expiry_exit_cost(open_pos, stype, exit_spx)
-                entry_credit = getattr(open_pos, 'entry_credit', 0)
-                pnl = entry_credit - exit_cost
-                pnl_pct = (pnl / entry_credit * 100) if entry_credit > 0 else 0
-
-                # Add final force-close checkpoint
-                pos_quantity = getattr(open_pos, 'quantity', 1)
-                entry_credit_ps = round(entry_credit / (100.0 * pos_quantity), 4)
-                cost_ps = round(exit_cost / (100.0 * pos_quantity), 4)
-                force_checkpoint: dict = {
-                    "time": FINAL_EXIT_TIME,
-                    "spx": round(exit_spx, 2),
-                    "cost_per_share": cost_ps,
-                    "pnl_per_share": round(entry_credit_ps - cost_ps, 4),
-                }
-                if stype == StrategyType.IRON_CONDOR:
-                    put_cost  = self._expiry_exit_cost(open_pos, StrategyType.PUT_SPREAD,  exit_spx)
-                    call_cost = self._expiry_exit_cost(open_pos, StrategyType.CALL_SPREAD, exit_spx)
-                    force_checkpoint["put_cost_per_share"]  = round(put_cost  / (100.0 * pos_quantity), 4)
-                    force_checkpoint["call_cost_per_share"] = round(call_cost / (100.0 * pos_quantity), 4)
-                checkpoints.append(force_checkpoint)
-
-                result_ic_leg_status = None
-                if stype == StrategyType.IRON_CONDOR and ic_leg_status is not None:
-                    if not ic_leg_status.put_side_closed:
-                        ic_leg_status.put_side_closed = True
-                        ic_leg_status.put_side_exit_time = FINAL_EXIT_TIME
-                        ic_leg_status.put_side_exit_reason = "Expired at market close"
-                    if not ic_leg_status.call_side_closed:
-                        ic_leg_status.call_side_closed = True
-                        ic_leg_status.call_side_exit_time = FINAL_EXIT_TIME
-                        ic_leg_status.call_side_exit_reason = "Expired at market close"
-                    result_ic_leg_status = ic_leg_status
-
-                trades.append(EnhancedBacktestResult(
-                    date=date,
-                    strategy_type=stype,
-                    market_signal=meta.get('market_signal', MarketSignal.NEUTRAL),
-                    entry_time=meta.get('entry_time', FINAL_EXIT_TIME),
-                    exit_time=FINAL_EXIT_TIME,
-                    exit_reason="Expired at market close",
-                    entry_spx_price=meta.get('entry_spx', 0),
-                    exit_spx_price=exit_spx,
-                    technical_indicators=meta.get('indicators', TechnicalIndicators(0,0,0,0,0,0,0,0.5)),
-                    strike_selection=meta.get('strike_selection', StrikeSelection(0,0,0,0,0)),
-                    entry_credit=entry_credit,
-                    exit_cost=exit_cost,
-                    pnl=pnl,
-                    pnl_pct=pnl_pct,
-                    max_profit=getattr(open_pos, 'max_profit', entry_credit),
-                    max_loss=getattr(open_pos, 'max_loss', -exit_cost),
-                    monitoring_points=checkpoints,
-                    success=True,
-                    confidence=meta.get('confidence', 0),
-                    notes=meta.get('notes', ''),
-                    entry_rationale=meta.get('entry_rationale'),
-                    exit_rationale={
-                        'exit_trigger': 'Expired at market close',
-                        'exit_cost': round(exit_cost, 2),
-                        'entry_credit': round(entry_credit, 2),
-                        'spx_at_exit': round(exit_spx, 2),
-                        'spx_move_since_entry': round(exit_spx - meta.get('entry_spx', 0), 2) if meta.get('entry_spx') else None,
-                        'pnl': round(pnl, 2),
-                        'pnl_pct': round(pnl_pct, 2),
-                    },
-                    ic_leg_status=result_ic_leg_status
-                ))
-
-        return DayBacktestResult(
-            date=date,
-            trades=trades,
-            total_pnl=sum(t.pnl for t in trades),
-            trade_count=len(trades),
-            scan_minutes_checked=len(scan_times)
-        )
 
     def _try_open_strategy(self, date: str, timestamp: str, strategy_type: StrategyType,
-                           target_delta: float, target_prob_itm: float,
                            min_spread_width: int, quantity: int,
                            target_credit: Optional[float] = None,
                            spx_history: Optional[pd.Series] = None):
@@ -1222,12 +187,10 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
         """
         self._last_strike_selection = None
         try:
-            strike_selection = self.delta_selector.select_strikes_by_delta(
+            strike_selection = self.strike_selector.select_strikes(
                 date=date,
                 timestamp=timestamp,
                 strategy_type=strategy_type,
-                target_delta=target_delta,
-                target_prob_itm=target_prob_itm,
                 min_spread_width=min_spread_width,
                 target_credit=target_credit
             )
@@ -1236,7 +199,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
 
             spx_price = self.enhanced_query_engine.get_fastest_spx_price(date, timestamp) or 0
             if spx_price > 0:
-                from engine.delta_strike_selector import IronCondorStrikeSelection
+                from engine.strike_selector import IronCondorStrikeSelection
 
                 # --- Dynamic minimum distance (Recommendation 2) ---
                 # IC: scale base distance with morning range (both sides exposed).
@@ -1348,8 +311,6 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                    date: str,
                                    entry_time: str = "10:00:00",
                                    exit_time: str = "15:45:00",
-                                   target_delta: float = 0.15,
-                                   target_prob_itm: float = 0.15,
                                    min_spread_width: int = 10,
                                    take_profit: float = 0.10,
                                    stop_loss: float = 2.0,
@@ -1360,8 +321,6 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
         """Legacy single-day method — runs intraday scan and returns first trade result."""
         day_result = self.backtest_day_intraday(
             date=date,
-            target_delta=target_delta,
-            target_prob_itm=target_prob_itm,
             min_spread_width=min_spread_width,
             take_profit=take_profit,
             stop_loss=stop_loss,
@@ -1525,7 +484,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
             entry_spx_price=0,
             exit_spx_price=0,
             technical_indicators=TechnicalIndicators(0, 0, 0, 0, 0, 0, 0, 0.5),
-            strike_selection=StrikeSelection(0, 0, 0, 0, 0),
+            strike_selection=StrikeSelection(0, 0, 0),
             entry_credit=0,
             exit_cost=0,
             pnl=0,
@@ -1550,18 +509,17 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
         print(f"{'='*140}")
         
         # Summary table
-        print(f"{'Date':<12} {'Strategy':<12} {'Signal':<8} {'Delta':<6} {'RSI':<5} {'P&L':<10} {'%':<7} {'Exit':<15} {'Status'}")
+        print(f"{'Date':<12} {'Strategy':<12} {'Signal':<8} {'RSI':<5} {'P&L':<10} {'%':<7} {'Exit':<15} {'Status'}")
         print(f"{'-'*140}")
         
         for result in results:
             if result.success:
                 status = "✓ WIN" if result.pnl > 0 else "✗ LOSS"
-                delta_str = f"{result.strike_selection.short_delta:.3f}" if result.success else "N/A"
                 rsi_str = f"{result.technical_indicators.rsi:.0f}" if result.success else "N/A"
                 strategy_short = result.strategy_type.value.replace(" ", "")[:10]
                 signal_short = result.market_signal.value[:6]
-                
-                print(f"{result.date:<12} {strategy_short:<12} {signal_short:<8} {delta_str:<6} {rsi_str:<5} "
+
+                print(f"{result.date:<12} {strategy_short:<12} {signal_short:<8} {rsi_str:<5} "
                       f"${result.pnl:<9.2f} {result.pnl_pct:<6.1f}% {result.exit_reason[:13]:<15} {status}")
             else:
                 print(f"{result.date:<12} {'SKIP':<12} {'N/A':<8} {'N/A':<6} {'N/A':<5} "
@@ -1594,11 +552,9 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
             
             # Technical indicator summary
             avg_rsi = sum(r.technical_indicators.rsi for r in successful_results) / len(successful_results)
-            avg_delta = sum(r.strike_selection.short_delta for r in successful_results) / len(successful_results)
-            
+
             print(f"\\nTechnical Summary:")
             print(f"  Average RSI: {avg_rsi:.1f}")
-            print(f"  Average Short Delta: {avg_delta:.3f}")
             print(f"  Setup Success Rate: {len(successful_results)}/{len(results)} ({len(successful_results)/len(results)*100:.1f}%)")
             
             # Show monitoring details if requested
@@ -1610,7 +566,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                 for result in successful_results:  # Show all results, not just first 3
                     print(f"\\n📊 {result.date} - {result.strategy_type.value} Strategy:")
                     print(f"   Entry SPX: ${result.entry_spx_price:.2f} → Exit SPX: ${result.exit_spx_price:.2f}")
-                    print(f"   Strike Selection: Short {result.strike_selection.short_strike:.0f} | Long {result.strike_selection.long_strike:.0f} | Delta {result.strike_selection.short_delta:.3f}")
+                    print(f"   Strike Selection: Short {result.strike_selection.short_strike:.0f} | Long {result.strike_selection.long_strike:.0f}")
                     print(f"   Entry Credit: ${result.entry_credit:.2f} → Exit Cost: ${result.exit_cost:.2f} → P&L: ${result.pnl:.2f}")
                     print(f"   Exit Reason: {result.exit_reason}")
                     print(f"   Monitoring Points: {len(result.monitoring_points)}")
@@ -1646,9 +602,7 @@ def run_enhanced_backtest():
                         choices=[STRATEGY_IRON_CONDOR, STRATEGY_CREDIT_SPREADS, STRATEGY_IC_CREDIT_SPREADS],
                         help="Strategy mode (default: iron_condor)")
     parser.add_argument("--contracts", type=int, default=1, help="Number of contracts per position (default: 1)")
-    parser.add_argument("--target-delta", type=float, default=0.15, help="Target delta for short strikes")
     parser.add_argument("--target-credit", type=float, default=0.50, help="Target net credit per spread per share (default: 0.50)")
-    parser.add_argument("--target-prob-itm", type=float, default=0.15, help="Target probability ITM")
     parser.add_argument("--take-profit", type=float, default=0.10, help="Take profit: exit when cost/share drops to this value (default: 0.10)")
     parser.add_argument("--stop-loss", type=float, default=2.0, help="Stop loss: exit when cost/share reaches this value (default: 2.0)")
     parser.add_argument("--monitor-interval", type=int, default=1, help="Minutes between position checks (default: 1)")
@@ -1664,8 +618,6 @@ def run_enhanced_backtest():
         # Single day intraday scan
         day_result = engine.backtest_day_intraday(
             date=args.date,
-            target_delta=args.target_delta,
-            target_prob_itm=args.target_prob_itm,
             take_profit=args.take_profit,
             stop_loss=args.stop_loss,
             monitor_interval=args.monitor_interval,
@@ -1693,8 +645,6 @@ def run_enhanced_backtest():
             logger.info(f"Intraday scan {i}/{len(test_dates)}: {date}")
             day_result = engine.backtest_day_intraday(
                 date=date,
-                target_delta=args.target_delta,
-                target_prob_itm=args.target_prob_itm,
                 take_profit=args.take_profit,
                 stop_loss=args.stop_loss,
                 monitor_interval=args.monitor_interval,
