@@ -20,7 +20,7 @@ from engine.enhanced_backtest import (
     EnhancedBacktestResult, TechnicalAnalyzer, StrategySelector,
     EnhancedMultiStrategyBacktester, IronCondorLegStatus, DayBacktestResult
 )
-from engine.delta_strike_selector import DeltaStrikeSelector, PositionMonitor, IntradayPositionMonitor, StrikeSelection, IronCondorStrikeSelection
+from engine.delta_strike_selector import StrikeSelector, IntradayPositionMonitor, StrikeSelection, IronCondorStrikeSelection
 from engine.query_engine_adapter import EnhancedQueryEngineAdapter
 
 
@@ -86,8 +86,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
         super().__init__(data_path)
         # Wrap query engine with enhanced adapter
         self.enhanced_query_engine = EnhancedQueryEngineAdapter(self.query_engine)
-        self.delta_selector = DeltaStrikeSelector(self.enhanced_query_engine, self.ic_loader)
-        self.position_monitor = PositionMonitor(self.enhanced_query_engine, self.strategy_builder)
+        self.strike_selector = StrikeSelector(self.enhanced_query_engine, self.ic_loader)
         self.intraday_monitor = IntradayPositionMonitor(self.enhanced_query_engine, self.strategy_builder)
 
     # ------------------------------------------------------------------
@@ -189,12 +188,10 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
         """
         self._last_strike_selection = None
         try:
-            strike_selection = self.delta_selector.select_strikes_by_delta(
+            strike_selection = self.strike_selector.select_strikes(
                 date=date,
                 timestamp=timestamp,
                 strategy_type=strategy_type,
-                target_delta=target_delta,
-                target_prob_itm=target_prob_itm,
                 min_spread_width=min_spread_width,
                 target_credit=target_credit
             )
@@ -492,7 +489,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
             entry_spx_price=0,
             exit_spx_price=0,
             technical_indicators=TechnicalIndicators(0, 0, 0, 0, 0, 0, 0, 0.5),
-            strike_selection=StrikeSelection(0, 0, 0, 0, 0),
+            strike_selection=StrikeSelection(0, 0, 0),
             entry_credit=0,
             exit_cost=0,
             pnl=0,
@@ -517,18 +514,17 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
         print(f"{'='*140}")
         
         # Summary table
-        print(f"{'Date':<12} {'Strategy':<12} {'Signal':<8} {'Delta':<6} {'RSI':<5} {'P&L':<10} {'%':<7} {'Exit':<15} {'Status'}")
+        print(f"{'Date':<12} {'Strategy':<12} {'Signal':<8} {'RSI':<5} {'P&L':<10} {'%':<7} {'Exit':<15} {'Status'}")
         print(f"{'-'*140}")
         
         for result in results:
             if result.success:
                 status = "✓ WIN" if result.pnl > 0 else "✗ LOSS"
-                delta_str = f"{result.strike_selection.short_delta:.3f}" if result.success else "N/A"
                 rsi_str = f"{result.technical_indicators.rsi:.0f}" if result.success else "N/A"
                 strategy_short = result.strategy_type.value.replace(" ", "")[:10]
                 signal_short = result.market_signal.value[:6]
-                
-                print(f"{result.date:<12} {strategy_short:<12} {signal_short:<8} {delta_str:<6} {rsi_str:<5} "
+
+                print(f"{result.date:<12} {strategy_short:<12} {signal_short:<8} {rsi_str:<5} "
                       f"${result.pnl:<9.2f} {result.pnl_pct:<6.1f}% {result.exit_reason[:13]:<15} {status}")
             else:
                 print(f"{result.date:<12} {'SKIP':<12} {'N/A':<8} {'N/A':<6} {'N/A':<5} "
@@ -561,11 +557,9 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
             
             # Technical indicator summary
             avg_rsi = sum(r.technical_indicators.rsi for r in successful_results) / len(successful_results)
-            avg_delta = sum(r.strike_selection.short_delta for r in successful_results) / len(successful_results)
-            
+
             print(f"\\nTechnical Summary:")
             print(f"  Average RSI: {avg_rsi:.1f}")
-            print(f"  Average Short Delta: {avg_delta:.3f}")
             print(f"  Setup Success Rate: {len(successful_results)}/{len(results)} ({len(successful_results)/len(results)*100:.1f}%)")
             
             # Show monitoring details if requested
@@ -577,7 +571,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                 for result in successful_results:  # Show all results, not just first 3
                     print(f"\\n📊 {result.date} - {result.strategy_type.value} Strategy:")
                     print(f"   Entry SPX: ${result.entry_spx_price:.2f} → Exit SPX: ${result.exit_spx_price:.2f}")
-                    print(f"   Strike Selection: Short {result.strike_selection.short_strike:.0f} | Long {result.strike_selection.long_strike:.0f} | Delta {result.strike_selection.short_delta:.3f}")
+                    print(f"   Strike Selection: Short {result.strike_selection.short_strike:.0f} | Long {result.strike_selection.long_strike:.0f}")
                     print(f"   Entry Credit: ${result.entry_credit:.2f} → Exit Cost: ${result.exit_cost:.2f} → P&L: ${result.pnl:.2f}")
                     print(f"   Exit Reason: {result.exit_reason}")
                     print(f"   Monitoring Points: {len(result.monitoring_points)}")

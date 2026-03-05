@@ -75,11 +75,9 @@ class StrategySelection:
 
 @dataclass
 class StrikeSelection:
-    """Delta-based strike selection"""
+    """Credit-based strike selection"""
     short_strike: float
     long_strike: float
-    short_delta: float
-    short_prob_itm: float
     spread_width: float
 
 

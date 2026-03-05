@@ -33,7 +33,7 @@ from enhanced_backtest import (
     DayBacktestResult,
 )
 from delta_strike_selector import (
-    DeltaStrikeSelector, IntradayPositionMonitor, IronCondorStrikeSelection,
+    StrikeSelector, IntradayPositionMonitor, IronCondorStrikeSelection,
 )
 from enhanced_multi_strategy import (
     EnhancedBacktestingEngine,
@@ -151,11 +151,11 @@ class LiveTradingLoop:
         # Strike selector: live gets a fresh selector backed by the live provider;
         # backtest reuses the engine's pre-built selector (Parquet-backed).
         if is_live:
-            self._delta_selector = DeltaStrikeSelector(
+            self._strike_selector = StrikeSelector(
                 market_data_provider, engine.ic_loader
             )
         else:
-            self._delta_selector = engine.delta_selector
+            self._strike_selector = engine.strike_selector
 
     # ------------------------------------------------------------------
     # Public API
@@ -995,8 +995,8 @@ class LiveTradingLoop:
         Select strikes and build a strategy object.
         Returns (strategy, strategy_type, entry_meta) or (None, None, {}).
         """
-        # Strike selection (uses self._delta_selector with live provider or Parquet)
-        selection = self._delta_selector.select_strikes_by_delta(
+        # Strike selection (uses self._strike_selector with live provider or Parquet)
+        selection = self._strike_selector.select_strikes(
             date=date,
             timestamp=bar_time,
             strategy_type=s_type,
@@ -1132,7 +1132,7 @@ class LiveTradingLoop:
                 "indicators",
                 TechnicalIndicators(0, 0, 0, 0, 0, 0, 0, 0.5)
             ),
-            strike_selection=meta.get("strike_selection", StrikeSelection(0, 0, 0, 0, 0)),
+            strike_selection=meta.get("strike_selection", StrikeSelection(0, 0, 0)),
             entry_credit=entry_credit,
             exit_cost=exit_cost,
             pnl=pnl,

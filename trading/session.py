@@ -115,7 +115,7 @@ from enhanced_backtest import (
     EnhancedBacktestResult, IronCondorLegStatus, DayBacktestResult,
 )
 from delta_strike_selector import (
-    DeltaStrikeSelector, IntradayPositionMonitor,
+    StrikeSelector, IntradayPositionMonitor,
     IronCondorStrikeSelection,
 )
 from enhanced_multi_strategy import (
@@ -165,7 +165,7 @@ class LiveTradingSession:
         # Reuse the engine's sub-components (same objects, same logic)
         self._technical_analyzer: TechnicalAnalyzer = engine.technical_analyzer
         self._strategy_selector: StrategySelector  = engine.strategy_selector
-        self._delta_selector: DeltaStrikeSelector  = engine.delta_selector
+        self._strike_selector: StrikeSelector = engine.strike_selector
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -215,7 +215,7 @@ class LiveTradingSession:
 
         # Delegate to the engine's intraday scan loop, but inject our provider.
         # We swap the engine's enhanced_query_engine temporarily so that all
-        # sub-components (delta_selector, intraday_monitor) also use the
+        # sub-components (strike_selector, intraday_monitor) also use the
         # injected provider.
         #
         # Additionally we swap strategy_builder.query_engine and
@@ -230,7 +230,7 @@ class LiveTradingSession:
         try:
             self._engine.enhanced_query_engine = self._provider
             # Re-wire sub-components to the new provider
-            self._engine.delta_selector.query_engine   = self._provider
+            self._engine.strike_selector.query_engine   = self._provider
             self._engine.intraday_monitor.query_engine = self._provider
             # Re-wire strategy_builder to use live data instead of Parquet
             self._engine.strategy_builder.query_engine                  = live_shim
@@ -260,7 +260,7 @@ class LiveTradingSession:
         finally:
             # Always restore the original providers/engines
             self._engine.enhanced_query_engine  = original_provider
-            self._engine.delta_selector.query_engine   = original_provider
+            self._engine.strike_selector.query_engine   = original_provider
             self._engine.intraday_monitor.query_engine = original_provider
             self._engine.strategy_builder.query_engine                  = original_sb_qe
             self._engine.strategy_builder.data_adapter.query_engine     = original_sb_da_qe

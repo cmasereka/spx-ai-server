@@ -33,8 +33,8 @@ class TestEnhancedBacktestingEngine:
         with patch('enhanced_multi_strategy.EnhancedQueryEngineAdapter') as mock_adapter:
             mock_adapter.return_value = MockQueryEngine()
             
-            with patch('delta_strike_selector.DeltaStrikeSelector') as mock_selector:
-                with patch('delta_strike_selector.PositionMonitor') as mock_monitor:
+            with patch('delta_strike_selector.StrikeSelector') as mock_selector:
+                with patch('delta_strike_selector.PositionMonitor') as mock_monitor_cls:
                     self.engine = EnhancedBacktestingEngine("tests/fixtures/test_data")
     
     def test_enhanced_backtest_single_day_success(self):
@@ -46,13 +46,11 @@ class TestEnhancedBacktestingEngine:
             with patch.object(self.engine, 'get_spx_price_history') as mock_history:
                 mock_history.return_value = pd.Series([SAMPLE_SPX_PRICE] * 50)
                 
-                with patch.object(self.engine, 'delta_selector') as mock_delta:
+                with patch.object(self.engine, 'strike_selector') as mock_delta:
                     from delta_strike_selector import StrikeSelection
-                    mock_delta.select_strikes_by_delta.return_value = StrikeSelection(
+                    mock_delta.select_strikes.return_value = StrikeSelection(
                         short_strike=6900.0,
-                        long_strike=6875.0, 
-                        short_delta=0.15,
-                        short_prob_itm=0.12,
+                        long_strike=6875.0,
                         spread_width=25.0
                     )
                     
@@ -128,8 +126,8 @@ class TestEnhancedBacktestingEngine:
             with patch.object(self.engine, 'get_spx_price_history') as mock_history:
                 mock_history.return_value = pd.Series([SAMPLE_SPX_PRICE] * 50)
                 
-                with patch.object(self.engine, 'delta_selector') as mock_delta:
-                    mock_delta.select_strikes_by_delta.return_value = None
+                with patch.object(self.engine, 'strike_selector') as mock_delta:
+                    mock_delta.select_strikes.return_value = None
                     
                     self.engine.available_dates = [SAMPLE_DATE]
                     
@@ -149,13 +147,11 @@ class TestEnhancedBacktestingEngine:
             with patch.object(self.engine, 'get_spx_price_history') as mock_history:
                 mock_history.return_value = pd.Series([SAMPLE_SPX_PRICE] * 50)
                 
-                with patch.object(self.engine, 'delta_selector') as mock_delta:
+                with patch.object(self.engine, 'strike_selector') as mock_delta:
                     from delta_strike_selector import StrikeSelection
-                    mock_delta.select_strikes_by_delta.return_value = StrikeSelection(
+                    mock_delta.select_strikes.return_value = StrikeSelection(
                         short_strike=6900.0,
                         long_strike=6875.0,
-                        short_delta=0.15, 
-                        short_prob_itm=0.12,
                         spread_width=25.0
                     )
                     
@@ -200,35 +196,30 @@ class TestBacktestingWorkflow:
     
     def test_strategy_selection_to_strike_selection(self):
         """Test the flow from strategy selection to strike selection."""
-        from delta_strike_selector import DeltaStrikeSelector, StrikeSelection
+        from delta_strike_selector import StrikeSelector, StrikeSelection
         from enhanced_backtest import StrategySelection, StrategyType, MarketSignal
-        
-        # Mock components
+
         mock_query_engine = MockQueryEngine()
         mock_ic_loader = Mock()
-        
-        selector = DeltaStrikeSelector(mock_query_engine, mock_ic_loader)
-        
-        # Mock strategy selection (bullish signal -> call spread)
+
+        selector = StrikeSelector(mock_query_engine, mock_ic_loader)
+
         strategy_selection = StrategySelection(
             strategy_type=StrategyType.CALL_SPREAD,
             market_signal=MarketSignal.BULLISH,
             confidence=0.8,
             reason="Bullish market conditions"
         )
-        
-        # Select strikes based on strategy
-        strike_selection = selector.select_strikes_by_delta(
+
+        strike_selection = selector.select_strikes(
             date=SAMPLE_DATE,
             timestamp="10:00:00",
             strategy_type=strategy_selection.strategy_type,
-            target_delta=0.20
+            target_credit=0.40,
         )
-        
-        # Validate workflow
+
         if strike_selection:  # May be None due to mock data limitations
             assert isinstance(strike_selection, StrikeSelection)
-            assert strike_selection.short_delta != 0
     
     def test_end_to_end_backtest_simulation(self):
         """Test complete end-to-end backtest simulation."""
@@ -248,8 +239,6 @@ class TestBacktestingWorkflow:
         strike_selection = StrikeSelection(
             short_strike=6900.0,
             long_strike=6875.0 if strategy_selection.strategy_type == StrategyType.PUT_SPREAD else 6925.0,
-            short_delta=0.15,
-            short_prob_itm=0.12,
             spread_width=25.0
         )
         
@@ -338,13 +327,14 @@ class TestErrorHandlingAndRecovery:
         mock_query_engine.get_fastest_spx_price.return_value = SAMPLE_SPX_PRICE
         mock_query_engine.get_options_data.return_value = None  # No options data
         
-        from delta_strike_selector import DeltaStrikeSelector
-        selector = DeltaStrikeSelector(mock_query_engine, Mock())
-        
-        result = selector.select_strikes_by_delta(
+        from delta_strike_selector import StrikeSelector
+        selector = StrikeSelector(mock_query_engine, Mock())
+
+        result = selector.select_strikes(
             date=SAMPLE_DATE,
             timestamp="10:00:00",
-            strategy_type=StrategyType.IRON_CONDOR
+            strategy_type=StrategyType.IRON_CONDOR,
+            target_credit=0.40,
         )
         
         # Should handle gracefully
