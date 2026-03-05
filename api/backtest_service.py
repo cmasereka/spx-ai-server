@@ -43,15 +43,28 @@ class BacktestService:
     async def initialize(self):
         """Initialize the backtest service"""
         try:
-            # Initialize the enhanced backtesting engine
-            # Set LOAD_PARQUET_DATA = False to skip historical data (live-trading-only mode)
-            LOAD_PARQUET_DATA = False
-            data_path = "data/processed/parquet_1m" if LOAD_PARQUET_DATA else ""
-            logger.info(f"Initializing Enhanced Backtesting Engine (parquet={'on' if LOAD_PARQUET_DATA else 'off'})...")
-            self.engine = EnhancedBacktestingEngine(data_path)
-            
+            data_path = "data/processed/parquet_1m"
+            logger.info(
+                "Initializing Enhanced Backtesting Engine "
+                "(lazy Parquet loading — data files are read on first request)..."
+            )
+            try:
+                self.engine = EnhancedBacktestingEngine(data_path)
+                available = len(self.engine.available_dates)
+                logger.info(
+                    f"✅ Engine ready — {available} trading date(s) available in Parquet store. "
+                    "No data loaded yet; files will be indexed on first request for each date."
+                )
+            except FileNotFoundError:
+                logger.warning(
+                    f"Parquet data directory '{data_path}' not found. "
+                    "Backtest functionality will be unavailable until the data directory exists. "
+                    "Live trading is unaffected."
+                )
+                self.engine = EnhancedBacktestingEngine("")  # engine with empty available_dates
+
             logger.info("✅ Backtest service initialized successfully")
-            
+
         except Exception as e:
             logger.error(f"Failed to initialize backtest service: {e}")
             raise

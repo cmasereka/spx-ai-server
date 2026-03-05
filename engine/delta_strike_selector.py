@@ -61,31 +61,30 @@ class IronCondorStrikeSelection:
 
 
 class DeltaStrikeSelector:
-    """Select strikes based on delta and probability ITM"""
-    
+    """Select strikes based on target credit."""
+
     def __init__(self, query_engine, ic_loader):
         self.query_engine = query_engine
         self.ic_loader = ic_loader
-    
+
     def select_strikes_by_delta(self,
-                              date: str,
-                              timestamp: str,
-                              strategy_type: StrategyType,
-                              target_delta: float = 0.15,
-                              target_prob_itm: float = 0.15,
-                              min_spread_width: int = 10,
-                              target_credit: Optional[float] = None) -> Optional[StrikeSelection]:
+                                date: str,
+                                timestamp: str,
+                                strategy_type: StrategyType,
+                                min_spread_width: int = 10,
+                                target_credit: Optional[float] = None,
+                                **_ignored) -> Optional[StrikeSelection]:
         """
-        Select strikes based on target credit per spread (preferred) or target delta.
+        Select strikes based on target credit per spread per share.
 
         Args:
-            target_delta: Target delta for short strike — used only when target_credit is None
-            target_prob_itm: Target probability ITM — used only when target_credit is None
-            min_spread_width: Spread width in strike points
+            min_spread_width: Spread width in strike points.
             target_credit: Desired net credit per spread per share (e.g. 0.50).
-                           Primary selection mode when provided.
         """
-        
+        if target_credit is None:
+            logger.warning("select_strikes_by_delta: target_credit is required")
+            return None
+
         try:
             # Get current SPX price
             spx_price = self.query_engine.get_fastest_spx_price(date, timestamp)
@@ -100,21 +99,13 @@ class DeltaStrikeSelector:
             # Filter for 0DTE options
             options_data = options_data[options_data['expiration'] == date]
 
-            # Choose selection method
-            if target_credit is not None:
-                put_selector  = lambda od, sp: self._select_put_spread_by_credit(od, sp, min_spread_width, target_credit)
-                call_selector = lambda od, sp: self._select_call_spread_by_credit(od, sp, min_spread_width, target_credit)
-            else:
-                put_selector  = lambda od, sp: self._select_put_spread_strikes(od, sp, target_delta, target_prob_itm, min_spread_width)
-                call_selector = lambda od, sp: self._select_call_spread_strikes(od, sp, target_delta, target_prob_itm, min_spread_width)
-
             if strategy_type == StrategyType.PUT_SPREAD:
-                return put_selector(options_data, spx_price)
+                return self._select_put_spread_by_credit(options_data, spx_price, min_spread_width, target_credit)
             elif strategy_type == StrategyType.CALL_SPREAD:
-                return call_selector(options_data, spx_price)
+                return self._select_call_spread_by_credit(options_data, spx_price, min_spread_width, target_credit)
             else:  # IRON_CONDOR — select both sides independently
-                put_strikes  = put_selector(options_data, spx_price)
-                call_strikes = call_selector(options_data, spx_price)
+                put_strikes  = self._select_put_spread_by_credit(options_data, spx_price, min_spread_width, target_credit)
+                call_strikes = self._select_call_spread_by_credit(options_data, spx_price, min_spread_width, target_credit)
 
                 if put_strikes is None or call_strikes is None:
                     return None
@@ -184,8 +175,8 @@ class DeltaStrikeSelector:
                 return StrikeSelection(
                     short_strike=short_strike,
                     long_strike=long_strike,
-                    short_delta=abs(puts[puts['strike'] == short_strike].iloc[0]['delta']),
-                    short_prob_itm=abs(puts[puts['strike'] == short_strike].iloc[0]['delta']),
+                    short_delta=0.0,
+                    short_prob_itm=0.0,
                     spread_width=short_strike - long_strike
                 )
 
@@ -195,8 +186,8 @@ class DeltaStrikeSelector:
         return StrikeSelection(
             short_strike=short_strike,
             long_strike=long_strike,
-            short_delta=abs(puts[puts['strike'] == short_strike].iloc[0]['delta']),
-            short_prob_itm=abs(puts[puts['strike'] == short_strike].iloc[0]['delta']),
+            short_delta=0.0,
+            short_prob_itm=0.0,
             spread_width=short_strike - long_strike
         )
 
@@ -243,8 +234,8 @@ class DeltaStrikeSelector:
                 return StrikeSelection(
                     short_strike=short_strike,
                     long_strike=long_strike,
-                    short_delta=calls[calls['strike'] == short_strike].iloc[0]['delta'],
-                    short_prob_itm=calls[calls['strike'] == short_strike].iloc[0]['delta'],
+                    short_delta=0.0,
+                    short_prob_itm=0.0,
                     spread_width=long_strike - short_strike
                 )
 
@@ -253,96 +244,14 @@ class DeltaStrikeSelector:
         return StrikeSelection(
             short_strike=short_strike,
             long_strike=long_strike,
-            short_delta=calls[calls['strike'] == short_strike].iloc[0]['delta'],
-            short_prob_itm=calls[calls['strike'] == short_strike].iloc[0]['delta'],
+            short_delta=0.0,
+            short_prob_itm=0.0,
             spread_width=long_strike - short_strike
         )
 
     # ------------------------------------------------------------------
-    # Delta-based selection (legacy fallback)
+    # Delta-based selection — removed; credit-only selection is used
     # ------------------------------------------------------------------
-
-    def _select_put_spread_strikes(self, options_data: pd.DataFrame, spx_price: float,
-                                 target_delta: float, target_prob_itm: float,
-                                 min_spread_width: int) -> Optional[StrikeSelection]:
-        """Select put spread strikes"""
-
-        # Only consider OTM puts (strike < SPX) — ITM puts have no place as short strikes
-        puts = options_data[
-            (options_data['option_type'] == 'put') &
-            (options_data['strike'] < spx_price)
-        ].copy()
-        if len(puts) == 0:
-            return None
-
-        # Find puts with delta magnitude closest to target (puts have negative delta)
-        puts['abs_delta_diff'] = abs(abs(puts['delta']) - target_delta)
-        puts = puts.sort_values('abs_delta_diff')
-
-        # Select short strike (sell this)
-        short_candidates = puts.head(5)  # Top 5 closest to target delta
-
-        for _, short_option in short_candidates.iterrows():
-            short_strike = short_option['strike']
-            short_delta = abs(short_option['delta'])
-
-            short_prob_itm = short_delta  # delta ≈ prob ITM for 0DTE
-
-            # Long strike is further OTM (lower for puts)
-            long_strike = short_strike - min_spread_width
-            long_options = puts[puts['strike'] == long_strike]
-
-            if len(long_options) > 0:
-                return StrikeSelection(
-                    short_strike=short_strike,
-                    long_strike=long_strike,
-                    short_delta=short_delta,
-                    short_prob_itm=short_prob_itm,
-                    spread_width=short_strike - long_strike
-                )
-
-        return None
-
-    def _select_call_spread_strikes(self, options_data: pd.DataFrame, spx_price: float,
-                                  target_delta: float, target_prob_itm: float,
-                                  min_spread_width: int) -> Optional[StrikeSelection]:
-        """Select call spread strikes"""
-
-        # Only consider OTM calls (strike > SPX) — ITM calls have no place as short strikes
-        calls = options_data[
-            (options_data['option_type'] == 'call') &
-            (options_data['strike'] > spx_price)
-        ].copy()
-        if len(calls) == 0:
-            return None
-
-        # Find calls with delta closest to target
-        calls['abs_delta_diff'] = abs(calls['delta'] - target_delta)
-        calls = calls.sort_values('abs_delta_diff')
-
-        # Select short strike (sell this)
-        short_candidates = calls.head(5)
-
-        for _, short_option in short_candidates.iterrows():
-            short_strike = short_option['strike']
-            short_delta = short_option['delta']
-
-            short_prob_itm = short_delta  # delta ≈ prob ITM for 0DTE
-
-            # Long strike is further OTM (higher for calls)
-            long_strike = short_strike + min_spread_width
-            long_options = calls[calls['strike'] == long_strike]
-
-            if len(long_options) > 0:
-                return StrikeSelection(
-                    short_strike=short_strike,
-                    long_strike=long_strike,
-                    short_delta=short_delta,
-                    short_prob_itm=short_prob_itm,
-                    spread_width=long_strike - short_strike
-                )
-
-        return None
 
 
 class PositionMonitor:

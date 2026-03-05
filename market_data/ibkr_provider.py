@@ -37,9 +37,6 @@ import numpy as np
 from loguru import logger
 
 from .provider import MarketDataProvider
-from query_engine_adapter import (
-    _time_to_expiry_years, _compute_bs_delta, RISK_FREE_RATE
-)
 
 try:
     from ib_insync import IB, Stock, Index, Option, Contract
@@ -358,7 +355,6 @@ class IBKRMarketDataProvider(MarketDataProvider):
             strikes = list(range(low - (low % 5), high, 5))
 
             expiry = datetime.strptime(date, "%Y-%m-%d").strftime("%Y%m%d")
-            T = _time_to_expiry_years(timestamp, date)
 
             logger.debug(
                 f"IBKR options fetch: SPX={spx_price:.2f} center={round(spx_price/5)*5} "
@@ -395,21 +391,12 @@ class IBKRMarketDataProvider(MarketDataProvider):
                         continue
                     mid_price = (bid + ask) / 2.0
                     is_call = right == "C"
-                    delta = _compute_bs_delta(
-                        S=spx_price,
-                        K=float(strike),
-                        T=T,
-                        r=RISK_FREE_RATE,
-                        mid_price=mid_price,
-                        is_call=is_call,
-                    )
                     rows.append({
                         "strike": float(strike),
                         "option_type": "call" if is_call else "put",
                         "expiration": date,
                         "bid": bid,
                         "ask": ask,
-                        "delta": delta,
                         "gamma": float(ticker.modelGreeks.gamma) if ticker.modelGreeks else 0.0,
                         "theta": float(ticker.modelGreeks.theta) if ticker.modelGreeks else 0.0,
                         "vega":  float(ticker.modelGreeks.vega)  if ticker.modelGreeks else 0.0,

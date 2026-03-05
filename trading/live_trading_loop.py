@@ -50,6 +50,58 @@ from enhanced_multi_strategy import (
 
 
 # ---------------------------------------------------------------------------
+# Normalised config for one trading day (backtest or live)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TradingDayConfig:
+    """Flat, broker-agnostic config used internally by LiveTradingLoop.
+
+    Both the live path (converted from LiveTradingRequest via
+    _live_request_to_config) and the backtest path (constructed directly in
+    backtest_day_intraday) share this single object so all guard and entry
+    logic sees identical field names.
+    """
+    strategy_mode:          str   = STRATEGY_IRON_CONDOR
+    target_credit:          float = 0.50
+    spread_width:           int   = 10
+    quantity:               int   = 1
+    take_profit:            float = 0.10
+    stop_loss:              float = 2.0
+    monitor_interval:       int   = 1
+    entry_start_time:       str   = ENTRY_SCAN_START
+    last_entry_time:        str   = LAST_ENTRY_TIME
+    enable_stale_loss_exit: bool  = False
+    stale_loss_minutes:     int   = 120
+    stale_loss_threshold:   float = 1.5
+    stagnation_window:      int   = 30
+    min_improvement:        float = 0.05
+    skip_indicators:        bool  = True
+
+
+def _live_request_to_config(req) -> TradingDayConfig:
+    """Convert a LiveTradingRequest to the normalised TradingDayConfig."""
+    return TradingDayConfig(
+        strategy_mode          = req.strategy.value,
+        target_credit          = req.target_credit,
+        spread_width           = req.spread_width,
+        quantity               = req.contracts,
+        take_profit            = req.take_profit,
+        stop_loss              = req.stop_loss,
+        monitor_interval       = req.monitor_interval,
+        entry_start_time       = req.entry_start_time,
+        last_entry_time        = req.last_entry_time,
+        enable_stale_loss_exit = req.enable_stale_loss_exit,
+        stale_loss_minutes     = req.stale_loss_minutes,
+        stale_loss_threshold   = req.stale_loss_threshold,
+        stagnation_window      = req.stagnation_window,
+        min_improvement        = req.min_improvement,
+        skip_indicators        = req.skip_indicators,
+        # target_delta / target_prob_itm stay at 0.15 defaults (not in LiveTradingRequest)
+    )
+
+
+# ---------------------------------------------------------------------------
 # Drift guard state
 # ---------------------------------------------------------------------------
 
@@ -83,18 +135,27 @@ class LiveTradingLoop:
     def __init__(
         self,
         engine: EnhancedBacktestingEngine,
-        market_data_provider: MarketDataProvider,
+        market_data_provider: Optional[MarketDataProvider] = None,
         broker_adapter: Optional[BrokerAdapter] = None,
+        is_live: bool = True,
     ):
         self._engine   = engine
-        self._provider = market_data_provider
+        self._is_live  = is_live
+        self._provider = market_data_provider  # kept for engine-swap compatibility
         self._broker   = broker_adapter or NullBrokerAdapter()
 
-        # Fresh DeltaStrikeSelector using the live provider directly —
-        # no engine.delta_selector swap needed.
-        self._delta_selector = DeltaStrikeSelector(
-            market_data_provider, engine.ic_loader
-        )
+        # Data source: live uses the realtime provider; backtest uses the
+        # engine's Parquet-backed query engine directly — no swaps needed.
+        self._data_src = market_data_provider if is_live else engine.enhanced_query_engine
+
+        # Strike selector: live gets a fresh selector backed by the live provider;
+        # backtest reuses the engine's pre-built selector (Parquet-backed).
+        if is_live:
+            self._delta_selector = DeltaStrikeSelector(
+                market_data_provider, engine.ic_loader
+            )
+        else:
+            self._delta_selector = engine.delta_selector
 
     # ------------------------------------------------------------------
     # Public API
@@ -103,25 +164,28 @@ class LiveTradingLoop:
     def run_day(
         self,
         date: str,
-        config,                  # LiveTradingRequest
+        config,                  # LiveTradingRequest or TradingDayConfig
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> DayBacktestResult:
         """
         Run one full trading day and return a DayBacktestResult.
 
-        Blocks until market close for real-time providers; completes
-        instantly for simulation providers.
+        Accepts either a LiveTradingRequest (live path) or a TradingDayConfig
+        (backtest path).  Converts to TradingDayConfig automatically.
 
-        Performs 3 engine sub-component swaps for the duration of the day:
-          1. engine.enhanced_query_engine → live provider (for _build_* methods)
-          2. engine.strategy_builder.query_engine → _LiveQueryEngineShim
-          3. engine.strategy_builder.data_adapter.query_engine → same shim
-        All three are restored in the finally block.
+        Live path:  blocks until market close; performs 3 engine sub-component
+          swaps so that strategy_builder picks up live option prices.
+        Backtest path: completes instantly; no engine swaps; validates date.
         """
+        # Normalise config — accept either LiveTradingRequest or TradingDayConfig
+        if not isinstance(config, TradingDayConfig):
+            config = _live_request_to_config(config)
+
         logger.info(
-            f"LiveTradingLoop.run_day: {date} | mode={config.strategy.value} "
-            f"credit={config.target_credit} qty={config.contracts} "
-            f"tp={config.take_profit} sl={config.stop_loss}"
+            f"LiveTradingLoop.run_day: {date} | mode={config.strategy_mode} "
+            f"credit={config.target_credit} qty={config.quantity} "
+            f"tp={config.take_profit} sl={config.stop_loss} "
+            f"live={self._is_live}"
         )
 
         def _fire(event: Dict[str, Any]):
@@ -131,35 +195,50 @@ class LiveTradingLoop:
                 except Exception as _e:
                     logger.debug(f"progress_callback error (ignored): {_e}")
 
-        live_shim         = _LiveQueryEngineShim(self._provider)
-        orig_qe           = self._engine.enhanced_query_engine
-        orig_sb_qe        = self._engine.strategy_builder.query_engine
-        orig_sb_da_qe     = self._engine.strategy_builder.data_adapter.query_engine
+        if self._is_live:
+            # 3 engine swaps for the duration of the day (restored in finally)
+            live_shim         = _LiveQueryEngineShim(self._provider)
+            orig_qe           = self._engine.enhanced_query_engine
+            orig_sb_qe        = self._engine.strategy_builder.query_engine
+            orig_sb_da_qe     = self._engine.strategy_builder.data_adapter.query_engine
 
-        try:
-            self._engine.enhanced_query_engine                      = self._provider
-            self._engine.strategy_builder.query_engine              = live_shim
-            self._engine.strategy_builder.data_adapter.query_engine = live_shim
+            try:
+                self._engine.enhanced_query_engine                      = self._provider
+                self._engine.strategy_builder.query_engine              = live_shim
+                self._engine.strategy_builder.data_adapter.query_engine = live_shim
+                return self._run_day_inner(date, config, _fire)
+            finally:
+                self._engine.enhanced_query_engine                      = orig_qe
+                self._engine.strategy_builder.query_engine              = orig_sb_qe
+                self._engine.strategy_builder.data_adapter.query_engine = orig_sb_da_qe
+        else:
+            # Backtest path — validate date against Parquet data
+            if date not in self._engine.available_dates:
+                provider_dates = getattr(self._data_src, 'available_dates', None) or []
+                if date not in provider_dates:
+                    logger.warning(
+                        f"Date {date} not found in Parquet dataset or injected provider — skipping. "
+                        f"Parquet has {len(self._engine.available_dates)} dates "
+                        f"(latest: {self._engine.available_dates[-1] if self._engine.available_dates else 'none'})."
+                    )
+                    return DayBacktestResult(date=date, trades=[], total_pnl=0.0,
+                                             trade_count=0, scan_minutes_checked=0)
             return self._run_day_inner(date, config, _fire)
-        finally:
-            self._engine.enhanced_query_engine                      = orig_qe
-            self._engine.strategy_builder.query_engine              = orig_sb_qe
-            self._engine.strategy_builder.data_adapter.query_engine = orig_sb_da_qe
 
     # ------------------------------------------------------------------
     # Inner loop (called after engine sub-components are swapped)
     # ------------------------------------------------------------------
 
-    def _run_day_inner(self, date: str, config, fire) -> DayBacktestResult:
-        strategy_mode = config.strategy.value
-        quantity      = config.contracts
+    def _run_day_inner(self, date: str, config: TradingDayConfig, fire) -> DayBacktestResult:
+        strategy_mode = config.strategy_mode
+        quantity      = config.quantity
         entry_start   = config.entry_start_time
         last_entry    = config.last_entry_time
         skip_ind      = config.skip_indicators
 
         # Build per-run monitor; strategy_builder already points to live shim.
         monitor = IntradayPositionMonitor(
-            self._provider,
+            self._data_src,
             self._engine.strategy_builder,
             take_profit       = config.take_profit,
             stop_loss         = config.stop_loss,
@@ -173,7 +252,7 @@ class LiveTradingLoop:
         # Fetch SPX opening price for drift guards
         spx_open: Optional[float] = None
         for _t0 in ("09:30:00", "09:31:00", "09:32:00", "09:35:00"):
-            _p = self._provider.get_fastest_spx_price(date, _t0)
+            _p = self._data_src.get_fastest_spx_price(date, _t0)
             if _p and _p > 0:
                 spx_open = float(_p)
                 break
@@ -188,7 +267,7 @@ class LiveTradingLoop:
                 if t < entry_start
             ]
             for _pt in pre_times:
-                _pp = self._provider.get_fastest_spx_price(date, _pt)
+                _pp = self._data_src.get_fastest_spx_price(date, _pt)
                 if _pp and _pp > 0:
                     self._step2_update_drift(float(_pp), guards, _pt)
             logger.debug(
@@ -214,8 +293,10 @@ class LiveTradingLoop:
         _had_call_spread_win_today = False
         _had_put_spread_win_today  = False
 
-        # Per-bar SPX history for indicator computation (full mode only)
-        _spx_history: List[float] = []
+        # Per-bar SPX history for indicator computation (full mode only).
+        # Stored as instance variable so _get_spx_series() can access it for
+        # live mode without needing a parameter.  Reset at start of each day.
+        self._spx_history: List[float] = []
 
         trades: List[EnhancedBacktestResult] = []
         scan_times = _build_minute_grid(date, entry_start, FINAL_EXIT_TIME)
@@ -231,7 +312,7 @@ class LiveTradingLoop:
             if spx is None:
                 continue
 
-            _spx_history.append(spx)
+            self._spx_history.append(spx)
 
             # ── STEP 2: update drift guards ────────────────────────────
             self._step2_update_drift(spx, guards, current_time)
@@ -296,6 +377,30 @@ class LiveTradingLoop:
                     f"cost={total_ps:.3f}/share | "
                     + ("EXIT: both sides" if (ic_leg_status.put_side_closed and ic_leg_status.call_side_closed) else "HOLD")
                 )
+
+                # Stale-loss check per IC leg (skip on final bar — hard close handles it)
+                if config.enable_stale_loss_exit and not is_final_bar:
+                    put_credit_ps, call_credit_ps = monitor._get_ic_side_entry_credits(open_ic, ic_qty)
+                    if not ic_leg_status.put_side_closed:
+                        stale, stale_reason = monitor.check_stale_loss(
+                            ic_checkpoints, put_credit_ps, cost_key="put_cost_per_share"
+                        )
+                        if stale:
+                            ic_leg_status.put_side_closed      = True
+                            ic_leg_status.put_side_exit_time   = current_time
+                            ic_leg_status.put_side_exit_cost   = raw_put
+                            ic_leg_status.put_side_exit_reason = stale_reason
+                            logger.info(f"IC put-side stale-loss exit at {current_time}: {stale_reason}")
+                    if not ic_leg_status.call_side_closed:
+                        stale, stale_reason = monitor.check_stale_loss(
+                            ic_checkpoints, call_credit_ps, cost_key="call_cost_per_share"
+                        )
+                        if stale:
+                            ic_leg_status.call_side_closed      = True
+                            ic_leg_status.call_side_exit_time   = current_time
+                            ic_leg_status.call_side_exit_cost   = raw_call
+                            ic_leg_status.call_side_exit_reason = stale_reason
+                            logger.info(f"IC call-side stale-loss exit at {current_time}: {stale_reason}")
 
                 if ic_leg_status.put_side_closed and ic_leg_status.call_side_closed:
                     total_exit = (
@@ -369,6 +474,14 @@ class LiveTradingLoop:
                     + ("EXIT: " + reason if should_exit else "HOLD")
                 )
 
+                # Stale-loss check (skip regular take-profit/stop-loss hits and final bar)
+                if config.enable_stale_loss_exit and not is_final_bar and not should_exit:
+                    stale, stale_reason = monitor.check_stale_loss(put_spread_checkpoints, ec_ps)
+                    if stale:
+                        should_exit = True
+                        reason = stale_reason
+                        logger.info(f"Put spread stale-loss exit at {current_time}: {stale_reason}")
+
                 if should_exit:
                     pnl = ps_credit - current_cost
                     result = self._make_result(
@@ -434,6 +547,14 @@ class LiveTradingLoop:
                     + ("EXIT: " + reason if should_exit else "HOLD")
                 )
 
+                # Stale-loss check (skip regular take-profit/stop-loss hits and final bar)
+                if config.enable_stale_loss_exit and not is_final_bar and not should_exit:
+                    stale, stale_reason = monitor.check_stale_loss(call_spread_checkpoints, ec_ps)
+                    if stale:
+                        should_exit = True
+                        reason = stale_reason
+                        logger.info(f"Call spread stale-loss exit at {current_time}: {stale_reason}")
+
                 if should_exit:
                     pnl = cs_credit - current_cost
                     result = self._make_result(
@@ -466,7 +587,7 @@ class LiveTradingLoop:
 
             # ── STEP 4: evaluate entry ─────────────────────────────────
             if not is_past_entry_cutoff and not is_final_bar:
-                spx_series = pd.Series(_spx_history) if _spx_history else None
+                spx_series = self._get_spx_series(date, current_time)
 
                 strategy, s_type, meta = self._step4_evaluate_entry(
                     date, current_time, spx, spx_series, guards, config,
@@ -516,7 +637,7 @@ class LiveTradingLoop:
                         fire(entry_event)
 
         # ── Force-close any remaining open positions at FINAL_EXIT_TIME ──
-        final_spx = self._provider.get_fastest_spx_price(date, FINAL_EXIT_TIME) or 0.0
+        final_spx = self._data_src.get_fastest_spx_price(date, FINAL_EXIT_TIME) or 0.0
         for _open_pos, _meta, _stype, _checkpoints in [
             (open_ic,         ic_entry_meta,    StrategyType.IRON_CONDOR, ic_checkpoints),
             (open_put_spread,  put_spread_meta,  StrategyType.PUT_SPREAD,  put_spread_checkpoints),
@@ -597,10 +718,11 @@ class LiveTradingLoop:
 
     def _step1_get_spx_price(self, date: str, bar_time: str) -> Optional[float]:
         """
-        Fetch live SPX price for this bar.  For RealtimeMarketDataProvider
-        this call blocks until the bar minute has elapsed (pacing the loop).
+        Fetch SPX price for this bar.  For RealtimeMarketDataProvider this
+        call blocks until the bar minute has elapsed (live pacing).
+        For backtest (Parquet) providers it is a fast dictionary lookup.
         """
-        price = self._provider.get_fastest_spx_price(date, bar_time)
+        price = self._data_src.get_fastest_spx_price(date, bar_time)
         if price and price > 0:
             logger.info(f"STEP 1 | {bar_time} | SPX={price:.2f}")
             return float(price)
@@ -644,6 +766,24 @@ class LiveTradingLoop:
         return drift
 
     # ------------------------------------------------------------------
+    # SPX price history helper
+    # ------------------------------------------------------------------
+
+    def _get_spx_series(self, date: str, bar_time: str) -> Optional[pd.Series]:
+        """
+        Return a pd.Series of recent SPX prices for indicator computation.
+
+        Live mode:  returns self._spx_history built incrementally bar-by-bar.
+        Backtest mode: fetches the last 60 bars from Parquet via the engine's
+            get_spx_price_history() so that RSI/BB are fully warm on any bar.
+        """
+        if self._is_live:
+            return pd.Series(self._spx_history) if self._spx_history else None
+        else:
+            hist = self._engine.get_spx_price_history(date, bar_time, lookback_minutes=60)
+            return hist if hist is not None and len(hist) > 0 else None
+
+    # ------------------------------------------------------------------
     # Step 4: evaluate entry
     # ------------------------------------------------------------------
 
@@ -669,7 +809,7 @@ class LiveTradingLoop:
         if spx <= 0:
             return None, None, {}
 
-        strategy_mode = config.strategy.value
+        strategy_mode = config.strategy_mode
         skip_ind      = config.skip_indicators
         day_drift     = (spx - guards.spx_open) if guards.spx_open else 0.0
 
@@ -855,7 +995,7 @@ class LiveTradingLoop:
         Select strikes and build a strategy object.
         Returns (strategy, strategy_type, entry_meta) or (None, None, {}).
         """
-        # Strike selection (uses self._delta_selector with live provider)
+        # Strike selection (uses self._delta_selector with live provider or Parquet)
         selection = self._delta_selector.select_strikes_by_delta(
             date=date,
             timestamp=bar_time,
@@ -897,15 +1037,15 @@ class LiveTradingLoop:
         # enhanced_query_engine → swapped to live provider in run_day)
         if s_type == StrategyType.IRON_CONDOR:
             strategy = self._engine._build_iron_condor_strategy(
-                date, bar_time, selection, config.contracts
+                date, bar_time, selection, config.quantity
             )
         elif s_type == StrategyType.PUT_SPREAD:
             strategy = self._engine._build_put_spread_strategy(
-                date, bar_time, selection, config.contracts
+                date, bar_time, selection, config.quantity
             )
         else:
             strategy = self._engine._build_call_spread_strategy(
-                date, bar_time, selection, config.contracts
+                date, bar_time, selection, config.quantity
             )
 
         if strategy is None:
