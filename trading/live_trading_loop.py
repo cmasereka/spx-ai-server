@@ -32,7 +32,7 @@ from enhanced_backtest import (
     IronCondorLegStatus, EnhancedBacktestResult, StrikeSelection,
     DayBacktestResult,
 )
-from delta_strike_selector import (
+from strike_selector import (
     StrikeSelector, IntradayPositionMonitor, IronCondorStrikeSelection,
 )
 from enhanced_multi_strategy import (
@@ -97,7 +97,6 @@ def _live_request_to_config(req) -> TradingDayConfig:
         stagnation_window      = req.stagnation_window,
         min_improvement        = req.min_improvement,
         skip_indicators        = req.skip_indicators,
-        # target_delta / target_prob_itm stay at 0.15 defaults (not in LiveTradingRequest)
     )
 
 

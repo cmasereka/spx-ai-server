@@ -26,7 +26,7 @@ from .models import (
 from .websocket_manager import WebSocketManager
 from enhanced_multi_strategy import EnhancedBacktestingEngine
 from enhanced_backtest import EnhancedBacktestResult, StrategyType as ST
-from delta_strike_selector import IronCondorStrikeSelection
+from strike_selector import IronCondorStrikeSelection
 from market_data.ibkr_provider import IBKRMarketDataProvider
 from market_data.realtime_provider import RealtimeMarketDataProvider
 from broker.null_adapter import NullBrokerAdapter

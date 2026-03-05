@@ -160,8 +160,6 @@ def create_test_configuration():
         "TEST_DATES": SAMPLE_DATES,
         "TEST_SPX_PRICES": SAMPLE_SPX_PRICES,
         "DEFAULT_STRATEGY_PARAMS": {
-            "target_delta": 0.15,
-            "target_prob_itm": 0.15,
             "min_spread_width": 10,
             "decay_threshold": 0.1,
             "entry_time": "10:00:00",

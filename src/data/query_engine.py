@@ -259,57 +259,6 @@ class BacktestQueryEngine:
         
         return liquid_options.sort_values('spread_pct')
     
-    def get_option_by_delta(self, date: Union[str, datetime],
-                          target_time: Union[str, datetime, time],
-                          target_delta: float,
-                          option_type: str = 'call',
-                          tolerance: float = 0.05) -> Optional[pd.Series]:
-        """
-        Find option closest to target delta.
-        
-        Args:
-            date: Trading date
-            target_time: Target time
-            target_delta: Target delta value (0.0 to 1.0 for calls, -1.0 to 0.0 for puts)
-            option_type: 'call' or 'put' (or 'C'/'P')
-            tolerance: Maximum delta difference tolerance
-            
-        Returns:
-            Option data as Series or None
-        """
-        # Normalize option type
-        option_type = option_type.upper()
-        if option_type in ['CALL', 'CALLS']:
-            option_type = 'C'
-        elif option_type in ['PUT', 'PUTS']:
-            option_type = 'P'
-        
-        options_chain = self.loader.get_options_chain_at_time(date, target_time)
-        
-        if options_chain.empty:
-            return None
-        
-        # Filter by option type
-        type_filtered = options_chain[options_chain['right'] == option_type]
-        
-        if type_filtered.empty:
-            return None
-        
-        # Find closest delta (if delta column exists)
-        if 'delta' not in type_filtered.columns:
-            logger.warning("Delta column not found in options data")
-            return None
-        
-        # Calculate delta differences
-        delta_diff = (type_filtered['delta'] - target_delta).abs()
-        closest_idx = delta_diff.idxmin()
-        
-        # Check if within tolerance
-        if delta_diff.loc[closest_idx] <= tolerance:
-            return type_filtered.loc[closest_idx]
-        
-        return None
-    
     def get_option_by_moneyness(self, date: Union[str, datetime],
                               target_time: Union[str, datetime, time],
                               moneyness: float,

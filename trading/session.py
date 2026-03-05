@@ -5,7 +5,7 @@ Orchestrates a single trading day using:
   - A MarketDataProvider  (Parquet for simulation, IBKR for live)
   - A BrokerAdapter       (Null for simulation, IBKR for live)
   - The same TechnicalAnalyzer and StrategySelector used in backtesting
-  - The same DeltaStrikeSelector for strike selection
+  - The same StrikeSelector for strike selection
   - The same entry guards (drift, RSI, reversal) from enhanced_multi_strategy
 
 This design keeps the engine logic identical across simulation, paper, and live
@@ -114,7 +114,7 @@ from enhanced_backtest import (
     StrategyType, TechnicalAnalyzer, StrategySelector,
     EnhancedBacktestResult, IronCondorLegStatus, DayBacktestResult,
 )
-from delta_strike_selector import (
+from strike_selector import (
     StrikeSelector, IntradayPositionMonitor,
     IronCondorStrikeSelection,
 )

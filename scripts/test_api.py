@@ -54,7 +54,6 @@ def test_start_backtest():
         "mode": "single_day",
         "single_date": "2026-02-09",
         "strategy_type": "iron_condor",
-        "target_delta": 0.15,
         "put_distance": 50,
         "call_distance": 50,
         "spread_width": 10,

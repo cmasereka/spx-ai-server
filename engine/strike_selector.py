@@ -219,9 +219,6 @@ class StrikeSelector:
         )
 
 
-# Backward-compatible alias
-DeltaStrikeSelector = StrikeSelector
-
 
 class IntradayPositionMonitor:
     """

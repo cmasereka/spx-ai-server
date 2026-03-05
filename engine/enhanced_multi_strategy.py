@@ -20,7 +20,7 @@ from engine.enhanced_backtest import (
     EnhancedBacktestResult, TechnicalAnalyzer, StrategySelector,
     EnhancedMultiStrategyBacktester, IronCondorLegStatus, DayBacktestResult
 )
-from engine.delta_strike_selector import StrikeSelector, IntradayPositionMonitor, StrikeSelection, IronCondorStrikeSelection
+from engine.strike_selector import StrikeSelector, IntradayPositionMonitor, StrikeSelection, IronCondorStrikeSelection
 from engine.query_engine_adapter import EnhancedQueryEngineAdapter
 
 
@@ -174,7 +174,6 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
 
 
     def _try_open_strategy(self, date: str, timestamp: str, strategy_type: StrategyType,
-                           target_delta: float, target_prob_itm: float,
                            min_spread_width: int, quantity: int,
                            target_credit: Optional[float] = None,
                            spx_history: Optional[pd.Series] = None):
@@ -200,7 +199,7 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
 
             spx_price = self.enhanced_query_engine.get_fastest_spx_price(date, timestamp) or 0
             if spx_price > 0:
-                from engine.delta_strike_selector import IronCondorStrikeSelection
+                from engine.strike_selector import IronCondorStrikeSelection
 
                 # --- Dynamic minimum distance (Recommendation 2) ---
                 # IC: scale base distance with morning range (both sides exposed).
@@ -312,8 +311,6 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                                    date: str,
                                    entry_time: str = "10:00:00",
                                    exit_time: str = "15:45:00",
-                                   target_delta: float = 0.15,
-                                   target_prob_itm: float = 0.15,
                                    min_spread_width: int = 10,
                                    take_profit: float = 0.10,
                                    stop_loss: float = 2.0,
@@ -324,8 +321,6 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
         """Legacy single-day method — runs intraday scan and returns first trade result."""
         day_result = self.backtest_day_intraday(
             date=date,
-            target_delta=target_delta,
-            target_prob_itm=target_prob_itm,
             min_spread_width=min_spread_width,
             take_profit=take_profit,
             stop_loss=stop_loss,
@@ -607,9 +602,7 @@ def run_enhanced_backtest():
                         choices=[STRATEGY_IRON_CONDOR, STRATEGY_CREDIT_SPREADS, STRATEGY_IC_CREDIT_SPREADS],
                         help="Strategy mode (default: iron_condor)")
     parser.add_argument("--contracts", type=int, default=1, help="Number of contracts per position (default: 1)")
-    parser.add_argument("--target-delta", type=float, default=0.15, help="Target delta for short strikes")
     parser.add_argument("--target-credit", type=float, default=0.50, help="Target net credit per spread per share (default: 0.50)")
-    parser.add_argument("--target-prob-itm", type=float, default=0.15, help="Target probability ITM")
     parser.add_argument("--take-profit", type=float, default=0.10, help="Take profit: exit when cost/share drops to this value (default: 0.10)")
     parser.add_argument("--stop-loss", type=float, default=2.0, help="Stop loss: exit when cost/share reaches this value (default: 2.0)")
     parser.add_argument("--monitor-interval", type=int, default=1, help="Minutes between position checks (default: 1)")
@@ -625,8 +618,6 @@ def run_enhanced_backtest():
         # Single day intraday scan
         day_result = engine.backtest_day_intraday(
             date=args.date,
-            target_delta=args.target_delta,
-            target_prob_itm=args.target_prob_itm,
             take_profit=args.take_profit,
             stop_loss=args.stop_loss,
             monitor_interval=args.monitor_interval,
@@ -654,8 +645,6 @@ def run_enhanced_backtest():
             logger.info(f"Intraday scan {i}/{len(test_dates)}: {date}")
             day_result = engine.backtest_day_intraday(
                 date=date,
-                target_delta=args.target_delta,
-                target_prob_itm=args.target_prob_itm,
                 take_profit=args.take_profit,
                 stop_loss=args.stop_loss,
                 monitor_interval=args.monitor_interval,

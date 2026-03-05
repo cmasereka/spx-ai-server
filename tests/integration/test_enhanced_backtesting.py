@@ -33,8 +33,8 @@ class TestEnhancedBacktestingEngine:
         with patch('enhanced_multi_strategy.EnhancedQueryEngineAdapter') as mock_adapter:
             mock_adapter.return_value = MockQueryEngine()
             
-            with patch('delta_strike_selector.StrikeSelector') as mock_selector:
-                with patch('delta_strike_selector.PositionMonitor') as mock_monitor_cls:
+            with patch('strike_selector.StrikeSelector') as mock_selector:
+                with patch('strike_selector.PositionMonitor') as mock_monitor_cls:
                     self.engine = EnhancedBacktestingEngine("tests/fixtures/test_data")
     
     def test_enhanced_backtest_single_day_success(self):
@@ -47,7 +47,7 @@ class TestEnhancedBacktestingEngine:
                 mock_history.return_value = pd.Series([SAMPLE_SPX_PRICE] * 50)
                 
                 with patch.object(self.engine, 'strike_selector') as mock_delta:
-                    from delta_strike_selector import StrikeSelection
+                    from strike_selector import StrikeSelection
                     mock_delta.select_strikes.return_value = StrikeSelection(
                         short_strike=6900.0,
                         long_strike=6875.0,
@@ -76,7 +76,6 @@ class TestEnhancedBacktestingEngine:
                             # Run the test
                             result = self.engine.enhanced_backtest_single_day(
                                 date=SAMPLE_DATE,
-                                target_delta=0.15,
                                 decay_threshold=0.1
                             )
                             
@@ -94,8 +93,7 @@ class TestEnhancedBacktestingEngine:
         self.engine.available_dates = []
         
         result = self.engine.enhanced_backtest_single_day(
-            date=SAMPLE_DATE,
-            target_delta=0.15
+            date=SAMPLE_DATE
         )
         
         # Should return failed result
@@ -111,8 +109,7 @@ class TestEnhancedBacktestingEngine:
             self.engine.available_dates = [SAMPLE_DATE]
             
             result = self.engine.enhanced_backtest_single_day(
-                date=SAMPLE_DATE,
-                target_delta=0.15
+                date=SAMPLE_DATE
             )
             
             assert result.success is False
@@ -132,8 +129,7 @@ class TestEnhancedBacktestingEngine:
                     self.engine.available_dates = [SAMPLE_DATE]
                     
                     result = self.engine.enhanced_backtest_single_day(
-                        date=SAMPLE_DATE,
-                        target_delta=0.15
+                        date=SAMPLE_DATE
                     )
                     
                     assert result.success is False
@@ -148,7 +144,7 @@ class TestEnhancedBacktestingEngine:
                 mock_history.return_value = pd.Series([SAMPLE_SPX_PRICE] * 50)
                 
                 with patch.object(self.engine, 'strike_selector') as mock_delta:
-                    from delta_strike_selector import StrikeSelection
+                    from strike_selector import StrikeSelection
                     mock_delta.select_strikes.return_value = StrikeSelection(
                         short_strike=6900.0,
                         long_strike=6875.0,
@@ -161,8 +157,7 @@ class TestEnhancedBacktestingEngine:
                         self.engine.available_dates = [SAMPLE_DATE]
                         
                         result = self.engine.enhanced_backtest_single_day(
-                            date=SAMPLE_DATE,
-                            target_delta=0.15
+                            date=SAMPLE_DATE
                         )
                         
                         assert result.success is False
@@ -196,7 +191,7 @@ class TestBacktestingWorkflow:
     
     def test_strategy_selection_to_strike_selection(self):
         """Test the flow from strategy selection to strike selection."""
-        from delta_strike_selector import StrikeSelector, StrikeSelection
+        from strike_selector import StrikeSelector, StrikeSelection
         from enhanced_backtest import StrategySelection, StrategyType, MarketSignal
 
         mock_query_engine = MockQueryEngine()
@@ -235,7 +230,7 @@ class TestBacktestingWorkflow:
         strategy_selection = selector.select_strategy(indicators)
         
         # 3. Mock Strike Selection (simplified)
-        from delta_strike_selector import StrikeSelection
+        from strike_selector import StrikeSelection
         strike_selection = StrikeSelection(
             short_strike=6900.0,
             long_strike=6875.0 if strategy_selection.strategy_type == StrategyType.PUT_SPREAD else 6925.0,
@@ -327,7 +322,7 @@ class TestErrorHandlingAndRecovery:
         mock_query_engine.get_fastest_spx_price.return_value = SAMPLE_SPX_PRICE
         mock_query_engine.get_options_data.return_value = None  # No options data
         
-        from delta_strike_selector import StrikeSelector
+        from strike_selector import StrikeSelector
         selector = StrikeSelector(mock_query_engine, Mock())
 
         result = selector.select_strikes(

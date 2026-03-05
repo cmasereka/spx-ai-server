@@ -463,7 +463,7 @@ class BacktestService:
                               backtest_id: str) -> BacktestResult:
         """Convert engine result to API format"""
         from enhanced_backtest import StrategyType as ST
-        from delta_strike_selector import IronCondorStrikeSelection
+        from strike_selector import IronCondorStrikeSelection
 
         ss = result.strike_selection
         is_ic = (result.strategy_type == ST.IRON_CONDOR)
@@ -553,7 +553,6 @@ class BacktestService:
                 single_date=request.single_date,
 
                 # Strategy parameters
-                target_delta=0.0,
                 put_distance=0,
                 call_distance=0,
                 spread_width=request.spread_width,

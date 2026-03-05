@@ -34,7 +34,7 @@ def generate_test_summary():
         ("Unit Tests", "tests/unit/"),
         ("Technical Analysis", "tests/unit/test_technical_analysis.py"),
         ("Options Strategies", "tests/unit/test_options_strategies.py"),
-        ("Delta Strike Selector", "tests/unit/test_delta_strike_selector.py"),
+        ("Strike Selector", "tests/unit/test_strike_selector.py"),
     ]
     
     overall_success = True

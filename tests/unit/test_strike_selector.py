@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch, MagicMock
 import sys
 sys.path.append('.')
 
-from delta_strike_selector import StrikeSelector, IntradayPositionMonitor, StrikeSelection, IronCondorStrikeSelection
+from strike_selector import StrikeSelector, IntradayPositionMonitor, StrikeSelection, IronCondorStrikeSelection
 from enhanced_backtest import StrategyType, IronCondorLegStatus
 from tests.conftest import (
     TestDataGenerator, MockQueryEngine, assert_valid_strike_selection,

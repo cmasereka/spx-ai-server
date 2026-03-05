@@ -24,7 +24,6 @@ class BacktestRun(Base):
     single_date = Column(Date, nullable=True)
     
     # Strategy parameters
-    target_delta = Column(Float, nullable=False)
     put_distance = Column(Integer, nullable=False)
     call_distance = Column(Integer, nullable=False)
     spread_width = Column(Integer, nullable=False)
