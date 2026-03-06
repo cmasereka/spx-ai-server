@@ -6,6 +6,7 @@ Pydantic models for request/response validation and serialization.
 from datetime import datetime, date
 from enum import Enum
 from typing import Dict, List, Optional, Any, Union
+import uuid
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
@@ -504,6 +505,12 @@ class LiveTradingRequest(BaseModel):
         True,
         description="When True, skip RSI/MACD/Bollinger warmup and use drift-only entry guards. "
                     "Useful for debugging or when indicator data is unavailable at session start."
+    )
+
+    broker_config_id: Optional[uuid.UUID] = Field(
+        None,
+        description="UUID of an approved UserBrokerConfig to use for credentials. "
+                    "When set, overrides any tastytrade fields and env-var fallback."
     )
 
     @field_validator("trade_date")
