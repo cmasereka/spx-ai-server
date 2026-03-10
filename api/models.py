@@ -20,9 +20,10 @@ class BacktestModeEnum(str, Enum):
 
 class BacktestStrategyEnum(str, Enum):
     """Strategy mode controlling which trade types are considered"""
-    IRON_CONDOR     = "iron_condor"       # IC entries only
-    CREDIT_SPREADS  = "credit_spreads"    # Put / call spreads only, no IC
-    IC_CREDIT_SPREADS = "ic_credit_spreads"  # All entry types (current behaviour)
+    IRON_CONDOR       = "iron_condor"         # IC entries only
+    CREDIT_SPREADS    = "credit_spreads"      # Put / call spreads only, no IC
+    IC_CREDIT_SPREADS = "ic_credit_spreads"   # All entry types (current behaviour)
+    DEBIT_SPREADS     = "debit_spreads"       # Directional debit spreads only
 
 
 class BacktestStatusEnum(str, Enum):
@@ -100,7 +101,36 @@ class BacktestRequest(BaseModel):
                     "keep the position open. Default $0.05/share."
     )
 
-    @field_validator('start_date', 'end_date', 'single_date')
+    # ── Debit-spread specific parameters (only used when strategy='debit_spreads') ──
+    target_debit: float = Field(
+        1.00, ge=0.10, le=5.0,
+        description="Target net debit per spread per share when entering debit spreads. "
+                    "E.g. 1.00 = aim to pay ~$1.00/share ($100/contract)."
+    )
+    debit_take_profit_pct: float = Field(
+        0.60, ge=0.10, le=0.99,
+        description="Close the debit spread when its mark-to-market value reaches this fraction "
+                    "of the theoretical max profit. E.g. 0.60 = exit at 60% of max profit."
+    )
+    debit_stop_loss_pct: float = Field(
+        0.50, ge=0.05, le=0.99,
+        description="Close the debit spread when it has lost this fraction of the debit paid. "
+                    "E.g. 0.50 = exit when the spread has lost 50% of its entry debit."
+    )
+    debit_last_entry_time: str = Field(
+        "14:00:00",
+        description="No new debit spread entries at or after this time (HH:MM:SS)."
+    )
+    debit_time_stop: str = Field(
+        "15:30:00",
+        description="Hard close all open debit positions by this time (HH:MM:SS) regardless of P&L. "
+                    "Protects against extreme afternoon theta decay."
+    )
+    debit_min_trend_points: float = Field(
+        10.0, ge=5.0, le=100.0,
+        description="Minimum directional SPX move (points from open) required before a debit "
+                    "spread entry is allowed. Ensures a trend is already established."
+    )
     @classmethod
     def validate_dates(cls, v):
         if v and v > date.today():
@@ -505,6 +535,32 @@ class LiveTradingRequest(BaseModel):
         True,
         description="When True, skip RSI/MACD/Bollinger warmup and use drift-only entry guards. "
                     "Useful for debugging or when indicator data is unavailable at session start."
+    )
+
+    # ── Debit-spread specific parameters (only used when strategy='debit_spreads') ──
+    target_debit: float = Field(
+        1.00, ge=0.10, le=5.0,
+        description="Target net debit per spread per share when entering debit spreads."
+    )
+    debit_take_profit_pct: float = Field(
+        0.60, ge=0.10, le=0.99,
+        description="Close debit spread when its value reaches this fraction of theoretical max profit."
+    )
+    debit_stop_loss_pct: float = Field(
+        0.50, ge=0.05, le=0.99,
+        description="Close debit spread when it has lost this fraction of the debit paid."
+    )
+    debit_last_entry_time: str = Field(
+        "14:00:00",
+        description="No new debit spread entries at or after this time (HH:MM:SS)."
+    )
+    debit_time_stop: str = Field(
+        "15:30:00",
+        description="Hard close all open debit positions by this time (HH:MM:SS) regardless of P&L."
+    )
+    debit_min_trend_points: float = Field(
+        10.0, ge=5.0, le=100.0,
+        description="Minimum directional SPX move (points from open) required for a debit entry."
     )
 
     broker_config_id: Optional[uuid.UUID] = Field(

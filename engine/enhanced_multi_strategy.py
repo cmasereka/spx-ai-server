@@ -66,9 +66,10 @@ INTRADAY_PUT_REVERSAL_POINTS  = 10.0
 CALL_SPREAD_MAX_ENTRY_RSI = 77.0
 
 # Strategy mode constants (match BacktestStrategyEnum values)
-STRATEGY_IRON_CONDOR     = "iron_condor"
-STRATEGY_CREDIT_SPREADS  = "credit_spreads"
+STRATEGY_IRON_CONDOR       = "iron_condor"
+STRATEGY_CREDIT_SPREADS    = "credit_spreads"
 STRATEGY_IC_CREDIT_SPREADS = "ic_credit_spreads"
+STRATEGY_DEBIT_SPREADS     = "debit_spreads"
 
 
 def _build_minute_grid(date: str, start_time: str, end_time: str) -> List[str]:
@@ -135,13 +136,22 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
                               stagnation_window: int = 30,
                               min_improvement: float = 0.05,
                               enable_stale_loss_exit: bool = False,
-                              skip_indicators: bool = True) -> DayBacktestResult:
+                              skip_indicators: bool = True,
+                              # Debit spread parameters
+                              target_debit: float = 1.00,
+                              debit_take_profit_pct: float = 0.60,
+                              debit_stop_loss_pct: float = 0.50,
+                              debit_last_entry_time: str = "14:00:00",
+                              debit_time_stop: str = "15:30:00",
+                              debit_min_trend_points: float = 10.0,
+                              ) -> DayBacktestResult:
         """
         Full intraday scan loop for one trading day.
         strategy_mode controls which entry types are allowed:
           iron_condor       — IC only
           credit_spreads    — put/call spreads only
           ic_credit_spreads — all types
+          debit_spreads     — directional debit spreads only
 
         Delegates to LiveTradingLoop(is_live=False) so that all guard and
         entry logic is shared with the live trading path.  Import is done
@@ -168,6 +178,12 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
             stagnation_window      = stagnation_window,
             min_improvement        = min_improvement,
             skip_indicators        = skip_indicators,
+            target_debit           = target_debit,
+            debit_take_profit_pct  = debit_take_profit_pct,
+            debit_stop_loss_pct    = debit_stop_loss_pct,
+            debit_last_entry_time  = debit_last_entry_time,
+            debit_time_stop        = debit_time_stop,
+            debit_min_trend_points = debit_min_trend_points,
         )
         loop = LiveTradingLoop(engine=self, is_live=False)
         return loop.run_day(date=date, config=cfg, progress_callback=progress_callback)
@@ -307,6 +323,42 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
             logger.warning(f"Expiry cost calculation failed ({strategy_type}): {e}")
         return 0.0
 
+    def _expiry_debit_value(self, strategy, strategy_type: StrategyType, spx_price: float) -> float:
+        """
+        Compute the settlement value RECEIVED at expiry for a debit spread.
+        Returns a positive dollar amount (the gain portion that settles ITM).
+
+        For debit spreads, the P&L at expiry = expiry_value - entry_debit.
+        """
+        try:
+            quantity = getattr(strategy, 'quantity', 1)
+
+            if strategy_type == StrategyType.DEBIT_PUT_SPREAD:
+                # long high-strike put, short low-strike put
+                long_leg  = next((l for l in strategy.legs if l.position_side.name == 'LONG'),  None)
+                short_leg = next((l for l in strategy.legs if l.position_side.name == 'SHORT'), None)
+                if not long_leg or not short_leg:
+                    return 0.0
+                long_val   = max(0.0, long_leg.strike  - spx_price)
+                short_val  = max(0.0, short_leg.strike - spx_price)
+                spread_w   = long_leg.strike - short_leg.strike
+                return min(max(long_val - short_val, 0.0), spread_w) * 100 * quantity
+
+            elif strategy_type == StrategyType.DEBIT_CALL_SPREAD:
+                # long low-strike call, short high-strike call
+                long_leg  = next((l for l in strategy.legs if l.position_side.name == 'LONG'),  None)
+                short_leg = next((l for l in strategy.legs if l.position_side.name == 'SHORT'), None)
+                if not long_leg or not short_leg:
+                    return 0.0
+                long_val   = max(0.0, spx_price - long_leg.strike)
+                short_val  = max(0.0, spx_price - short_leg.strike)
+                spread_w   = short_leg.strike - long_leg.strike
+                return min(max(long_val - short_val, 0.0), spread_w) * 100 * quantity
+
+        except Exception as e:
+            logger.warning(f"Expiry debit value calculation failed ({strategy_type}): {e}")
+        return 0.0
+
     def enhanced_backtest_single_day(self,
                                    date: str,
                                    entry_time: str = "10:00:00",
@@ -420,7 +472,27 @@ class EnhancedBacktestingEngine(EnhancedMultiStrategyBacktester):
     
     def _build_call_spread_strategy(self, date: str, timestamp: str, strike_selection: StrikeSelection, quantity: int):
         """Build Call Spread strategy"""
-        # Build call spread using existing infrastructure  
+        # Build call spread using existing infrastructure
+        return self._build_single_spread(date, timestamp, strike_selection, quantity, 'call')
+
+    def _build_debit_put_spread_strategy(self, date: str, timestamp: str,
+                                          strike_selection: StrikeSelection, quantity: int):
+        """
+        Build a debit put spread (bearish).
+        strike_selection.long_strike  = near-ATM put we are LONG  (higher strike)
+        strike_selection.short_strike = further-OTM put we are SHORT (lower strike)
+        VerticalSpread will detect entry_debit > 0 because long_leg is more expensive.
+        """
+        return self._build_single_spread(date, timestamp, strike_selection, quantity, 'put')
+
+    def _build_debit_call_spread_strategy(self, date: str, timestamp: str,
+                                           strike_selection: StrikeSelection, quantity: int):
+        """
+        Build a debit call spread (bullish).
+        strike_selection.long_strike  = near-ATM call we are LONG  (lower strike)
+        strike_selection.short_strike = further-OTM call we are SHORT (higher strike)
+        VerticalSpread will detect entry_debit > 0 because long_leg is more expensive.
+        """
         return self._build_single_spread(date, timestamp, strike_selection, quantity, 'call')
     
     def _build_single_spread(self, date: str, timestamp: str, strike_selection: StrikeSelection, quantity: int, option_type: str):
@@ -599,7 +671,8 @@ def run_enhanced_backtest():
     parser.add_argument("--start-date", help="Start date for range (YYYY-MM-DD)")
     parser.add_argument("--end-date", help="End date for range (YYYY-MM-DD)")
     parser.add_argument("--strategy", default=STRATEGY_IRON_CONDOR,
-                        choices=[STRATEGY_IRON_CONDOR, STRATEGY_CREDIT_SPREADS, STRATEGY_IC_CREDIT_SPREADS],
+                        choices=[STRATEGY_IRON_CONDOR, STRATEGY_CREDIT_SPREADS,
+                                 STRATEGY_IC_CREDIT_SPREADS, STRATEGY_DEBIT_SPREADS],
                         help="Strategy mode (default: iron_condor)")
     parser.add_argument("--contracts", type=int, default=1, help="Number of contracts per position (default: 1)")
     parser.add_argument("--target-credit", type=float, default=0.50, help="Target net credit per spread per share (default: 0.50)")
@@ -608,6 +681,13 @@ def run_enhanced_backtest():
     parser.add_argument("--monitor-interval", type=int, default=1, help="Minutes between position checks (default: 1)")
     parser.add_argument("--min-spread-width", type=int, default=10, help="Minimum spread width")
     parser.add_argument("--show-monitoring", action="store_true", help="Show detailed monitoring")
+    # Debit spread options
+    parser.add_argument("--target-debit", type=float, default=1.00, help="Target net debit per spread per share (default: 1.00)")
+    parser.add_argument("--debit-take-profit-pct", type=float, default=0.60, help="Debit take-profit: close when value >= debit + pct*max_profit (default: 0.60)")
+    parser.add_argument("--debit-stop-loss-pct", type=float, default=0.50, help="Debit stop-loss: close when value <= debit*(1-pct) (default: 0.50)")
+    parser.add_argument("--debit-last-entry-time", default="14:00:00", help="Last entry time for debit spreads (default: 14:00:00)")
+    parser.add_argument("--debit-time-stop", default="15:30:00", help="Force-close debit spreads by this time (default: 15:30:00)")
+    parser.add_argument("--debit-min-trend-points", type=float, default=15.0, help="Min SPX drift required for debit spread entry (default: 15.0)")
 
     args = parser.parse_args()
 
@@ -625,6 +705,12 @@ def run_enhanced_backtest():
             target_credit=args.target_credit,
             strategy_mode=args.strategy,
             quantity=args.contracts,
+            target_debit=args.target_debit,
+            debit_take_profit_pct=args.debit_take_profit_pct,
+            debit_stop_loss_pct=args.debit_stop_loss_pct,
+            debit_last_entry_time=args.debit_last_entry_time,
+            debit_time_stop=args.debit_time_stop,
+            debit_min_trend_points=args.debit_min_trend_points,
         )
         print(f"\nDate: {day_result.date} | Trades: {day_result.trade_count} | Total P&L: ${day_result.total_pnl:.2f} | Bars scanned: {day_result.scan_minutes_checked}")
         if day_result.trades:
@@ -652,6 +738,12 @@ def run_enhanced_backtest():
                 target_credit=args.target_credit,
                 strategy_mode=args.strategy,
                 quantity=args.contracts,
+                target_debit=args.target_debit,
+                debit_take_profit_pct=args.debit_take_profit_pct,
+                debit_stop_loss_pct=args.debit_stop_loss_pct,
+                debit_last_entry_time=args.debit_last_entry_time,
+                debit_time_stop=args.debit_time_stop,
+                debit_min_trend_points=args.debit_min_trend_points,
             )
             all_trades.extend(day_result.trades)
             logger.info(f"  {date}: {day_result.trade_count} trades, P&L=${day_result.total_pnl:.2f}")

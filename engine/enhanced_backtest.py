@@ -40,9 +40,11 @@ class SimpleBacktester:
 
 
 class StrategyType(Enum):
-    IRON_CONDOR = "Iron Condor"
-    PUT_SPREAD = "Put Spread"
-    CALL_SPREAD = "Call Spread"
+    IRON_CONDOR       = "Iron Condor"
+    PUT_SPREAD        = "Put Spread"
+    CALL_SPREAD       = "Call Spread"
+    DEBIT_PUT_SPREAD  = "Debit Put Spread"
+    DEBIT_CALL_SPREAD = "Debit Call Spread"
 
 
 class MarketSignal(Enum):

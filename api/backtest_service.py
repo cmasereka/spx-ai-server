@@ -289,6 +289,10 @@ class BacktestService:
             """
             import uuid as _uuid
 
+            # Track monitoring ticks per (strategy_type, entry_time) so we can
+            # attach them to each trade result for DB persistence (P&L chart).
+            monitoring_ticks: dict = {}
+
             def callback(event: dict):
                 ev = event.get("event")
                 if ev == "position_opened":
@@ -323,6 +327,10 @@ class BacktestService:
                             strikes = {"put_long": raw_strikes.long_strike, "put_short": raw_strikes.short_strike}
                         elif stype_str == "Call Spread":
                             strikes = {"call_short": raw_strikes.short_strike, "call_long": raw_strikes.long_strike}
+                        elif stype_str == "Debit Put Spread":
+                            strikes = {"put_long": raw_strikes.long_strike, "put_short": raw_strikes.short_strike}
+                        elif stype_str == "Debit Call Spread":
+                            strikes = {"call_short": raw_strikes.short_strike, "call_long": raw_strikes.long_strike}
                         else:
                             strikes = {}
                     elif hasattr(raw_strikes, "_asdict"):
@@ -346,6 +354,15 @@ class BacktestService:
                     key = (event.get("strategy_type", ""), event.get("entry_time", ""))
                     position_id = open_position_ids.get(key)
                     if position_id:
+                        # Accumulate tick for DB persistence (P&L chart checkpoints)
+                        if key not in monitoring_ticks:
+                            monitoring_ticks[key] = []
+                        monitoring_ticks[key].append({
+                            "time": str(event.get("time", "")),
+                            "spx": float(event.get("spx", 0) or 0),
+                            "pnl_per_share": float(event.get("pnl_per_share", 0) or 0),
+                            "cost_per_share": float(event.get("cost_per_share", 0) or 0),
+                        })
                         payload = {
                             "position_id":            position_id,
                             "strategy_type":          event.get("strategy_type"),
@@ -365,6 +382,13 @@ class BacktestService:
                     open_position_ids.pop(key, None)
                     if result:
                         api_result = self._convert_single_trade(result, backtest_id)
+                        # If the engine didn't populate monitoring_points, use the
+                        # ticks we collected from the progress callback (ensures P&L
+                        # chart data is available for all strategy types).
+                        if not api_result.monitoring_points:
+                            api_result.monitoring_points = monitoring_ticks.pop(key, [])
+                        else:
+                            monitoring_ticks.pop(key, None)
                         day_ws_events.append(("trade_result", api_result))
                         day_results.append(api_result)
 
@@ -435,6 +459,13 @@ class BacktestService:
                 min_improvement=request.min_improvement,
                 enable_stale_loss_exit=request.enable_stale_loss_exit,
                 progress_callback=progress_callback,
+                # Debit spread parameters
+                target_debit=getattr(request, 'target_debit', 1.00),
+                debit_take_profit_pct=getattr(request, 'debit_take_profit_pct', 0.60),
+                debit_stop_loss_pct=getattr(request, 'debit_stop_loss_pct', 0.50),
+                debit_last_entry_time=getattr(request, 'debit_last_entry_time', "14:00:00"),
+                debit_time_stop=getattr(request, 'debit_time_stop', "15:30:00"),
+                debit_min_trend_points=getattr(request, 'debit_min_trend_points', 10.0),
             )
         except Exception as e:
             logger.error(f"Single day backtest failed for {test_date}: {e}")
@@ -489,6 +520,22 @@ class BacktestService:
                 "put_short": getattr(ss, 'short_strike', 0) if ss else 0,
                 "call_short": 0,
                 "call_long": 0,
+            }
+        elif result.strategy_type == ST.DEBIT_PUT_SPREAD:
+            # long_strike = high-strike put (near ATM), short_strike = low-strike put (OTM)
+            strikes = {
+                "put_long": getattr(ss, 'long_strike', 0) if ss else 0,
+                "put_short": getattr(ss, 'short_strike', 0) if ss else 0,
+                "call_short": 0,
+                "call_long": 0,
+            }
+        elif result.strategy_type == ST.DEBIT_CALL_SPREAD:
+            # long_strike = low-strike call (near ATM), short_strike = high-strike call (OTM)
+            strikes = {
+                "put_long": 0,
+                "put_short": 0,
+                "call_short": getattr(ss, 'short_strike', 0) if ss else 0,
+                "call_long": getattr(ss, 'long_strike', 0) if ss else 0,
             }
         else:  # CALL_SPREAD
             strikes = {
@@ -578,7 +625,22 @@ class BacktestService:
                     "take_profit": request.take_profit,
                     "stop_loss": request.stop_loss,
                     "monitor_interval": request.monitor_interval,
+                    "entry_start_time": request.entry_start_time,
+                    "last_entry_time": request.last_entry_time,
                     "specific_dates": [str(d) for d in request.specific_dates] if request.specific_dates else None,
+                    # Stale-loss exit parameters
+                    "stale_loss_minutes": request.stale_loss_minutes,
+                    "stale_loss_threshold": request.stale_loss_threshold,
+                    "stagnation_window": request.stagnation_window,
+                    "min_improvement": request.min_improvement,
+                    "enable_stale_loss_exit": request.enable_stale_loss_exit,
+                    # Debit spread parameters
+                    "target_debit": request.target_debit,
+                    "debit_take_profit_pct": request.debit_take_profit_pct,
+                    "debit_stop_loss_pct": request.debit_stop_loss_pct,
+                    "debit_last_entry_time": request.debit_last_entry_time,
+                    "debit_time_stop": request.debit_time_stop,
+                    "debit_min_trend_points": request.debit_min_trend_points,
                 }
             )
             
@@ -638,6 +700,13 @@ class BacktestService:
                 logger.error(f"Backtest run {backtest_id} not found — cannot save trade {result.trade_id}")
                 return
 
+            # Serialize monitoring_points through Pydantic to ensure JSON safety
+            # (engine may return objects with non-serializable types like datetime.time)
+            try:
+                monitoring_data = result.model_dump(mode="json").get("monitoring_points", [])
+            except Exception:
+                monitoring_data = []
+
             trade = Trade(
                 trade_id=result.trade_id,
                 backtest_run_id=backtest_run.id,
@@ -666,7 +735,7 @@ class BacktestService:
                     "entry_rationale": result.entry_rationale,
                     "exit_rationale": result.exit_rationale,
                 },
-                monitoring_data=result.monitoring_points,
+                monitoring_data=monitoring_data,
             )
             session.add(trade)
             session.commit()
@@ -690,10 +759,15 @@ class BacktestService:
                 return
             
             for result in results:
+                try:
+                    monitoring_data = result.model_dump(mode="json").get("monitoring_points", [])
+                except Exception:
+                    monitoring_data = []
+
                 trade = Trade(
                     trade_id=result.trade_id,
                     backtest_run_id=backtest_run.id,
-                    
+
                     # Trade timing
                     trade_date=result.trade_date,
                     entry_time=result.entry_time,
@@ -730,11 +804,11 @@ class BacktestService:
                         "entry_rationale": result.entry_rationale,
                         "exit_rationale": result.exit_rationale,
                     },
-                    monitoring_data=result.monitoring_points
+                    monitoring_data=monitoring_data,
                 )
-                
+
                 session.add(trade)
-            
+
             session.commit()
             logger.info(f"Saved {len(results)} trades for backtest {backtest_id} to database")
     
