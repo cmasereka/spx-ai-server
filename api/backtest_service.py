@@ -487,7 +487,7 @@ class BacktestService:
                 api_result,
             )
         except Exception as exc:
-            logger.error(f"Failed to persist trade for backtest {backtest_id}: {exc}")
+            logger.exception(f"Failed to persist trade for backtest {backtest_id}: {exc}")
         await websocket_manager.send_trade_result(backtest_id, api_result.model_dump(mode="json"))
     
     def _convert_single_trade(self, result: EnhancedBacktestResult,
@@ -584,7 +584,7 @@ class BacktestService:
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self._save_backtest_run_sync, backtest_id, request, status)
         except Exception as e:
-            logger.error(f"Failed to save backtest run to database: {e}")
+            logger.exception(f"Failed to save backtest run to database: {e}")
     
     def _save_backtest_run_sync(self, backtest_id: str, request: BacktestRequest, status: BacktestStatus):
         """Synchronous database save for backtest run"""
