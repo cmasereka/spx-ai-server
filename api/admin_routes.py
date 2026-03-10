@@ -42,6 +42,13 @@ class UpdateBrokerConfigStatusRequest(BaseModel):
     status: str  # 'approved' | 'rejected'
 
 
+class UpdateBrokerConfigRequest(BaseModel):
+    label: Optional[str] = None
+    account_number: Optional[str] = None
+    broker_type: Optional[str] = None
+    is_paper: Optional[bool] = None
+
+
 # ---------------------------------------------------------------------------
 # Invitations
 # ---------------------------------------------------------------------------
@@ -229,6 +236,38 @@ def list_broker_configs(
         }
         for cfg, user in configs
     ]
+
+
+@router.patch("/broker-configs/{config_id}")
+def update_broker_config(
+    config_id: str,
+    payload: UpdateBrokerConfigRequest,
+    admin: User = Depends(get_admin_user),
+    db: Session = Depends(get_db),
+):
+    cfg = db.query(UserBrokerConfig).filter(UserBrokerConfig.id == config_id).first()
+    if not cfg:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Broker config not found")
+    if payload.label is not None:
+        cfg.label = payload.label or None
+    if payload.account_number is not None:
+        cfg.account_number = payload.account_number
+    if payload.broker_type is not None:
+        cfg.broker_type = payload.broker_type
+    if payload.is_paper is not None:
+        cfg.is_paper = payload.is_paper
+    db.commit()
+    return {
+        "id": str(cfg.id),
+        "user_id": str(cfg.user_id),
+        "broker_type": cfg.broker_type,
+        "label": cfg.label,
+        "account_number": cfg.account_number,
+        "is_paper": cfg.is_paper,
+        "status": cfg.status,
+        "approved_at": cfg.approved_at.isoformat() if cfg.approved_at else None,
+        "created_at": cfg.created_at.isoformat() if cfg.created_at else None,
+    }
 
 
 @router.patch("/broker-configs/{config_id}/status")
