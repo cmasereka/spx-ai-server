@@ -59,7 +59,7 @@ class StrikeSelector:
                        strategy_type: StrategyType,
                        min_spread_width: int = 10,
                        target_credit: Optional[float] = None,
-                       **_ignored) -> Optional[StrikeSelection]:
+                       **kwargs) -> Optional[StrikeSelection]:
         """
         Select strikes based on target credit per spread per share.
 
@@ -87,6 +87,12 @@ class StrikeSelector:
                 return self._select_put_spread_by_credit(options_data, spx_price, min_spread_width, target_credit)
             elif strategy_type == StrategyType.CALL_SPREAD:
                 return self._select_call_spread_by_credit(options_data, spx_price, min_spread_width, target_credit)
+            elif strategy_type == StrategyType.DEBIT_PUT_SPREAD:
+                target_debit = kwargs.get('target_debit', 1.00)
+                return self._select_debit_put_spread(options_data, spx_price, min_spread_width, target_debit)
+            elif strategy_type == StrategyType.DEBIT_CALL_SPREAD:
+                target_debit = kwargs.get('target_debit', 1.00)
+                return self._select_debit_call_spread(options_data, spx_price, min_spread_width, target_debit)
             else:  # IRON_CONDOR — select both sides independently
                 put_strikes  = self._select_put_spread_by_credit(options_data, spx_price, min_spread_width, target_credit)
                 call_strikes = self._select_call_spread_by_credit(options_data, spx_price, min_spread_width, target_credit)
@@ -218,6 +224,139 @@ class StrikeSelector:
             spread_width=long_strike - short_strike,
         )
 
+    # ------------------------------------------------------------------
+    # Debit-based selection (buy near-ATM, sell further OTM)
+    # ------------------------------------------------------------------
+
+    def _select_debit_put_spread(self, options_data: pd.DataFrame, spx_price: float,
+                                  spread_width: int,
+                                  target_debit: float) -> Optional[StrikeSelection]:
+        """
+        Select a debit put spread (bearish): long near-ATM put, short further-OTM put.
+        Convention: long_strike > short_strike (long is higher/closer to ATM).
+        The returned StrikeSelection uses the standard field names:
+          short_strike = the put we are SHORT (lower, further OTM)
+          long_strike  = the put we are LONG  (higher, near ATM)
+        """
+        puts = options_data[
+            (options_data['option_type'] == 'put') &
+            (options_data['strike'] <= spx_price + 10) &   # near or slightly above ATM
+            (options_data['ask'] > 0)
+        ].copy()
+        if len(puts) == 0:
+            return None
+
+        puts['mid'] = (puts['bid'] + puts['ask']) / 2.0
+
+        candidates = []
+        # Scan near-ATM puts as the long leg
+        for _, long_row in puts[puts['strike'] >= spx_price - 30].iterrows():
+            long_strike  = float(long_row['strike'])
+            short_strike = long_strike - spread_width
+            short_rows   = puts[puts['strike'] == short_strike]
+            if len(short_rows) == 0:
+                continue
+            long_mid  = float(long_row['mid'])
+            short_mid = float(short_rows.iloc[0]['mid'])
+            net_debit = long_mid - short_mid
+            if net_debit <= 0:
+                continue  # degenerate case; skip
+            candidates.append((abs(net_debit - target_debit), long_strike, short_strike, net_debit))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda x: x[0])
+
+        for tolerance in (0.15, 0.30):
+            valid = [c for c in candidates if c[0] <= tolerance]
+            if valid:
+                _, long_strike, short_strike, net_debit = valid[0]
+                logger.debug(
+                    f"Debit put spread: long={long_strike:.0f}/short={short_strike:.0f} "
+                    f"debit=${net_debit:.3f} (target=${target_debit:.2f})"
+                )
+                return StrikeSelection(
+                    short_strike=short_strike,
+                    long_strike=long_strike,
+                    spread_width=long_strike - short_strike,
+                )
+
+        _, long_strike, short_strike, net_debit = candidates[0]
+        logger.debug(
+            f"Debit put spread (outside tolerance): long={long_strike:.0f}/short={short_strike:.0f} "
+            f"debit=${net_debit:.3f}"
+        )
+        return StrikeSelection(
+            short_strike=short_strike,
+            long_strike=long_strike,
+            spread_width=long_strike - short_strike,
+        )
+
+    def _select_debit_call_spread(self, options_data: pd.DataFrame, spx_price: float,
+                                   spread_width: int,
+                                   target_debit: float) -> Optional[StrikeSelection]:
+        """
+        Select a debit call spread (bullish): long near-ATM call, short further-OTM call.
+        Convention: long_strike < short_strike (long is lower/closer to ATM).
+        The returned StrikeSelection:
+          short_strike = the call we are SHORT (higher, further OTM)
+          long_strike  = the call we are LONG  (lower, near ATM)
+        """
+        calls = options_data[
+            (options_data['option_type'] == 'call') &
+            (options_data['strike'] >= spx_price - 10) &   # near or slightly below ATM
+            (options_data['ask'] > 0)
+        ].copy()
+        if len(calls) == 0:
+            return None
+
+        calls['mid'] = (calls['bid'] + calls['ask']) / 2.0
+
+        candidates = []
+        # Scan near-ATM calls as the long leg
+        for _, long_row in calls[calls['strike'] <= spx_price + 30].iterrows():
+            long_strike  = float(long_row['strike'])
+            short_strike = long_strike + spread_width
+            short_rows   = calls[calls['strike'] == short_strike]
+            if len(short_rows) == 0:
+                continue
+            long_mid  = float(long_row['mid'])
+            short_mid = float(short_rows.iloc[0]['mid'])
+            net_debit = long_mid - short_mid
+            if net_debit <= 0:
+                continue
+            candidates.append((abs(net_debit - target_debit), long_strike, short_strike, net_debit))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda x: x[0])
+
+        for tolerance in (0.15, 0.30):
+            valid = [c for c in candidates if c[0] <= tolerance]
+            if valid:
+                _, long_strike, short_strike, net_debit = valid[0]
+                logger.debug(
+                    f"Debit call spread: long={long_strike:.0f}/short={short_strike:.0f} "
+                    f"debit=${net_debit:.3f} (target=${target_debit:.2f})"
+                )
+                return StrikeSelection(
+                    short_strike=short_strike,
+                    long_strike=long_strike,
+                    spread_width=short_strike - long_strike,
+                )
+
+        _, long_strike, short_strike, net_debit = candidates[0]
+        logger.debug(
+            f"Debit call spread (outside tolerance): long={long_strike:.0f}/short={short_strike:.0f} "
+            f"debit=${net_debit:.3f}"
+        )
+        return StrikeSelection(
+            short_strike=short_strike,
+            long_strike=long_strike,
+            spread_width=short_strike - long_strike,
+        )
 
 
 class IntradayPositionMonitor:

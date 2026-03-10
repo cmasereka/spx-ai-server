@@ -27,3 +27,6 @@ psycopg2-binary>=2.9.0
 pytz>=2024.1
 ib_insync>=0.9.86
 tastytrade>=9.0
+python-jose[cryptography]>=3.3.0
+bcrypt>=4.0.0
+cryptography>=41.0.0

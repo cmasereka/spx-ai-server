@@ -883,7 +883,28 @@ def _create_broker_adapter(req: LiveTradingRequest):
     """
     Instantiate the appropriate BrokerAdapter for the requested broker.
     For IBKR, uses client_id + 1 to avoid conflicting with the market data connection.
+    If broker_config_id is set, loads encrypted credentials from the database.
     """
+    if req.broker_config_id is not None:
+        from src.database.connection import db_manager
+        from src.database.models import UserBrokerConfig
+        from api.auth import decrypt_credentials
+        with db_manager.get_session() as db:
+            cfg = db.query(UserBrokerConfig).filter(
+                UserBrokerConfig.id == req.broker_config_id,
+                UserBrokerConfig.status == 'approved',
+            ).first()
+            if not cfg:
+                raise ValueError(f"Approved broker config {req.broker_config_id} not found")
+            creds = decrypt_credentials(cfg.encrypted_credentials)
+        from broker.tastytrade_adapter import TastyTradeBrokerAdapter
+        return TastyTradeBrokerAdapter(
+            provider_secret=creds["provider_secret"],
+            refresh_token=creds["refresh_token"],
+            account_number=cfg.account_number,
+            is_paper=cfg.is_paper,
+        )
+
     if req.broker == BrokerEnum.TASTYTRADE:
         from broker.tastytrade_adapter import TastyTradeBrokerAdapter
         cfg = req.tastytrade

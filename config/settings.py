@@ -20,7 +20,7 @@ PROCESSED_DATA_DIR = os.path.join(DATA_DIR, "processed")
 DATABASE_PATH = os.path.join(PROCESSED_DATA_DIR, "spx_options.db")
 
 # PostgreSQL Configuration
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://localhost:5432/spx_ai?gssencmode=disable")
+DATABASE_URL = os.getenv("DATABASE_URL", f"postgresql://{os.getenv('USER', 'postgres')}@/spx_ai?gssencmode=disable")
 POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
 POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
 POSTGRES_DB = os.getenv("POSTGRES_DB", "spx_ai")

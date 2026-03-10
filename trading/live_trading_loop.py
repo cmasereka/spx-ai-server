@@ -45,6 +45,7 @@ from enhanced_multi_strategy import (
     INTRADAY_CALL_REVERSAL_POINTS, INTRADAY_PUT_REVERSAL_POINTS,
     CALL_SPREAD_MAX_ENTRY_RSI,
     STRATEGY_IRON_CONDOR, STRATEGY_CREDIT_SPREADS, STRATEGY_IC_CREDIT_SPREADS,
+    STRATEGY_DEBIT_SPREADS,
     PUT_SPREAD_DRIFT_CONFIRM_MINUTES,
 )
 
@@ -77,6 +78,13 @@ class TradingDayConfig:
     stagnation_window:      int   = 30
     min_improvement:        float = 0.05
     skip_indicators:        bool  = True
+    # ── Debit spread parameters ──────────────────────────────────────────
+    target_debit:           float = 1.00
+    debit_take_profit_pct:  float = 0.60
+    debit_stop_loss_pct:    float = 0.50
+    debit_last_entry_time:  str   = "14:00:00"
+    debit_time_stop:        str   = "15:30:00"
+    debit_min_trend_points: float = 10.0
 
 
 def _live_request_to_config(req) -> TradingDayConfig:
@@ -97,7 +105,78 @@ def _live_request_to_config(req) -> TradingDayConfig:
         stagnation_window      = req.stagnation_window,
         min_improvement        = req.min_improvement,
         skip_indicators        = req.skip_indicators,
+        target_debit           = getattr(req, 'target_debit',           1.00),
+        debit_take_profit_pct  = getattr(req, 'debit_take_profit_pct',  0.60),
+        debit_stop_loss_pct    = getattr(req, 'debit_stop_loss_pct',    0.50),
+        debit_last_entry_time  = getattr(req, 'debit_last_entry_time',  "14:00:00"),
+        debit_time_stop        = getattr(req, 'debit_time_stop',        "15:30:00"),
+        debit_min_trend_points = getattr(req, 'debit_min_trend_points', 10.0),
     )
+
+
+# ---------------------------------------------------------------------------
+# Debit spread monitoring helpers
+# ---------------------------------------------------------------------------
+
+def _calculate_debit_spread_value(strategy) -> float:
+    """
+    Current mark-to-market value of a debit spread (money received if closed now).
+    = sum(long_leg_price * 100 * qty) - sum(short_leg_price * 100 * qty)
+    Returns 0.0 if the value would be negative (can't receive negative value).
+    """
+    value = 0.0
+    try:
+        for leg in strategy.legs:
+            leg_price = getattr(leg, 'current_price', 0) or getattr(leg, 'entry_price', 0)
+            qty = getattr(leg, 'quantity', 1)
+            side = getattr(leg, 'position_side', None)
+            try:
+                is_long = side.name == 'LONG'
+            except AttributeError:
+                is_long = str(side).upper() == 'LONG'
+            if is_long:
+                value += leg_price * 100 * qty
+            else:
+                value -= leg_price * 100 * qty
+    except Exception:
+        pass
+    return max(value, 0.0)
+
+
+def _should_exit_debit(
+    current_value: float,
+    entry_debit: float,
+    max_spread_value: float,
+    take_profit_pct: float,
+    stop_loss_pct: float,
+    quantity: int,
+) -> Tuple[bool, str]:
+    """
+    Decide whether to exit a debit spread position.
+
+    take_profit: current_value has reached (entry_debit + take_profit_pct × max_profit)
+    stop_loss:   current_value has fallen to (entry_debit × (1 - stop_loss_pct))
+    """
+    max_profit    = max(max_spread_value - entry_debit, entry_debit * 0.05)
+    profit_target = entry_debit + take_profit_pct * max_profit
+    loss_floor    = entry_debit * (1.0 - stop_loss_pct)
+    qty           = max(quantity, 1)
+
+    if current_value >= profit_target:
+        val_ps = current_value / (100.0 * qty)
+        tgt_ps = profit_target  / (100.0 * qty)
+        return True, (
+            f"Debit take-profit: value ${val_ps:.3f}/share >= target ${tgt_ps:.3f}/share "
+            f"({take_profit_pct:.0%} of max profit)"
+        )
+    if current_value <= loss_floor:
+        val_ps   = current_value / (100.0 * qty)
+        floor_ps = loss_floor    / (100.0 * qty)
+        return True, (
+            f"Debit stop-loss: value ${val_ps:.3f}/share <= floor ${floor_ps:.3f}/share "
+            f"({stop_loss_pct:.0%} loss)"
+        )
+    return False, ""
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +311,12 @@ class LiveTradingLoop:
         strategy_mode = config.strategy_mode
         quantity      = config.quantity
         entry_start   = config.entry_start_time
-        last_entry    = config.last_entry_time
+        # For debit spreads enforce an earlier entry cutoff than the default 2 PM
+        last_entry    = (
+            config.debit_last_entry_time
+            if strategy_mode == STRATEGY_DEBIT_SPREADS
+            else config.last_entry_time
+        )
         skip_ind      = config.skip_indicators
 
         # Build per-run monitor; strategy_builder already points to live shim.
@@ -286,6 +370,14 @@ class LiveTradingLoop:
         ic_checkpoints:         List[dict] = []
         put_spread_checkpoints: List[dict] = []
         call_spread_checkpoints: List[dict] = []
+
+        # Debit spread position slots
+        open_debit_put_spread:  Optional[Any] = None
+        open_debit_call_spread: Optional[Any] = None
+        debit_put_meta:         dict = {}
+        debit_call_meta:        dict = {}
+        debit_put_checkpoints:  List[dict] = []
+        debit_call_checkpoints: List[dict] = []
 
         # Day-level latches
         _had_call_spread_today     = False
@@ -584,6 +676,162 @@ class LiveTradingLoop:
                         "order_result": order,
                     })
 
+            # --- Debit put spread monitoring ---
+            if open_debit_put_spread is not None and is_check_bar:
+                try:
+                    self._engine.strategy_builder.update_strategy_prices_optimized(
+                        open_debit_put_spread, date, current_time
+                    )
+                except Exception:
+                    pass
+                dps_qty    = getattr(open_debit_put_spread, 'quantity', 1)
+                entry_dbt  = getattr(open_debit_put_spread, 'entry_debit', 0)
+                sw         = abs(open_debit_put_spread.long_strike - open_debit_put_spread.short_strike)
+                max_sw_val = sw * 100 * dps_qty
+                if is_final_bar:
+                    cur_val    = self._engine._expiry_debit_value(
+                        open_debit_put_spread, StrategyType.DEBIT_PUT_SPREAD, spx
+                    )
+                    should_exit_d  = True
+                    debit_reason_d = "Expired at market close"
+                else:
+                    cur_val = _calculate_debit_spread_value(open_debit_put_spread)
+                    is_time_stop_d = current_time >= config.debit_time_stop
+                    if is_time_stop_d:
+                        should_exit_d  = True
+                        debit_reason_d = "Hard time stop"
+                    else:
+                        should_exit_d, debit_reason_d = _should_exit_debit(
+                            cur_val, entry_dbt, max_sw_val,
+                            config.debit_take_profit_pct, config.debit_stop_loss_pct, dps_qty
+                        )
+                val_ps = round(cur_val  / (100.0 * dps_qty), 4)
+                dbt_ps = round(entry_dbt / (100.0 * dps_qty), 4)
+                debit_put_checkpoints.append({
+                    "time": current_time, "spx": round(spx, 2),
+                    "cost_per_share": val_ps,
+                    "pnl_per_share":  round(val_ps - dbt_ps, 4),
+                })
+                fire({
+                    "event": "monitor_tick",
+                    "strategy_type": StrategyType.DEBIT_PUT_SPREAD.value,
+                    "entry_time": debit_put_meta.get("entry_time", current_time),
+                    "time": current_time, "spx": round(spx, 2),
+                    "pnl_per_share": round(val_ps - dbt_ps, 4),
+                    "entry_credit_per_share": dbt_ps,
+                })
+                logger.debug(
+                    f"STEP 6 | {current_time} | debit put | "
+                    f"value={val_ps:.3f}/share | "
+                    + (f"EXIT: {debit_reason_d}" if should_exit_d else "HOLD")
+                )
+                if should_exit_d:
+                    pnl = cur_val - entry_dbt
+                    result = self._make_result(
+                        date, StrategyType.DEBIT_PUT_SPREAD, debit_put_meta,
+                        entry_dbt, cur_val, pnl, spx, current_time,
+                        debit_reason_d, debit_put_checkpoints,
+                        max_spread_value=max_sw_val,
+                    )
+                    trades.append(result)
+                    closed_dps            = open_debit_put_spread
+                    open_debit_put_spread = None
+                    debit_put_meta        = {}
+                    debit_put_checkpoints = []
+                    logger.info(
+                        f"STEP 6 | {current_time} | DEBIT PUT EXIT | "
+                        f"pnl={pnl:.2f} | reason={debit_reason_d}"
+                    )
+                    order = self._broker.close_position(
+                        closed_dps, quantity, current_time, cur_val
+                    )
+                    fire({
+                        "event": "position_closed",
+                        "strategy_type": StrategyType.DEBIT_PUT_SPREAD.value,
+                        "result": result,
+                        "strategy_obj": closed_dps,
+                        "exit_time": current_time,
+                        "order_result": order,
+                    })
+
+            # --- Debit call spread monitoring ---
+            if open_debit_call_spread is not None and is_check_bar:
+                try:
+                    self._engine.strategy_builder.update_strategy_prices_optimized(
+                        open_debit_call_spread, date, current_time
+                    )
+                except Exception:
+                    pass
+                dcs_qty    = getattr(open_debit_call_spread, 'quantity', 1)
+                entry_dbt  = getattr(open_debit_call_spread, 'entry_debit', 0)
+                sw         = abs(open_debit_call_spread.short_strike - open_debit_call_spread.long_strike)
+                max_sw_val = sw * 100 * dcs_qty
+                if is_final_bar:
+                    cur_val    = self._engine._expiry_debit_value(
+                        open_debit_call_spread, StrategyType.DEBIT_CALL_SPREAD, spx
+                    )
+                    should_exit_d  = True
+                    debit_reason_d = "Expired at market close"
+                else:
+                    cur_val = _calculate_debit_spread_value(open_debit_call_spread)
+                    is_time_stop_d = current_time >= config.debit_time_stop
+                    if is_time_stop_d:
+                        should_exit_d  = True
+                        debit_reason_d = "Hard time stop"
+                    else:
+                        should_exit_d, debit_reason_d = _should_exit_debit(
+                            cur_val, entry_dbt, max_sw_val,
+                            config.debit_take_profit_pct, config.debit_stop_loss_pct, dcs_qty
+                        )
+                val_ps = round(cur_val  / (100.0 * dcs_qty), 4)
+                dbt_ps = round(entry_dbt / (100.0 * dcs_qty), 4)
+                debit_call_checkpoints.append({
+                    "time": current_time, "spx": round(spx, 2),
+                    "cost_per_share": val_ps,
+                    "pnl_per_share":  round(val_ps - dbt_ps, 4),
+                })
+                fire({
+                    "event": "monitor_tick",
+                    "strategy_type": StrategyType.DEBIT_CALL_SPREAD.value,
+                    "entry_time": debit_call_meta.get("entry_time", current_time),
+                    "time": current_time, "spx": round(spx, 2),
+                    "pnl_per_share": round(val_ps - dbt_ps, 4),
+                    "entry_credit_per_share": dbt_ps,
+                })
+                logger.debug(
+                    f"STEP 6 | {current_time} | debit call | "
+                    f"value={val_ps:.3f}/share | "
+                    + (f"EXIT: {debit_reason_d}" if should_exit_d else "HOLD")
+                )
+                if should_exit_d:
+                    pnl = cur_val - entry_dbt
+                    result = self._make_result(
+                        date, StrategyType.DEBIT_CALL_SPREAD, debit_call_meta,
+                        entry_dbt, cur_val, pnl, spx, current_time,
+                        debit_reason_d, debit_call_checkpoints,
+                        max_spread_value=max_sw_val,
+                    )
+                    trades.append(result)
+                    closed_dcs             = open_debit_call_spread
+                    open_debit_call_spread = None
+                    debit_call_meta        = {}
+                    debit_call_checkpoints = []
+                    logger.info(
+                        f"STEP 6 | {current_time} | DEBIT CALL EXIT | "
+                        f"pnl={pnl:.2f} | reason={debit_reason_d}"
+                    )
+                    order = self._broker.close_position(
+                        closed_dcs, quantity, current_time, cur_val
+                    )
+                    fire({
+                        "event": "position_closed",
+                        "strategy_type": StrategyType.DEBIT_CALL_SPREAD.value,
+                        "result": result,
+                        "strategy_obj": closed_dcs,
+                        "exit_time": current_time,
+                        "order_result": order,
+                    })
+
             # ── STEP 4: evaluate entry ─────────────────────────────────
             if not is_past_entry_cutoff and not is_final_bar:
                 spx_series = self._get_spx_series(date, current_time)
@@ -594,13 +842,22 @@ class LiveTradingLoop:
                     _had_call_spread_today,
                     _had_call_spread_win_today,
                     _had_put_spread_win_today,
+                    open_debit_put_spread, open_debit_call_spread,
                 )
 
                 if strategy is not None:
                     # ── STEP 5: submit order ───────────────────────────
-                    entry_credit = getattr(strategy, 'entry_credit', 0)
+                    # For debit spreads use entry_debit as the order price sentinel
+                    is_debit = s_type in (
+                        StrategyType.DEBIT_PUT_SPREAD, StrategyType.DEBIT_CALL_SPREAD
+                    )
+                    order_price = (
+                        getattr(strategy, 'entry_debit', 0)
+                        if is_debit
+                        else getattr(strategy, 'entry_credit', 0)
+                    )
                     order = self._step5_send_order(
-                        strategy, quantity, current_time, entry_credit
+                        strategy, quantity, current_time, order_price
                     )
 
                     entry_event = {
@@ -608,7 +865,7 @@ class LiveTradingLoop:
                         "strategy_type": s_type.value,
                         "entry_time": current_time,
                         "entry_spx": spx,
-                        "entry_credit": entry_credit,
+                        "entry_credit": order_price,
                         "strikes": meta.get("strike_selection"),
                         "entry_rationale": meta.get("entry_rationale"),
                         "strategy_obj": strategy,
@@ -635,8 +892,22 @@ class LiveTradingLoop:
                         logger.info(f"Opened call spread at {current_time}")
                         fire(entry_event)
 
+                    elif s_type == StrategyType.DEBIT_PUT_SPREAD:
+                        open_debit_put_spread = strategy
+                        debit_put_meta        = meta
+                        logger.info(f"Opened debit put spread at {current_time}")
+                        fire(entry_event)
+
+                    elif s_type == StrategyType.DEBIT_CALL_SPREAD:
+                        open_debit_call_spread = strategy
+                        debit_call_meta        = meta
+                        logger.info(f"Opened debit call spread at {current_time}")
+                        fire(entry_event)
+
         # ── Force-close any remaining open positions at FINAL_EXIT_TIME ──
         final_spx = self._data_src.get_fastest_spx_price(date, FINAL_EXIT_TIME) or 0.0
+
+        # --- Credit spread / IC force-close ---
         for _open_pos, _meta, _stype, _checkpoints in [
             (open_ic,         ic_entry_meta,    StrategyType.IRON_CONDOR, ic_checkpoints),
             (open_put_spread,  put_spread_meta,  StrategyType.PUT_SPREAD,  put_spread_checkpoints),
@@ -693,6 +964,49 @@ class LiveTradingLoop:
             )
             order = self._broker.close_position(
                 _open_pos, quantity, FINAL_EXIT_TIME, exit_cost
+            )
+            fire({
+                "event": "position_closed",
+                "strategy_type": _stype.value,
+                "result": result,
+                "strategy_obj": _open_pos,
+                "exit_time": FINAL_EXIT_TIME,
+                "order_result": order,
+            })
+
+        # --- Debit spread force-close at expiry ---
+        for _open_pos, _meta, _stype, _checkpoints in [
+            (open_debit_put_spread,  debit_put_meta,  StrategyType.DEBIT_PUT_SPREAD,  debit_put_checkpoints),
+            (open_debit_call_spread, debit_call_meta, StrategyType.DEBIT_CALL_SPREAD, debit_call_checkpoints),
+        ]:
+            if _open_pos is None:
+                continue
+            pos_qty      = getattr(_open_pos, 'quantity', 1)
+            entry_debit  = getattr(_open_pos, 'entry_debit', 0)
+            expiry_value = self._engine._expiry_debit_value(_open_pos, _stype, final_spx)
+            pnl          = expiry_value - entry_debit
+            val_ps       = round(expiry_value / (100.0 * pos_qty), 4)
+            dbt_ps       = round(entry_debit  / (100.0 * pos_qty), 4)
+            _checkpoints.append({
+                "time": FINAL_EXIT_TIME, "spx": round(final_spx, 2),
+                "cost_per_share": val_ps,
+                "pnl_per_share":  round(val_ps - dbt_ps, 4),
+            })
+            result = self._make_result(
+                date, _stype, _meta,
+                entry_debit,   # repurposed as amount at risk
+                expiry_value,  # repurposed as value received
+                pnl,
+                final_spx, FINAL_EXIT_TIME, "Expired at market close",
+                _checkpoints,
+                max_spread_value=self._spread_width_value(_open_pos, pos_qty),
+            )
+            trades.append(result)
+            logger.info(
+                f"STEP 6 | {FINAL_EXIT_TIME} | {_stype.value} EXPIRY | pnl={pnl:.2f}"
+            )
+            order = self._broker.close_position(
+                _open_pos, quantity, FINAL_EXIT_TIME, expiry_value
             )
             fire({
                 "event": "position_closed",
@@ -800,6 +1114,8 @@ class LiveTradingLoop:
         had_call_spread_today: bool,
         had_call_spread_win_today: bool,
         had_put_spread_win_today: bool,
+        open_debit_put_spread=None,
+        open_debit_call_spread=None,
     ) -> Tuple[Optional[Any], Optional[StrategyType], dict]:
         """
         Evaluate whether to open a new position at this bar.
@@ -943,6 +1259,13 @@ class LiveTradingLoop:
                         ic_blocked, put_blocked, call_blocked,
                     )
 
+            # ── Debit spread entries ───────────────────────────────────
+            if strategy_mode == STRATEGY_DEBIT_SPREADS:
+                return self._try_build_debit_strategy(
+                    date, bar_time, spx, day_drift, indicators, config, guards,
+                    open_debit_put_spread, open_debit_call_spread, skip_ind,
+                )
+
         except Exception as exc:
             logger.debug(f"STEP 4 | {bar_time} | entry error: {exc}")
 
@@ -1078,6 +1401,146 @@ class LiveTradingLoop:
         return strategy, s_type, meta
 
     # ------------------------------------------------------------------
+    # Debit spread entry evaluation
+    # ------------------------------------------------------------------
+
+    def _try_build_debit_strategy(
+        self,
+        date: str,
+        bar_time: str,
+        spx: float,
+        day_drift: float,
+        indicators: TechnicalIndicators,
+        config,
+        guards: _DriftGuards,
+        open_debit_put_spread,
+        open_debit_call_spread,
+        skip_ind: bool,
+    ) -> Tuple[Optional[Any], Optional[StrategyType], dict]:
+        """
+        Evaluate and build a debit spread entry if conditions are met.
+
+        Entry rules:
+          Debit call (bullish):
+            - day_drift >= +debit_min_trend_points (market trending up)
+            - RSI >= 55 (momentum confirming) OR skip_ind
+            - No open debit call spread already
+
+          Debit put (bearish):
+            - day_drift <= -debit_min_trend_points (market trending down)
+            - RSI <= 45 (momentum confirming) OR skip_ind
+            - No open debit put spread already
+
+          In both cases: intraday reversal guard (market not already reversing
+          strongly against the entry direction).
+        """
+        min_pts = config.debit_min_trend_points
+
+        # ── Debit call spread (bullish) ─────────────────────────────────
+        if open_debit_call_spread is None and day_drift >= min_pts:
+            # Reversal guard: if market has pulled back from its high by >= 5 pts, skip
+            reversal = guards.intraday_max_drift - day_drift
+            if reversal >= 5.0:
+                logger.debug(
+                    f"STEP 4 | {bar_time} | debit call blocked: reversal {reversal:.1f} >= 5pts"
+                )
+            else:
+                rsi_ok = skip_ind or indicators.rsi >= 55.0
+                if rsi_ok:
+                    logger.info(
+                        f"STEP 4 | {bar_time} | signal=Debit Call Spread "
+                        f"drift={day_drift:+.1f} rsi={indicators.rsi:.1f}"
+                    )
+                    selection = self._strike_selector.select_strikes(
+                        date=date,
+                        timestamp=bar_time,
+                        strategy_type=StrategyType.DEBIT_CALL_SPREAD,
+                        min_spread_width=config.spread_width,
+                        target_credit=config.target_credit,  # not used for debit
+                        target_debit=config.target_debit,
+                    )
+                    if selection is not None:
+                        strategy = self._engine._build_debit_call_spread_strategy(
+                            date, bar_time, selection, config.quantity
+                        )
+                        if strategy is not None:
+                            entry_debit = getattr(strategy, 'entry_debit', 0)
+                            logger.info(
+                                f"STEP 4 | ENTER Debit Call Spread | {bar_time} | "
+                                f"debit={entry_debit:.2f} drift={day_drift:+.1f}"
+                            )
+                            meta = {
+                                "entry_time":       bar_time,
+                                "entry_spx":        spx,
+                                "strike_selection": selection,
+                                "market_signal":    MarketSignal.BULLISH,
+                                "confidence":       0.6,
+                                "notes":            f"Debit call drift={day_drift:+.1f}",
+                                "entry_rationale": {
+                                    "strategy_selected": StrategyType.DEBIT_CALL_SPREAD.value,
+                                    "spx_at_entry":      round(spx, 2),
+                                    "day_drift_pts":     round(day_drift, 2),
+                                    "rsi":               round(indicators.rsi, 2),
+                                    "reversal_pts":      round(reversal, 2),
+                                    "entry_debit":       round(entry_debit, 3),
+                                },
+                            }
+                            return strategy, StrategyType.DEBIT_CALL_SPREAD, meta
+
+        # ── Debit put spread (bearish) ──────────────────────────────────
+        if open_debit_put_spread is None and day_drift <= -min_pts:
+            # Reversal guard: if market has bounced from its low by >= 5 pts, skip
+            reversal = day_drift - guards.intraday_min_drift
+            if reversal >= 5.0:
+                logger.debug(
+                    f"STEP 4 | {bar_time} | debit put blocked: reversal {reversal:.1f} >= 5pts"
+                )
+            else:
+                rsi_ok = skip_ind or indicators.rsi <= 45.0
+                if rsi_ok:
+                    logger.info(
+                        f"STEP 4 | {bar_time} | signal=Debit Put Spread "
+                        f"drift={day_drift:+.1f} rsi={indicators.rsi:.1f}"
+                    )
+                    selection = self._strike_selector.select_strikes(
+                        date=date,
+                        timestamp=bar_time,
+                        strategy_type=StrategyType.DEBIT_PUT_SPREAD,
+                        min_spread_width=config.spread_width,
+                        target_credit=config.target_credit,
+                        target_debit=config.target_debit,
+                    )
+                    if selection is not None:
+                        strategy = self._engine._build_debit_put_spread_strategy(
+                            date, bar_time, selection, config.quantity
+                        )
+                        if strategy is not None:
+                            entry_debit = getattr(strategy, 'entry_debit', 0)
+                            logger.info(
+                                f"STEP 4 | ENTER Debit Put Spread | {bar_time} | "
+                                f"debit={entry_debit:.2f} drift={day_drift:+.1f}"
+                            )
+                            meta = {
+                                "entry_time":       bar_time,
+                                "entry_spx":        spx,
+                                "strike_selection": selection,
+                                "market_signal":    MarketSignal.BEARISH,
+                                "confidence":       0.6,
+                                "notes":            f"Debit put drift={day_drift:+.1f}",
+                                "entry_rationale": {
+                                    "strategy_selected": StrategyType.DEBIT_PUT_SPREAD.value,
+                                    "spx_at_entry":      round(spx, 2),
+                                    "day_drift_pts":     round(day_drift, 2),
+                                    "rsi":               round(indicators.rsi, 2),
+                                    "reversal_pts":      round(reversal, 2),
+                                    "entry_debit":       round(entry_debit, 3),
+                                },
+                            }
+                            return strategy, StrategyType.DEBIT_PUT_SPREAD, meta
+
+        return None, None, {}
+
+    # ------------------------------------------------------------------
     # Step 5: send order
     # ------------------------------------------------------------------
 
@@ -1115,9 +1578,17 @@ class LiveTradingLoop:
         exit_reason: str,
         checkpoints: list,
         ic_leg_status=None,
+        max_spread_value: float = None,
     ) -> EnhancedBacktestResult:
         pnl_pct = (pnl / entry_credit * 100) if entry_credit else 0.0
         entry_spx = meta.get("entry_spx", 0)
+        _is_debit = stype in (StrategyType.DEBIT_PUT_SPREAD, StrategyType.DEBIT_CALL_SPREAD)
+        if _is_debit and max_spread_value is not None:
+            _max_profit = max(max_spread_value - entry_credit, 0.0)
+            _max_loss   = entry_credit
+        else:
+            _max_profit = entry_credit
+            _max_loss   = -exit_cost
         return EnhancedBacktestResult(
             date=date,
             strategy_type=stype,
@@ -1136,8 +1607,8 @@ class LiveTradingLoop:
             exit_cost=exit_cost,
             pnl=pnl,
             pnl_pct=pnl_pct,
-            max_profit=entry_credit,
-            max_loss=-exit_cost,
+            max_profit=_max_profit,
+            max_loss=_max_loss,
             monitoring_points=checkpoints,
             success=True,
             confidence=meta.get("confidence", 0),
@@ -1154,3 +1625,12 @@ class LiveTradingLoop:
             },
             ic_leg_status=ic_leg_status,
         )
+
+    @staticmethod
+    def _spread_width_value(strategy, qty: int) -> float:
+        """Return the maximum dollar value of a debit spread (spread_width * 100 * qty)."""
+        try:
+            sw = abs(getattr(strategy, 'long_strike', 0) - getattr(strategy, 'short_strike', 0))
+            return sw * 100.0 * qty
+        except Exception:
+            return 0.0

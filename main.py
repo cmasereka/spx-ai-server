@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, date
 from typing import Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, BackgroundTasks
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
@@ -22,6 +22,10 @@ from api.websocket_manager import WebSocketManager
 from api import database_routes
 from api.live_trading_service import LiveTradingService
 import api.live_trading_routes as live_trading_routes
+from api.auth import get_approved_user
+from api.auth_routes import router as auth_router
+from api.user_routes import router as user_router
+from api.admin_routes import router as admin_router
 
 # Global services
 backtest_service = BacktestService()
@@ -71,23 +75,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include database routes
-app.include_router(database_routes.router)
+# Auth routes (no authentication required)
+app.include_router(auth_router)
 
-# Include live (IBKR) trading routes
-app.include_router(live_trading_routes.router)
+# User / admin routes
+app.include_router(user_router)
+app.include_router(admin_router)
+
+# Include database routes (protected)
+app.include_router(database_routes.router, dependencies=[Depends(get_approved_user)])
+
+# Include live (IBKR) trading routes (protected)
+app.include_router(live_trading_routes.router, dependencies=[Depends(get_approved_user)])
 
 @app.get("/", tags=["Health"])
 async def root():
     """Health check endpoint"""
     return {
-        "message": "SPX AI Trading Platform API", 
+        "message": "SPX AI Trading Platform API",
         "status": "online",
         "timestamp": datetime.now().isoformat()
     }
 
 @app.get("/api/v1/status", response_model=SystemStatus, tags=["System"])
-async def get_system_status():
+async def get_system_status(_: None = Depends(get_approved_user)):
     """Get system status and available data"""
     try:
         status = await backtest_service.get_system_status()
@@ -98,8 +109,9 @@ async def get_system_status():
 
 @app.post("/api/v1/backtest/start", response_model=BacktestResponse, tags=["Backtesting"])
 async def start_backtest(
-    request: BacktestRequest, 
-    background_tasks: BackgroundTasks
+    request: BacktestRequest,
+    background_tasks: BackgroundTasks,
+    _: None = Depends(get_approved_user),
 ):
     """Start a new backtest"""
     try:
@@ -125,7 +137,7 @@ async def start_backtest(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/v1/backtest/{backtest_id}/status", response_model=BacktestStatus, tags=["Backtesting"])
-async def get_backtest_status(backtest_id: str):
+async def get_backtest_status(backtest_id: str, _: None = Depends(get_approved_user)):
     """Get backtest status"""
     try:
         status = backtest_service.get_backtest_status(backtest_id)
@@ -139,7 +151,7 @@ async def get_backtest_status(backtest_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/v1/backtest/{backtest_id}/results", response_model=List[BacktestResult], tags=["Backtesting"])
-async def get_backtest_results(backtest_id: str):
+async def get_backtest_results(backtest_id: str, _: None = Depends(get_approved_user)):
     """Get backtest results"""
     try:
         results = backtest_service.get_backtest_results(backtest_id)
@@ -153,7 +165,7 @@ async def get_backtest_results(backtest_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/api/v1/backtest/{backtest_id}", tags=["Backtesting"])
-async def cancel_backtest(backtest_id: str):
+async def cancel_backtest(backtest_id: str, _: None = Depends(get_approved_user)):
     """Cancel a running backtest"""
     try:
         success = await backtest_service.cancel_backtest(backtest_id)
@@ -167,7 +179,7 @@ async def cancel_backtest(backtest_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/v1/backtest", tags=["Backtesting"])
-async def list_backtests():
+async def list_backtests(_: None = Depends(get_approved_user)):
     """List all backtests (combines database and in-memory data, sorted by most recent)"""
     try:
         # Get in-memory backtests (includes active/running ones)
