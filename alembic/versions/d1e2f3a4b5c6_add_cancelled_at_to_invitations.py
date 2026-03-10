@@ -15,7 +15,12 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.add_column('invitations', sa.Column('cancelled_at', sa.DateTime(), nullable=True))
+    from sqlalchemy import inspect as sa_inspect
+    bind = op.get_bind()
+    inspector = sa_inspect(bind)
+    cols = {c['name'] for c in inspector.get_columns('invitations')}
+    if 'cancelled_at' not in cols:
+        op.add_column('invitations', sa.Column('cancelled_at', sa.DateTime(), nullable=True))
 
 
 def downgrade() -> None:

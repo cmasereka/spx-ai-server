@@ -22,14 +22,23 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.add_column(
-        'ibkr_orders',
-        sa.Column('broker_type', sa.String(20), nullable=False, server_default='ibkr'),
-    )
-    op.add_column(
-        'paper_trading_runs',
-        sa.Column('broker_type', sa.String(20), nullable=True),
-    )
+    from sqlalchemy import inspect as sa_inspect
+    bind = op.get_bind()
+    inspector = sa_inspect(bind)
+
+    ibkr_cols = {c['name'] for c in inspector.get_columns('ibkr_orders')}
+    if 'broker_type' not in ibkr_cols:
+        op.add_column(
+            'ibkr_orders',
+            sa.Column('broker_type', sa.String(20), nullable=False, server_default='ibkr'),
+        )
+
+    pt_cols = {c['name'] for c in inspector.get_columns('paper_trading_runs')}
+    if 'broker_type' not in pt_cols:
+        op.add_column(
+            'paper_trading_runs',
+            sa.Column('broker_type', sa.String(20), nullable=True),
+        )
 
 
 def downgrade() -> None:

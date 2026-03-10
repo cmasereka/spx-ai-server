@@ -17,58 +17,72 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.create_table(
-        'users',
-        sa.Column('id', postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column('email', sa.String(255), unique=True, nullable=False),
-        sa.Column('full_name', sa.String(100), nullable=False),
-        sa.Column('hashed_password', sa.String(255), nullable=False),
-        sa.Column('role', sa.String(10), nullable=False, server_default='user'),
-        sa.Column('status', sa.String(20), nullable=False, server_default='pending_approval'),
-        sa.Column('invited_by', postgresql.UUID(as_uuid=True), nullable=True),
-        sa.Column('created_at', sa.DateTime(), server_default=sa.func.now()),
-        sa.Column('last_login_at', sa.DateTime(), nullable=True),
-    )
-    op.create_index('ix_users_email', 'users', ['email'], unique=True)
+    from sqlalchemy import inspect as sa_inspect
+    bind = op.get_bind()
+    inspector = sa_inspect(bind)
+    existing_tables = set(inspector.get_table_names())
 
-    op.create_table(
-        'invitations',
-        sa.Column('id', postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column('code', sa.String(64), unique=True, nullable=False),
-        sa.Column('created_by', postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column('note', sa.String(200), nullable=True),
-        sa.Column('is_used', sa.Boolean(), nullable=False, server_default='false'),
-        sa.Column('used_by', postgresql.UUID(as_uuid=True), nullable=True),
-        sa.Column('used_at', sa.DateTime(), nullable=True),
-        sa.Column('expires_at', sa.DateTime(), nullable=False),
-        sa.Column('created_at', sa.DateTime(), server_default=sa.func.now()),
-    )
-    op.create_index('ix_invitations_code', 'invitations', ['code'], unique=True)
+    if 'users' not in existing_tables:
+        op.create_table(
+            'users',
+            sa.Column('id', postgresql.UUID(as_uuid=True), primary_key=True),
+            sa.Column('email', sa.String(255), unique=True, nullable=False),
+            sa.Column('full_name', sa.String(100), nullable=False),
+            sa.Column('hashed_password', sa.String(255), nullable=False),
+            sa.Column('role', sa.String(10), nullable=False, server_default='user'),
+            sa.Column('status', sa.String(20), nullable=False, server_default='pending_approval'),
+            sa.Column('invited_by', postgresql.UUID(as_uuid=True), nullable=True),
+            sa.Column('created_at', sa.DateTime(), server_default=sa.func.now()),
+            sa.Column('last_login_at', sa.DateTime(), nullable=True),
+        )
+        op.create_index('ix_users_email', 'users', ['email'], unique=True)
 
-    op.create_table(
-        'user_broker_configs',
-        sa.Column('id', postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column('user_id', postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column('broker_type', sa.String(20), nullable=False),
-        sa.Column('label', sa.String(100), nullable=True),
-        sa.Column('account_number', sa.String(50), nullable=False),
-        sa.Column('is_paper', sa.Boolean(), nullable=False, server_default='true'),
-        sa.Column('encrypted_credentials', sa.Text(), nullable=False),
-        sa.Column('status', sa.String(20), nullable=False, server_default='pending_approval'),
-        sa.Column('approved_by', postgresql.UUID(as_uuid=True), nullable=True),
-        sa.Column('approved_at', sa.DateTime(), nullable=True),
-        sa.Column('created_at', sa.DateTime(), server_default=sa.func.now()),
-        sa.Column('updated_at', sa.DateTime(), server_default=sa.func.now()),
-    )
-    op.create_index('ix_user_broker_configs_user_id', 'user_broker_configs', ['user_id'])
+    if 'invitations' not in existing_tables:
+        op.create_table(
+            'invitations',
+            sa.Column('id', postgresql.UUID(as_uuid=True), primary_key=True),
+            sa.Column('code', sa.String(64), unique=True, nullable=False),
+            sa.Column('created_by', postgresql.UUID(as_uuid=True), nullable=False),
+            sa.Column('note', sa.String(200), nullable=True),
+            sa.Column('is_used', sa.Boolean(), nullable=False, server_default='false'),
+            sa.Column('used_by', postgresql.UUID(as_uuid=True), nullable=True),
+            sa.Column('used_at', sa.DateTime(), nullable=True),
+            sa.Column('expires_at', sa.DateTime(), nullable=False),
+            sa.Column('created_at', sa.DateTime(), server_default=sa.func.now()),
+        )
+        op.create_index('ix_invitations_code', 'invitations', ['code'], unique=True)
 
-    op.add_column('backtest_runs',
-        sa.Column('user_id', postgresql.UUID(as_uuid=True), nullable=True))
-    op.create_index('ix_backtest_runs_user_id', 'backtest_runs', ['user_id'])
+    if 'user_broker_configs' not in existing_tables:
+        op.create_table(
+            'user_broker_configs',
+            sa.Column('id', postgresql.UUID(as_uuid=True), primary_key=True),
+            sa.Column('user_id', postgresql.UUID(as_uuid=True), nullable=False),
+            sa.Column('broker_type', sa.String(20), nullable=False),
+            sa.Column('label', sa.String(100), nullable=True),
+            sa.Column('account_number', sa.String(50), nullable=False),
+            sa.Column('is_paper', sa.Boolean(), nullable=False, server_default='true'),
+            sa.Column('encrypted_credentials', sa.Text(), nullable=False),
+            sa.Column('status', sa.String(20), nullable=False, server_default='pending_approval'),
+            sa.Column('approved_by', postgresql.UUID(as_uuid=True), nullable=True),
+            sa.Column('approved_at', sa.DateTime(), nullable=True),
+            sa.Column('created_at', sa.DateTime(), server_default=sa.func.now()),
+            sa.Column('updated_at', sa.DateTime(), server_default=sa.func.now()),
+        )
+        op.create_index('ix_user_broker_configs_user_id', 'user_broker_configs', ['user_id'])
 
-    op.add_column('paper_trading_runs',
-        sa.Column('user_id', postgresql.UUID(as_uuid=True), nullable=True))
-    op.create_index('ix_paper_trading_runs_user_id', 'paper_trading_runs', ['user_id'])
+    # Add user_id to backtest_runs if not already present
+    backtest_cols = {c['name'] for c in inspector.get_columns('backtest_runs')}
+    if 'user_id' not in backtest_cols:
+        op.add_column('backtest_runs',
+            sa.Column('user_id', postgresql.UUID(as_uuid=True), nullable=True))
+        op.create_index('ix_backtest_runs_user_id', 'backtest_runs', ['user_id'])
+
+    # Add user_id to paper_trading_runs if not already present
+    pt_cols = {c['name'] for c in inspector.get_columns('paper_trading_runs')}
+    if 'user_id' not in pt_cols:
+        op.add_column('paper_trading_runs',
+            sa.Column('user_id', postgresql.UUID(as_uuid=True), nullable=True))
+        op.create_index('ix_paper_trading_runs_user_id', 'paper_trading_runs', ['user_id'])
 
 
 def downgrade() -> None:
