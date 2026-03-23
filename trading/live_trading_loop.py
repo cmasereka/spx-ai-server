@@ -433,23 +433,30 @@ class LiveTradingLoop:
         # morning times therefore return None, leaving spx_open unset and
         # _spx_history empty.  Supplement from whatever the provider has
         # buffered so that BB warmup and drift guards work correctly.
-        if self._is_live and hasattr(self._data_src, 'get_spx_data'):
-            hist_df = self._data_src.get_spx_data(date)
-            if hist_df is not None and len(hist_df) > 0:
-                buffered = [float(p) for p in hist_df['close'] if p and p > 0]
-                if buffered:
-                    # Merge: keep existing history (from pre-scan), add any new
-                    existing_len = len(self._spx_history)
-                    for p in buffered:
-                        if p not in self._spx_history:
-                            self._spx_history.insert(existing_len, p)
-                    if spx_open is None:
-                        spx_open = buffered[0]
-                        guards.spx_open = spx_open
-                    logger.info(
-                        f"Live: seeded {len(buffered)} bars from provider buffer "
-                        f"(total history={len(self._spx_history)}, spx_open={spx_open})"
-                    )
+        #
+        # IMPORTANT: bypass RealtimeMarketDataProvider's _wait_for_bar here —
+        # get_spx_data(date) uses end_time="16:00:00" by default, which would
+        # block the thread until market close.  Access the unwrapped inner
+        # provider instead to read the buffer without any time-sync wait.
+        if self._is_live:
+            _seed_src = getattr(self._data_src, '_inner', self._data_src)
+            if hasattr(_seed_src, 'get_spx_data'):
+                hist_df = _seed_src.get_spx_data(date)
+                if hist_df is not None and len(hist_df) > 0:
+                    buffered = [float(p) for p in hist_df['close'] if p and p > 0]
+                    if buffered:
+                        # Merge: keep existing history (from pre-scan), add any new
+                        existing_len = len(self._spx_history)
+                        for p in buffered:
+                            if p not in self._spx_history:
+                                self._spx_history.insert(existing_len, p)
+                        if spx_open is None:
+                            spx_open = buffered[0]
+                            guards.spx_open = spx_open
+                        logger.info(
+                            f"Live: seeded {len(buffered)} bars from provider buffer "
+                            f"(total history={len(self._spx_history)}, spx_open={spx_open})"
+                        )
 
         # Last resort for live sessions: use the most recent available price as
         # spx_open so drift guards are not latched at the wrong bar.
@@ -1768,9 +1775,9 @@ class LiveTradingLoop:
 
         if bb_middle == 0.0:
             # Not enough bars to compute BB yet
-            logger.debug(
-                f"STEP 4 | {bar_time} | BB Credit Spread: warming up "
-                f"({len(prices)}/{config.bb_period} bars)"
+            logger.info(
+                f"STEP 4 | {bar_time} | BB warming up "
+                f"({len(prices)}/{config.bb_period} bars) spx={spx:.2f}"
             )
             return None, None, {}
 
@@ -1781,16 +1788,25 @@ class LiveTradingLoop:
             s_type = StrategyType.PUT_SPREAD
             direction = "below-lower"
         else:
-            logger.debug(
-                f"STEP 4 | {bar_time} | BB Credit Spread: inside bands "
-                f"spx={spx:.2f} upper={bb_upper:.2f} lower={bb_lower:.2f} — no trade"
+            logger.info(
+                f"STEP 4 | {bar_time} | BB inside bands — no trade "
+                f"spx={spx:.2f} upper={bb_upper:.2f} lower={bb_lower:.2f} "
+                f"mid={bb_middle:.2f}"
             )
             return None, None, {}
 
-        # Skip if we already have an open spread of this type
+        # Log BB state even if a position is already open
         if s_type == StrategyType.PUT_SPREAD and open_put_spread is not None:
+            logger.info(
+                f"STEP 4 | {bar_time} | BB {direction} — PUT SPREAD already open "
+                f"spx={spx:.2f} upper={bb_upper:.2f} lower={bb_lower:.2f}"
+            )
             return None, None, {}
         if s_type == StrategyType.CALL_SPREAD and open_call_spread is not None:
+            logger.info(
+                f"STEP 4 | {bar_time} | BB {direction} — CALL SPREAD already open "
+                f"spx={spx:.2f} upper={bb_upper:.2f} lower={bb_lower:.2f}"
+            )
             return None, None, {}
 
         logger.info(
