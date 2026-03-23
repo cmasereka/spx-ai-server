@@ -20,10 +20,11 @@ class BacktestModeEnum(str, Enum):
 
 class BacktestStrategyEnum(str, Enum):
     """Strategy mode controlling which trade types are considered"""
-    IRON_CONDOR       = "iron_condor"         # IC entries only
-    CREDIT_SPREADS    = "credit_spreads"      # Put / call spreads only, no IC
-    IC_CREDIT_SPREADS = "ic_credit_spreads"   # All entry types (current behaviour)
-    DEBIT_SPREADS     = "debit_spreads"       # Directional debit spreads only
+    IRON_CONDOR        = "iron_condor"          # IC entries only
+    CREDIT_SPREADS     = "credit_spreads"       # Put / call spreads only, no IC
+    IC_CREDIT_SPREADS  = "ic_credit_spreads"    # All entry types (current behaviour)
+    DEBIT_SPREADS      = "debit_spreads"        # Directional debit spreads only
+    BB_CREDIT_SPREADS  = "bb_credit_spreads"    # Bollinger-Band directional credit spreads
 
 
 class BacktestStatusEnum(str, Enum):
@@ -568,6 +569,21 @@ class LiveTradingRequest(BaseModel):
     debit_min_trend_points: float = Field(
         10.0, ge=5.0, le=100.0,
         description="Minimum directional SPX move (points from open) required for a debit entry."
+    )
+
+    # ── BB Credit Spreads parameters (only used when strategy='bb_credit_spreads') ──
+    bb_period: int = Field(
+        20, ge=5, le=100,
+        description="Lookback period for Bollinger Bands calculation. Default 20."
+    )
+    bb_std_dev: float = Field(
+        2.0, ge=0.5, le=4.0,
+        description="Number of standard deviations for Bollinger Band width. Default 2.0."
+    )
+    target_prob_itm: float = Field(
+        0.06, ge=0.01, le=0.50,
+        description="Target probability ITM (≈ absolute delta) for short strike selection. "
+                    "E.g. 0.06 selects a strike where the option has ~6% chance of expiring ITM."
     )
 
     broker_config_id: Optional[uuid.UUID] = Field(

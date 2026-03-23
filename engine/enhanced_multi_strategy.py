@@ -70,6 +70,7 @@ STRATEGY_IRON_CONDOR       = "iron_condor"
 STRATEGY_CREDIT_SPREADS    = "credit_spreads"
 STRATEGY_IC_CREDIT_SPREADS = "ic_credit_spreads"
 STRATEGY_DEBIT_SPREADS     = "debit_spreads"
+STRATEGY_BB_CREDIT_SPREADS = "bb_credit_spreads"
 
 
 def _build_minute_grid(date: str, start_time: str, end_time: str) -> List[str]:

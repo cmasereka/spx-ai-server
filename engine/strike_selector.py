@@ -358,6 +358,158 @@ class StrikeSelector:
             spread_width=short_strike - long_strike,
         )
 
+    # ------------------------------------------------------------------
+    # Delta-based selection (BB credit spreads — target_prob_itm ≈ |delta|)
+    # ------------------------------------------------------------------
+
+    def select_strikes_by_delta(
+        self,
+        date: str,
+        timestamp: str,
+        strategy_type: StrategyType,
+        target_prob_itm: float = 0.06,
+        spread_width: int = 10,
+    ) -> Optional[StrikeSelection]:
+        """
+        Select strikes for a credit spread where the short option's |delta| is
+        closest to `target_prob_itm` (e.g. 0.06 → ~6% probability ITM).
+
+        Falls back to OTM-distance heuristic when delta data is unavailable.
+        """
+        try:
+            spx_price = self.query_engine.get_fastest_spx_price(date, timestamp)
+            if not spx_price:
+                return None
+
+            options_data = self.query_engine.get_options_data(date, timestamp)
+            if options_data is None or len(options_data) == 0:
+                return None
+
+            options_data = options_data[options_data['expiration'] == date]
+
+            if strategy_type == StrategyType.PUT_SPREAD:
+                return self._select_put_spread_by_delta(
+                    options_data, spx_price, spread_width, target_prob_itm
+                )
+            elif strategy_type == StrategyType.CALL_SPREAD:
+                return self._select_call_spread_by_delta(
+                    options_data, spx_price, spread_width, target_prob_itm
+                )
+        except Exception as e:
+            logger.error(f"select_strikes_by_delta failed: {e}")
+        return None
+
+    def _select_put_spread_by_delta(
+        self,
+        options_data: pd.DataFrame,
+        spx_price: float,
+        spread_width: int,
+        target_prob_itm: float,
+    ) -> Optional[StrikeSelection]:
+        """
+        OTM put where |delta| is closest to target_prob_itm.
+        Short = selected strike, Long = short_strike - spread_width.
+        """
+        puts = options_data[
+            (options_data['option_type'] == 'put') &
+            (options_data['strike'] < spx_price) &
+            (options_data['ask'] > 0)
+        ].copy()
+        if len(puts) == 0:
+            return None
+
+        has_delta = 'delta' in puts.columns and puts['delta'].notna().any()
+
+        if has_delta:
+            # delta for puts is negative; use absolute value
+            puts['abs_delta'] = puts['delta'].abs()
+            puts = puts[puts['abs_delta'] > 0]
+            if len(puts) == 0:
+                return None
+            puts['delta_diff'] = (puts['abs_delta'] - target_prob_itm).abs()
+            best = puts.loc[puts['delta_diff'].idxmin()]
+            short_strike = float(best['strike'])
+        else:
+            # Heuristic: target distance ≈ 2–3× ATM IV × sqrt(T) × spx,
+            # simplified to a fixed multiple of spx away from ATM.
+            # For ~6% prob ITM we aim ~2 std-devs OTM; use credit scan instead.
+            return None  # require delta data for this method
+
+        long_strike = short_strike - spread_width
+        long_rows = puts[puts['strike'] == long_strike]
+        if len(long_rows) == 0:
+            # Try to find the nearest strike at spread_width distance
+            available = sorted(puts['strike'].unique())
+            target_long = short_strike - spread_width
+            candidates_l = [s for s in available if abs(s - target_long) <= 2.5]
+            if not candidates_l:
+                return None
+            long_strike = min(candidates_l, key=lambda s: abs(s - target_long))
+
+        abs_d = float(best['abs_delta']) if has_delta else target_prob_itm
+        logger.debug(
+            f"Put spread (delta): short={short_strike:.0f} long={long_strike:.0f} "
+            f"|delta|={abs_d:.4f} (target={target_prob_itm:.4f})"
+        )
+        return StrikeSelection(
+            short_strike=short_strike,
+            long_strike=long_strike,
+            spread_width=short_strike - long_strike,
+        )
+
+    def _select_call_spread_by_delta(
+        self,
+        options_data: pd.DataFrame,
+        spx_price: float,
+        spread_width: int,
+        target_prob_itm: float,
+    ) -> Optional[StrikeSelection]:
+        """
+        OTM call where |delta| is closest to target_prob_itm.
+        Short = selected strike, Long = short_strike + spread_width.
+        """
+        calls = options_data[
+            (options_data['option_type'] == 'call') &
+            (options_data['strike'] > spx_price) &
+            (options_data['ask'] > 0)
+        ].copy()
+        if len(calls) == 0:
+            return None
+
+        has_delta = 'delta' in calls.columns and calls['delta'].notna().any()
+
+        if has_delta:
+            calls['abs_delta'] = calls['delta'].abs()
+            calls = calls[calls['abs_delta'] > 0]
+            if len(calls) == 0:
+                return None
+            calls['delta_diff'] = (calls['abs_delta'] - target_prob_itm).abs()
+            best = calls.loc[calls['delta_diff'].idxmin()]
+            short_strike = float(best['strike'])
+        else:
+            return None
+
+        long_strike = short_strike + spread_width
+        call_rows = calls[calls['strike'] == long_strike]
+        if len(call_rows) == 0:
+            available = sorted(calls['strike'].unique())
+            target_long = short_strike + spread_width
+            candidates_l = [s for s in available if abs(s - target_long) <= 2.5]
+            if not candidates_l:
+                return None
+            long_strike = min(candidates_l, key=lambda s: abs(s - target_long))
+
+        abs_d = float(best['abs_delta']) if has_delta else target_prob_itm
+        logger.debug(
+            f"Call spread (delta): short={short_strike:.0f} long={long_strike:.0f} "
+            f"|delta|={abs_d:.4f} (target={target_prob_itm:.4f})"
+        )
+        return StrikeSelection(
+            short_strike=short_strike,
+            long_strike=long_strike,
+            spread_width=long_strike - short_strike,
+        )
+
 
 class IntradayPositionMonitor:
     """

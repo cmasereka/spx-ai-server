@@ -45,7 +45,7 @@ from enhanced_multi_strategy import (
     INTRADAY_CALL_REVERSAL_POINTS, INTRADAY_PUT_REVERSAL_POINTS,
     CALL_SPREAD_MAX_ENTRY_RSI,
     STRATEGY_IRON_CONDOR, STRATEGY_CREDIT_SPREADS, STRATEGY_IC_CREDIT_SPREADS,
-    STRATEGY_DEBIT_SPREADS,
+    STRATEGY_DEBIT_SPREADS, STRATEGY_BB_CREDIT_SPREADS,
     PUT_SPREAD_DRIFT_CONFIRM_MINUTES,
 )
 
@@ -96,6 +96,10 @@ class TradingDayConfig:
     # EMA stack for trend confirmation
     debit_ema_fast:             int   = 9
     debit_ema_slow:             int   = 21
+    # ── BB Credit Spreads parameters ─────────────────────────────────────
+    bb_period:                  int   = 20     # Bollinger Band lookback
+    bb_std_dev:                 float = 2.0    # Band width in std deviations
+    target_prob_itm:            float = 0.06   # Target |delta| for short strike
 
 
 def _live_request_to_config(req) -> TradingDayConfig:
@@ -130,6 +134,9 @@ def _live_request_to_config(req) -> TradingDayConfig:
         debit_orb_minutes           = getattr(req, 'debit_orb_minutes',         30),
         debit_ema_fast              = getattr(req, 'debit_ema_fast',            9),
         debit_ema_slow              = getattr(req, 'debit_ema_slow',            21),
+        bb_period                   = getattr(req, 'bb_period',                 20),
+        bb_std_dev                  = getattr(req, 'bb_std_dev',                2.0),
+        target_prob_itm             = getattr(req, 'target_prob_itm',           0.06),
     )
 
 
@@ -232,6 +239,27 @@ def _compute_ema(prices: List[float], period: int) -> float:
     for p in prices[1:]:
         ema = p * k + ema * (1.0 - k)
     return ema
+
+
+def _compute_bb(
+    prices: List[float],
+    period: int = 20,
+    num_std: float = 2.0,
+) -> Tuple[float, float, float]:
+    """
+    Compute Bollinger Bands over the last `period` bars.
+
+    Returns (upper, middle, lower).  Uses a simple moving average (SMA) of the
+    last `period` prices, not an EMA, which is the standard BB definition.
+    Returns (0, 0, 0) when fewer than `period` bars are available.
+    """
+    if len(prices) < period:
+        return 0.0, 0.0, 0.0
+    window = prices[-period:]
+    mean = sum(window) / period
+    variance = sum((p - mean) ** 2 for p in window) / period
+    std = variance ** 0.5
+    return mean + num_std * std, mean, mean - num_std * std
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +420,7 @@ class LiveTradingLoop:
                 _pp = self._data_src.get_fastest_spx_price(date, _pt)
                 if _pp and _pp > 0:
                     self._step2_update_drift(float(_pp), guards, _pt)
+                    self._spx_history.append(float(_pp))  # seed for BB / indicator warmup
             logger.debug(
                 f"Pre-scan complete: put_blocked={guards.put_spread_ever_blocked} "
                 f"call_blocked={guards.call_spread_ever_blocked} "
@@ -1305,6 +1334,13 @@ class LiveTradingLoop:
                     open_debit_put_spread, open_debit_call_spread, skip_ind,
                 )
 
+            # ── BB Credit Spread entries ───────────────────────────────
+            if strategy_mode == STRATEGY_BB_CREDIT_SPREADS:
+                return self._try_build_bb_credit_spread(
+                    date, bar_time, spx, config,
+                    open_put_spread, open_call_spread,
+                )
+
         except Exception as exc:
             logger.debug(f"STEP 4 | {bar_time} | entry error: {exc}")
 
@@ -1658,6 +1694,137 @@ class LiveTradingLoop:
                     )
 
         return None, None, {}
+
+    # ------------------------------------------------------------------
+    # BB Credit Spread entry evaluation
+    # ------------------------------------------------------------------
+
+    def _try_build_bb_credit_spread(
+        self,
+        date: str,
+        bar_time: str,
+        spx: float,
+        config,
+        open_put_spread,
+        open_call_spread,
+    ) -> Tuple[Optional[Any], Optional[StrategyType], dict]:
+        """
+        Evaluate and build a BB-based credit spread entry.
+
+        Direction logic:
+          • spx > bb_upper  → Bear Call Spread (sell call spread above market)
+          • spx < bb_lower  → Bull Put Spread (sell put spread below market)
+          • inside bands    → no trade
+
+        Strike selection uses |delta| ≈ target_prob_itm.
+        Falls back to credit-based selection when delta data is unavailable.
+        """
+        prices = self._spx_history
+        bb_upper, bb_middle, bb_lower = _compute_bb(prices, config.bb_period, config.bb_std_dev)
+
+        if bb_middle == 0.0:
+            # Not enough bars to compute BB yet
+            logger.debug(
+                f"STEP 4 | {bar_time} | BB Credit Spread: warming up "
+                f"({len(prices)}/{config.bb_period} bars)"
+            )
+            return None, None, {}
+
+        if spx > bb_upper:
+            s_type = StrategyType.CALL_SPREAD
+            direction = "above-upper"
+        elif spx < bb_lower:
+            s_type = StrategyType.PUT_SPREAD
+            direction = "below-lower"
+        else:
+            logger.debug(
+                f"STEP 4 | {bar_time} | BB Credit Spread: inside bands "
+                f"spx={spx:.2f} upper={bb_upper:.2f} lower={bb_lower:.2f} — no trade"
+            )
+            return None, None, {}
+
+        # Skip if we already have an open spread of this type
+        if s_type == StrategyType.PUT_SPREAD and open_put_spread is not None:
+            return None, None, {}
+        if s_type == StrategyType.CALL_SPREAD and open_call_spread is not None:
+            return None, None, {}
+
+        logger.info(
+            f"STEP 4 | {bar_time} | BB {s_type.value} signal: {direction} "
+            f"spx={spx:.2f} upper={bb_upper:.2f} lower={bb_lower:.2f}"
+        )
+
+        # Try delta-based selection first, fall back to credit-based
+        selection = self._strike_selector.select_strikes_by_delta(
+            date=date,
+            timestamp=bar_time,
+            strategy_type=s_type,
+            target_prob_itm=config.target_prob_itm,
+            spread_width=config.spread_width,
+        )
+        if selection is None:
+            logger.info(
+                f"STEP 4 | {bar_time} | BB: no delta data, falling back to credit selection"
+            )
+            selection = self._strike_selector.select_strikes(
+                date=date,
+                timestamp=bar_time,
+                strategy_type=s_type,
+                target_credit=config.target_credit,
+                min_spread_width=config.spread_width,
+            )
+
+        if selection is None:
+            logger.info(f"STEP 4 | {bar_time} | BB: no strikes found")
+            return None, None, {}
+
+        # Minimum distance guard (same as regular credit spreads)
+        short_dist = abs(selection.short_strike - spx)
+        if short_dist < MIN_DISTANCE_SPREAD:
+            logger.info(
+                f"STEP 4 | {bar_time} | BB: BLOCKED by min-distance "
+                f"short_dist={short_dist:.1f} (min={MIN_DISTANCE_SPREAD})"
+            )
+            return None, None, {}
+
+        # Build strategy object
+        if s_type == StrategyType.PUT_SPREAD:
+            strategy = self._engine._build_put_spread_strategy(
+                date, bar_time, selection, config.quantity
+            )
+        else:
+            strategy = self._engine._build_call_spread_strategy(
+                date, bar_time, selection, config.quantity
+            )
+
+        if strategy is None:
+            logger.info(f"STEP 4 | {bar_time} | BB: strategy build failed")
+            return None, None, {}
+
+        entry_credit = getattr(strategy, 'entry_credit', 0)
+        logger.info(
+            f"STEP 4 | ENTER BB {s_type.value} | {bar_time} | "
+            f"credit={entry_credit:.3f} short={selection.short_strike:.0f} "
+            f"long={selection.long_strike:.0f}"
+        )
+        meta = {
+            "entry_time":       bar_time,
+            "entry_spx":        spx,
+            "strike_selection": selection,
+            "market_signal":    MarketSignal.NEUTRAL,
+            "confidence":       0.7,
+            "notes":            f"BB {direction} spx={spx:.1f} upper={bb_upper:.1f} lower={bb_lower:.1f}",
+            "entry_rationale": {
+                "strategy_selected": s_type.value,
+                "spx_at_entry":      round(spx, 2),
+                "bb_upper":          round(bb_upper, 2),
+                "bb_lower":          round(bb_lower, 2),
+                "bb_middle":         round(bb_middle, 2),
+                "bb_direction":      direction,
+                "target_prob_itm":   config.target_prob_itm,
+            },
+        }
+        return strategy, s_type, meta
 
     # ------------------------------------------------------------------
     # Step 5: send order
