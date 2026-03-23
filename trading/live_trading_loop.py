@@ -410,8 +410,9 @@ class LiveTradingLoop:
 
         guards = _DriftGuards(spx_open=spx_open)
 
-        # Pre-scan 09:31 → entry_start: latch drift flags before entry window opens
-        if spx_open and spx_open > 0:
+        # Pre-scan 09:31 → entry_start: latch drift flags before entry window opens.
+        # Skipped for BB Credit Spreads — drift guards are not used by that strategy.
+        if strategy_mode != STRATEGY_BB_CREDIT_SPREADS and spx_open and spx_open > 0:
             pre_times = [
                 t for t in _build_minute_grid(date, "09:31:00", entry_start)
                 if t < entry_start
@@ -514,7 +515,10 @@ class LiveTradingLoop:
             self._spx_history.append(spx)
 
             # ── STEP 2: update drift guards ────────────────────────────
-            self._step2_update_drift(spx, guards, current_time)
+            # Skipped for BB Credit Spreads — drift guards are not consulted
+            # by _try_build_bb_credit_spread so computing them is unnecessary.
+            if strategy_mode != STRATEGY_BB_CREDIT_SPREADS:
+                self._step2_update_drift(spx, guards, current_time)
 
             # ── Monitor existing positions (check bars only) ───────────
 
