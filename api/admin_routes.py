@@ -46,7 +46,6 @@ class UpdateBrokerConfigRequest(BaseModel):
     label: Optional[str] = None
     account_number: Optional[str] = None
     broker_type: Optional[str] = None
-    is_paper: Optional[bool] = None
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +228,6 @@ def list_broker_configs(
             "broker_type": cfg.broker_type,
             "label": cfg.label,
             "account_number": cfg.account_number,
-            "is_paper": cfg.is_paper,
             "status": cfg.status,
             "approved_at": cfg.approved_at.isoformat() if cfg.approved_at else None,
             "created_at": cfg.created_at.isoformat() if cfg.created_at else None,
@@ -254,8 +252,6 @@ def update_broker_config(
         cfg.account_number = payload.account_number
     if payload.broker_type is not None:
         cfg.broker_type = payload.broker_type
-    if payload.is_paper is not None:
-        cfg.is_paper = payload.is_paper
     db.commit()
     return {
         "id": str(cfg.id),
@@ -263,7 +259,6 @@ def update_broker_config(
         "broker_type": cfg.broker_type,
         "label": cfg.label,
         "account_number": cfg.account_number,
-        "is_paper": cfg.is_paper,
         "status": cfg.status,
         "approved_at": cfg.approved_at.isoformat() if cfg.approved_at else None,
         "created_at": cfg.created_at.isoformat() if cfg.created_at else None,

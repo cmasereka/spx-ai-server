@@ -33,7 +33,6 @@ from market_data.tastytrade_provider import TastyTradeMarketDataProvider
 provider = TastyTradeMarketDataProvider(
     provider_secret="your_provider_secret",
     refresh_token="your_refresh_token",
-    is_paper=True,
 )
 provider.connect()
 price = provider.get_fastest_spx_price("2026-03-03", "10:00:00")
@@ -92,8 +91,7 @@ class TastyTradeMarketDataProvider(MarketDataProvider):
 
     def __init__(self,
                  provider_secret: str,
-                 refresh_token: str,
-                 is_paper: bool = True):
+                 refresh_token: str):
         if not TT_AVAILABLE:
             raise ImportError(
                 "tastytrade must be installed to use TastyTradeMarketDataProvider. "
@@ -101,7 +99,6 @@ class TastyTradeMarketDataProvider(MarketDataProvider):
             )
         self._provider_secret = provider_secret
         self._refresh_token = refresh_token
-        self._is_paper = is_paper
 
         self._session: Optional["Session"] = None
         self._connected = False
@@ -144,11 +141,10 @@ class TastyTradeMarketDataProvider(MarketDataProvider):
         arrive automatically when the market opens.
         """
         try:
-            env = "paper (cert)" if self._is_paper else "live (prod)"
             self._today = datetime.now(_ET).strftime("%Y-%m-%d")
             self._connect_error = None
             self._stream_ready.clear()
-            logger.info(f"TastyTradeMarketDataProvider authenticating [{env}]…")
+            logger.info("TastyTradeMarketDataProvider authenticating…")
 
             # Start background streaming thread.
             # Session creation and option chain loading happen inside _stream_async
@@ -188,7 +184,7 @@ class TastyTradeMarketDataProvider(MarketDataProvider):
             with self._lock:
                 bar_count = len(self._price_buffer.get(self._today, {}))
             logger.info(
-                f"TastyTradeMarketDataProvider connected [{env}] "
+                f"TastyTradeMarketDataProvider connected "
                 f"trade_date={self._today} "
                 f"spx_bars={bar_count} "
                 f"option_symbols={len(self._symbol_meta)}"

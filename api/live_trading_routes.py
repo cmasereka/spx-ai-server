@@ -1,8 +1,8 @@
 """
-Live Trading API Routes (IBKR paper / live)
+Live Trading API Routes
 
 Endpoints:
-  POST   /api/v1/trading/sessions                — start a new IBKR session
+  POST   /api/v1/trading/sessions                — start a new trading session
   GET    /api/v1/trading/sessions                — list all sessions
   GET    /api/v1/trading/sessions/{id}           — get session status
   DELETE /api/v1/trading/sessions/{id}           — stop a running session
@@ -12,12 +12,15 @@ Endpoints:
 """
 
 import asyncio
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from loguru import logger
 
 from .models import LiveTradingRequest, LiveTradingStatus, IBKRConnectionConfig, IBKRDiagnosticRequest, DiagnosticRequest, BrokerEnum
 from .live_trading_service import LiveTradingService
 from .websocket_manager import WebSocketManager
+from api.auth import get_approved_user, get_db, decrypt_credentials
+from src.database.models import User, UserBrokerConfig
+from sqlalchemy.orm import Session
 
 router = APIRouter(prefix="/api/v1/trading", tags=["Live Trading"])
 
@@ -207,14 +210,42 @@ def _test_ibkr_connection_sync(config: IBKRConnectionConfig) -> dict:
 # ---------------------------------------------------------------------------
 
 @router.post("/diagnose-market-data", response_model=dict)
-async def diagnose_market_data(request: DiagnosticRequest):
+async def diagnose_market_data(
+    request: DiagnosticRequest,
+    current_user: User = Depends(get_approved_user),
+    db: Session = Depends(get_db),
+):
     """
     Test the full SPX-price + options-chain data path without starting a trading session.
 
     Set broker='ibkr' to test IBKR connectivity.
     Set broker='tastytrade' to test TastyTrade authentication, option chain, and DXLink streaming.
+
+    Pass broker_config_id to use credentials from the user's saved broker account
+    (must be approved and belong to the logged-in user).
     """
     try:
+        # If a saved broker config is referenced, load and inject its credentials
+        if request.broker_config_id is not None:
+            cfg_record = db.query(UserBrokerConfig).filter(
+                UserBrokerConfig.id == request.broker_config_id,
+                UserBrokerConfig.user_id == current_user.id,
+                UserBrokerConfig.status == "approved",
+            ).first()
+            if not cfg_record:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Broker config not found or not approved for this account."
+                )
+            creds = decrypt_credentials(cfg_record.encrypted_credentials)
+            from .models import TastyTradeConfig
+            request.broker = BrokerEnum.TASTYTRADE
+            request.tastytrade = TastyTradeConfig(
+                provider_secret=creds["provider_secret"],
+                refresh_token=creds["refresh_token"],
+                account_number=cfg_record.account_number,
+            )
+
         if request.broker == BrokerEnum.TASTYTRADE:
             result = await asyncio.get_event_loop().run_in_executor(
                 None, _diagnose_tastytrade_sync, request
@@ -232,6 +263,8 @@ async def diagnose_market_data(request: DiagnosticRequest):
                 None, _diagnose_market_data_sync, ibkr_req
             )
         return result
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.error(f"Market data diagnostic failed: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
@@ -538,10 +571,10 @@ def _diagnose_tastytrade_sync(request: DiagnosticRequest) -> dict:
         session = Session(
             cfg.provider_secret,
             cfg.refresh_token,
-            is_test=cfg.is_paper,
+            is_test=False,  # Always production — paper trading uses a paper account number on prod API
         )
         report["authenticated"] = True
-        report["environment"] = "paper (cert)" if cfg.is_paper else "live (prod)"
+        report["environment"] = "live (prod API)"
     except Exception as exc:
         report["errors"].append(f"Authentication failed: {exc}")
         return report

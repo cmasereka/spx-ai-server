@@ -100,15 +100,14 @@ class TastyTradeBrokerAdapter(BrokerAdapter):
     provider_secret:  OAuth2 provider secret (client secret).
     refresh_token:    OAuth2 refresh token for the user.
     account_number:   TastyTrade account number (e.g. '5WT00000').
-    is_paper:         True  → paper account (production API, paper account number).
-                      False → live account  (production API, live account number).
+                      Both paper and live accounts use the production API.
     """
 
     def __init__(self,
                  provider_secret: str,
                  refresh_token: str,
                  account_number: str,
-                 is_paper: bool = True):
+                 session_data: Optional[str] = None):
         if not TT_AVAILABLE:
             raise ImportError(
                 "tastytrade must be installed to use TastyTradeBrokerAdapter. "
@@ -117,8 +116,15 @@ class TastyTradeBrokerAdapter(BrokerAdapter):
         self._provider_secret = provider_secret
         self._refresh_token = refresh_token
         self._account_number = account_number
-        self._is_paper = is_paper
 
+        # Serialized Session JSON from the market data provider, if available.
+        # TastyTrade rotates refresh tokens on first use, so two independent
+        # Session() calls with the same token cause the second to fail.  Instead
+        # we serialize the already-authenticated Session (which carries a valid
+        # access_token), then deserialize it inside _connect_async on our own
+        # event loop — giving us a fresh httpx.AsyncClient and asyncio.Lock bound
+        # to the correct loop while skipping the refresh-token exchange entirely.
+        self._session_data: Optional[str] = session_data
         self._session: Optional["Session"] = None
         self._account: Optional["Account"] = None
         self._connected = False
@@ -139,9 +145,12 @@ class TastyTradeBrokerAdapter(BrokerAdapter):
         Authenticate with TastyTrade, resolve the trading account, and start
         the persistent background event loop used for all async operations.
         """
+        logger.info(
+            f"TastyTradeBrokerAdapter.connect() called "
+            f"account={self._account_number!r} "
+            f"has_session_data={self._session_data is not None}"
+        )
         try:
-            env = "paper account" if self._is_paper else "live account"
-
             # Start a persistent background event loop thread.
             # Session and Account are created inside this loop so that the
             # httpx.AsyncClient is bound to the correct loop for all subsequent calls.
@@ -166,7 +175,7 @@ class TastyTradeBrokerAdapter(BrokerAdapter):
             future.result(timeout=30)
 
             logger.info(
-                f"TastyTradeBrokerAdapter connected [{env}] "
+                f"TastyTradeBrokerAdapter connected "
                 f"account={self._account.account_number}"
             )
             return True
@@ -178,15 +187,31 @@ class TastyTradeBrokerAdapter(BrokerAdapter):
 
     async def _connect_async(self):
         """
-        Create the TastyTrade Session and resolve the Account object.
+        Create (or restore) the TastyTrade Session and resolve the Account object.
         Must run on the persistent background loop.
+
+        If session_data was provided (serialized from the market data provider after
+        it already authenticated), we deserialize it here — this creates a fresh
+        httpx.AsyncClient and asyncio.Lock on the current loop while reusing the
+        still-valid access_token, so no refresh-token exchange is needed.
+
+        Otherwise a new Session is created, which will exchange the refresh_token
+        for an access_token on the first REST call.
         """
-        self._session = Session(
-            self._provider_secret,
-            self._refresh_token,
-            is_test=False,
-        )
+        if self._session_data is not None:
+            logger.info("TastyTradeBrokerAdapter: deserializing shared session...")
+            self._session = Session.deserialize(self._session_data)
+            logger.info("TastyTradeBrokerAdapter: session deserialized, fetching account...")
+        else:
+            logger.info("TastyTradeBrokerAdapter: creating new session (no shared session data)...")
+            self._session = Session(
+                self._provider_secret,
+                self._refresh_token,
+                is_test=False,
+            )
+            logger.info("TastyTradeBrokerAdapter: new session created, fetching account...")
         self._account = await Account.get(self._session, self._account_number)
+        logger.info(f"TastyTradeBrokerAdapter: account resolved: {self._account_number}")
         self._connected = True
 
     def disconnect(self):

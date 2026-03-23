@@ -167,12 +167,12 @@ class BacktestService:
             # Update database with running status
             await self._update_backtest_run_status(backtest_id, status)
             
-            await websocket_manager.send_backtest_update(
+            await websocket_manager.send_session_update(
                 backtest_id, "status_change", {"status": "running"}
             )
             
             # Send initial progress
-            await websocket_manager.send_backtest_progress(backtest_id, 0, 1, "Starting backtest...")
+            await websocket_manager.send_session_progress(backtest_id, 0, 1, "Starting backtest...")
             
             # Run the actual backtest in thread pool to avoid blocking
             loop = asyncio.get_event_loop()
@@ -200,7 +200,7 @@ class BacktestService:
             await self._update_backtest_run_final_results(backtest_id, status, total_pnl, max_drawdown, win_rate)
             
             # Send completion notification
-            await websocket_manager.send_backtest_completed(
+            await websocket_manager.send_session_completed(
                 backtest_id, 
                 {
                     "total_trades": status.total_trades,
@@ -230,7 +230,7 @@ class BacktestService:
             # Update database with failed status
             await self._update_backtest_run_status(backtest_id, status)
             
-            await websocket_manager.send_backtest_error(backtest_id, str(e))
+            await websocket_manager.send_session_error(backtest_id, str(e))
             logger.error(f"Backtest {backtest_id} failed: {e}")
         
         finally:
@@ -397,7 +397,7 @@ class BacktestService:
         for i, test_date in enumerate(test_dates, 1):
             try:
                 # Send progress update
-                await websocket_manager.send_backtest_progress(
+                await websocket_manager.send_session_progress(
                     backtest_id, i, total_dates, str(test_date)
                 )
 
@@ -421,10 +421,10 @@ class BacktestService:
                 # has time to commit each render before the next update lands.
                 for ev_type, ev_data in day_ws_events:
                     if ev_type == "position_opened":
-                        await websocket_manager.send_backtest_update(backtest_id, "position_opened", ev_data)
+                        await websocket_manager.send_session_update(backtest_id, "position_opened", ev_data)
                         await asyncio.sleep(0.05)   # 50 ms – let frontend render the opening row
                     elif ev_type == "position_update":
-                        await websocket_manager.send_backtest_update(backtest_id, "position_update", ev_data)
+                        await websocket_manager.send_session_update(backtest_id, "position_update", ev_data)
                         await asyncio.sleep(0.02)   # 20 ms per tick (~50 fps updates)
                     elif ev_type == "trade_result":
                         await self._save_and_send_trade(backtest_id, ev_data, websocket_manager)

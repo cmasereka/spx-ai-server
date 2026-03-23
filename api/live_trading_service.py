@@ -21,7 +21,7 @@ from loguru import logger
 
 from .models import (
     LiveTradingRequest, LiveTradingStatus, BrokerEnum,
-    PaperPosition, BacktestResult, StrategyDetails, OrderSlippage,
+    LivePosition, BacktestResult, StrategyDetails, OrderSlippage,
 )
 from .websocket_manager import WebSocketManager
 from enhanced_multi_strategy import EnhancedBacktestingEngine
@@ -31,7 +31,7 @@ from market_data.ibkr_provider import IBKRMarketDataProvider
 from market_data.realtime_provider import RealtimeMarketDataProvider
 from broker.null_adapter import NullBrokerAdapter
 from src.database.connection import db_manager
-from src.database.models import PaperTradingRun, BrokerOrder, Trade
+from src.database.models import LiveTradingRun, BrokerOrder, Trade
 
 
 class _LiveSessionState:
@@ -45,7 +45,7 @@ class _LiveSessionState:
         self.status = "pending"
         self.broker_type: str = request.broker.value if request else "ibkr"
         self.broker_connected = False
-        self.open_positions: List[PaperPosition] = []
+        self.open_positions: List[LivePosition] = []
         self.completed_trades: List[BacktestResult] = []
         self.day_pnl: float = 0.0
         self.trade_count: int = 0
@@ -97,8 +97,8 @@ class LiveTradingService:
         """Restore completed/stopped/failed sessions from the database into memory."""
         try:
             with db_manager.get_session() as db_session:
-                runs = db_session.query(PaperTradingRun).order_by(
-                    PaperTradingRun.created_at.asc()
+                runs = db_session.query(LiveTradingRun).order_by(
+                    LiveTradingRun.created_at.asc()
                 ).all()
 
                 for run in runs:
@@ -114,7 +114,6 @@ class LiveTradingService:
                                     provider_secret="",   # credentials not stored in DB
                                     refresh_token="",     # credentials not stored in DB
                                     account_number=params.get("tt_account", ""),
-                                    is_paper=params.get("tt_is_paper", True),
                                 ),
                                 trade_date=run.trade_date,
                                 strategy=params.get("strategy", BacktestStrategyEnum.CREDIT_SPREADS),
@@ -268,7 +267,7 @@ class LiveTradingService:
 
     def _delete_session_sync(self, session_id: str):
         with db_manager.get_session() as session:
-            run = session.query(PaperTradingRun).filter_by(session_id=session_id).first()
+            run = session.query(LiveTradingRun).filter_by(session_id=session_id).first()
             if run:
                 session.delete(run)
                 session.commit()
@@ -281,6 +280,23 @@ class LiveTradingService:
         """Create and start a live trading session. Returns session_id."""
         if not self.engine:
             raise RuntimeError("LiveTradingService not initialised")
+
+        # When broker_config_id is provided, resolve the actual broker type from
+        # the DB so that the rest of the service (logging, DB save, provider
+        # creation) uses the correct broker rather than the IBKR default.
+        if request.broker_config_id is not None:
+            from src.database.models import UserBrokerConfig
+            with db_manager.get_session() as db:
+                cfg = db.query(UserBrokerConfig).filter(
+                    UserBrokerConfig.id == request.broker_config_id,
+                    UserBrokerConfig.status == "approved",
+                ).first()
+                if not cfg:
+                    raise ValueError(
+                        f"Approved broker config {request.broker_config_id} not found"
+                    )
+                # Override broker enum so all downstream code sees the right type
+                request.broker = BrokerEnum(cfg.broker_type)
 
         trade_date = request.trade_date or date.today()
         session_id = str(uuid.uuid4())
@@ -315,18 +331,31 @@ class LiveTradingService:
     ):
         """Async wrapper — runs the blocking session in the thread pool."""
         loop = asyncio.get_event_loop()
-        backtest_id = state.session_id
+        session_id = state.session_id
         req = state.request
 
         # --- Create market data provider (broker-specific) ---
         with state._lock:
             state.status = "connecting"
-        await websocket_manager.send_backtest_update(
-            backtest_id, "status_change",
-            {"status": "connecting", "session_id": backtest_id}
+        await websocket_manager.send_session_update(
+            session_id, "status_change",
+            {"status": "connecting", "session_id": session_id}
         )
 
-        provider = _create_market_data_provider(req)
+        provider = None
+        broker_adapter = None
+        try:
+            provider = _create_market_data_provider(req)
+            broker_adapter = _create_broker_adapter(req)
+        except Exception as exc:
+            logger.error(f"Live trading session {state.session_id} setup failed: {exc}")
+            with state._lock:
+                state.status = "failed"
+                state.error_message = str(exc)
+                state.completed_at = datetime.now()
+            await self._update_session_db_status(state)
+            await websocket_manager.send_session_error(session_id, str(exc))
+            return
 
         # Shared container so the worker thread can report back connect result
         connect_result: dict = {}
@@ -350,7 +379,7 @@ class LiveTradingService:
             _asyncio.set_event_loop(_thread_loop)
 
             broker_label = req.broker.value
-            logger.info(f"Session {backtest_id}: connecting to {broker_label}")
+            logger.info(f"Session {session_id}: connecting to {broker_label}")
             connected = provider.connect()
             connect_result["connected"] = connected
             if not connected:
@@ -364,17 +393,30 @@ class LiveTradingService:
             if hasattr(provider, "_today"):
                 provider._today = state.trade_date
             logger.info(
-                f"Session {backtest_id}: {broker_label} market data connected — "
+                f"Session {session_id}: {broker_label} market data connected — "
                 f"trade_date={state.trade_date} "
                 f"provider dates: {provider.available_dates}"
             )
 
-            broker_adapter = _create_broker_adapter(req)
+            # For TastyTrade, serialize the already-authenticated Session and
+            # inject it into the broker adapter so it can deserialize on its own
+            # event loop — avoiding a second refresh-token exchange that would
+            # fail due to TastyTrade's token rotation.
+            raw_session = getattr(provider, "_session", None)
+            logger.debug(
+                f"Session {session_id}: raw_session={raw_session!r} "
+                f"session_token={getattr(raw_session, 'session_token', 'N/A')!r}"
+            )
+            if raw_session is not None and hasattr(broker_adapter, "_session_data"):
+                broker_adapter._session_data = raw_session.serialize()
+                logger.debug(f"Session {session_id}: injected serialized session into broker adapter")
+
+            logger.info(f"Session {session_id}: broker adapter connect()...")
             broker_connected = broker_adapter.connect()
             if not broker_connected:
                 logger.critical(
                     f"╔══ BROKER CONNECTION FAILED ══╗\n"
-                    f"  Session  : {backtest_id}\n"
+                    f"  Session  : {session_id}\n"
                     f"  Broker   : {broker_label}\n"
                     f"  Session will be marked as FAILED — no orders will be submitted\n"
                     f"╚══════════════════════════════╝"
@@ -387,9 +429,23 @@ class LiveTradingService:
                 return None
             else:
                 logger.info(
-                    f"Session {backtest_id}: broker adapter connected "
+                    f"Session {session_id}: broker adapter connected "
                     f"({broker_label}) — orders WILL be submitted"
                 )
+
+            # Both connections succeeded — signal "running" to the async loop now,
+            # before the trading day starts (which may run for hours).
+            async def _signal_running():
+                with state._lock:
+                    state.status = "running"
+                    state.started_at = datetime.now()
+                    state.broker_connected = True
+                await self._update_session_db_status(state)
+                await websocket_manager.send_session_update(
+                    session_id, "status_change",
+                    {"status": "running", "session_id": session_id},
+                )
+            loop.call_soon_threadsafe(asyncio.ensure_future, _signal_running())
 
             rt_provider = RealtimeMarketDataProvider(
                 provider,
@@ -397,13 +453,13 @@ class LiveTradingService:
             )
 
             logger.info(
-                f"Session {backtest_id}: scanning date={state.trade_date} "
+                f"Session {session_id}: scanning date={state.trade_date} "
                 f"entry_window={req.entry_start_time}–{req.last_entry_time} "
                 f"strategy={req.strategy.value} credit={req.target_credit} "
                 f"tp={req.take_profit} sl={req.stop_loss}"
             )
 
-            callback = self._make_callback(state, loop, websocket_manager, backtest_id)
+            callback = self._make_callback(state, loop, websocket_manager, session_id)
 
             try:
                 from trading.live_trading_loop import LiveTradingLoop
@@ -431,19 +487,11 @@ class LiveTradingService:
                 state.error_message = connect_result.get("error", "Broker connection failed")
                 state.completed_at = datetime.now()
             await self._update_session_db_status(state)
-            await websocket_manager.send_backtest_error(backtest_id, state.error_message)
+            await websocket_manager.send_session_error(session_id, state.error_message)
             return
 
-        with state._lock:
-            state.status = "running"
-            state.started_at = datetime.now()
-            state.broker_connected = True
-
-        await self._update_session_db_status(state)
-        await websocket_manager.send_backtest_update(
-            backtest_id, "status_change",
-            {"status": "running", "session_id": backtest_id}
-        )
+        # Status was already set to "running" from the thread via _signal_running().
+        # Nothing to do here — proceed directly to finalising the completed day.
 
         try:
             if day_result is None:
@@ -451,7 +499,7 @@ class LiveTradingService:
                 return
 
             logger.info(
-                f"Session {backtest_id}: scan complete — "
+                f"Session {session_id}: scan complete — "
                 f"trades={day_result.trade_count} pnl={day_result.total_pnl:.2f} "
                 f"bars_checked={day_result.scan_minutes_checked}"
             )
@@ -472,8 +520,8 @@ class LiveTradingService:
                 state.trade_count = day_result.trade_count
 
             await self._finalise_session_db(state)
-            await websocket_manager.send_backtest_completed(
-                backtest_id,
+            await websocket_manager.send_session_completed(
+                session_id,
                 {
                     "session_id": state.session_id,
                     "total_trades": state.trade_count,
@@ -490,9 +538,9 @@ class LiveTradingService:
                     state.status = "stopped"
                     state.completed_at = datetime.now()
             await self._finalise_session_db(state)
-            await websocket_manager.send_backtest_update(
-                backtest_id, "status_change",
-                {"status": "stopped", "session_id": backtest_id},
+            await websocket_manager.send_session_update(
+                session_id, "status_change",
+                {"status": "stopped", "session_id": session_id},
             )
 
         except Exception as exc:
@@ -502,14 +550,15 @@ class LiveTradingService:
                 state.error_message = str(exc)
                 state.completed_at = datetime.now()
             await self._update_session_db_status(state)
-            await websocket_manager.send_backtest_error(backtest_id, str(exc))
+            await websocket_manager.send_session_error(session_id, str(exc))
 
         finally:
             self._running_tasks.pop(state.session_id, None)
-            try:
-                provider.disconnect()
-            except Exception:
-                pass
+            if provider is not None:
+                try:
+                    provider.disconnect()
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # Progress callback
@@ -520,7 +569,7 @@ class LiveTradingService:
         state: _LiveSessionState,
         loop: asyncio.AbstractEventLoop,
         websocket_manager: WebSocketManager,
-        backtest_id: str,
+        session_id: str,
     ):
         """Return a thread-safe progress callback that also persists IBKR orders."""
 
@@ -528,7 +577,7 @@ class LiveTradingService:
             ev = event.get("event")
             with state._lock:
                 if ev == "position_opened":
-                    pos = PaperPosition(
+                    pos = LivePosition(
                         position_id=str(uuid.uuid4()),
                         strategy_type=event.get("strategy_type", ""),
                         entry_time=event.get("entry_time", ""),
@@ -556,8 +605,8 @@ class LiveTradingService:
 
                     loop.call_soon_threadsafe(
                         asyncio.ensure_future,
-                        websocket_manager.send_backtest_update(
-                            backtest_id, "position_opened",
+                        websocket_manager.send_session_update(
+                            session_id, "position_opened",
                             {"session_id": state.session_id, **pos.dict()}
                         )
                     )
@@ -574,8 +623,8 @@ class LiveTradingService:
                     if pos:
                         loop.call_soon_threadsafe(
                             asyncio.ensure_future,
-                            websocket_manager.send_backtest_update(
-                                backtest_id, "position_update",
+                            websocket_manager.send_session_update(
+                                session_id, "position_update",
                                 {
                                     "session_id": state.session_id,
                                     "position_id": pos.position_id,
@@ -623,7 +672,7 @@ class LiveTradingService:
                         loop.call_soon_threadsafe(
                             asyncio.ensure_future,
                             self._save_and_send_live_trade(
-                                state.session_id, api_result, websocket_manager, backtest_id
+                                api_result, websocket_manager, session_id
                             )
                         )
 
@@ -635,10 +684,9 @@ class LiveTradingService:
 
     async def _save_and_send_live_trade(
         self,
-        session_id: str,
         api_result: BacktestResult,
         websocket_manager: WebSocketManager,
-        backtest_id: str,
+        session_id: str,
     ):
         """Persist a single live trade to the trades table and broadcast via WebSocket."""
         try:
@@ -648,17 +696,17 @@ class LiveTradingService:
             )
         except Exception as exc:
             logger.error(f"Failed to persist live trade {api_result.trade_id}: {exc}")
-        await websocket_manager.send_trade_result(backtest_id, api_result.dict())
+        await websocket_manager.send_trade_result(session_id, api_result.dict())
 
     def _save_live_trade_sync(self, session_id: str, result: BacktestResult):
         """Write one completed trade to the trades table, linked to the live session."""
         with db_manager.get_session() as db_session:
-            run = db_session.query(PaperTradingRun).filter_by(
+            run = db_session.query(LiveTradingRun).filter_by(
                 session_id=session_id
             ).first()
             if not run:
                 logger.error(
-                    f"PaperTradingRun {session_id} not found — cannot save trade {result.trade_id}"
+                    f"LiveTradingRun {session_id} not found — cannot save trade {result.trade_id}"
                 )
                 return
             trade = Trade(
@@ -707,11 +755,14 @@ class LiveTradingService:
             req = state.request
 
             # Build broker-specific connection parameters (no passwords stored)
-            if req.broker == BrokerEnum.TASTYTRADE and req.tastytrade:
+            if req.broker_config_id is not None:
+                broker_params = {
+                    "broker_config_id": str(req.broker_config_id),
+                }
+            elif req.broker == BrokerEnum.TASTYTRADE and req.tastytrade:
                 broker_params = {
                     # Do not store provider_secret or refresh_token in DB
                     "tt_account": req.tastytrade.account_number,
-                    "tt_is_paper": req.tastytrade.is_paper,
                 }
             else:
                 broker_params = {
@@ -721,7 +772,7 @@ class LiveTradingService:
                     "ibkr_account": req.ibkr.account,
                 }
 
-            run = PaperTradingRun(
+            run = LiveTradingRun(
                 session_id=state.session_id,
                 mode="live",
                 trade_date=datetime.strptime(state.trade_date, "%Y-%m-%d").date(),
@@ -760,7 +811,7 @@ class LiveTradingService:
 
     def _update_status_sync(self, state: _LiveSessionState):
         with db_manager.get_session() as session:
-            run = session.query(PaperTradingRun).filter_by(
+            run = session.query(LiveTradingRun).filter_by(
                 session_id=state.session_id
             ).first()
             if run:
@@ -779,7 +830,7 @@ class LiveTradingService:
 
     def _finalise_sync(self, state: _LiveSessionState):
         with db_manager.get_session() as session:
-            run = session.query(PaperTradingRun).filter_by(
+            run = session.query(LiveTradingRun).filter_by(
                 session_id=state.session_id
             ).first()
             if run:
@@ -862,13 +913,32 @@ def _create_market_data_provider(req: LiveTradingRequest):
     connect() is called separately (inside _run_session_in_thread) so that
     ib_insync's event loop binds to the correct thread.
     """
+    # When a saved broker config is referenced, load credentials from DB.
+    # This also determines the broker type (always TastyTrade for saved configs).
+    if req.broker_config_id is not None:
+        from src.database.connection import db_manager
+        from src.database.models import UserBrokerConfig
+        from api.auth import decrypt_credentials
+        from market_data.tastytrade_provider import TastyTradeMarketDataProvider
+        with db_manager.get_session() as db:
+            cfg = db.query(UserBrokerConfig).filter(
+                UserBrokerConfig.id == req.broker_config_id,
+                UserBrokerConfig.status == 'approved',
+            ).first()
+            if not cfg:
+                raise ValueError(f"Approved broker config {req.broker_config_id} not found")
+            creds = decrypt_credentials(cfg.encrypted_credentials)
+        return TastyTradeMarketDataProvider(
+            provider_secret=creds["provider_secret"],
+            refresh_token=creds["refresh_token"],
+        )
+
     if req.broker == BrokerEnum.TASTYTRADE:
         from market_data.tastytrade_provider import TastyTradeMarketDataProvider
         cfg = req.tastytrade
         return TastyTradeMarketDataProvider(
             provider_secret=cfg.provider_secret,
             refresh_token=cfg.refresh_token,
-            is_paper=cfg.is_paper,
         )
     # Default: IBKR
     return IBKRMarketDataProvider(
@@ -884,6 +954,11 @@ def _create_broker_adapter(req: LiveTradingRequest):
     Instantiate the appropriate BrokerAdapter for the requested broker.
     For IBKR, uses client_id + 1 to avoid conflicting with the market data connection.
     If broker_config_id is set, loads encrypted credentials from the database.
+
+    For TastyTrade sessions, call this from the main async context (not a thread
+    pool worker) so that the DB query doesn't contend with the connection pool.
+    The serialized session data from the market data provider is injected separately
+    (via broker_adapter._session_data) before connect() is called in the thread.
     """
     if req.broker_config_id is not None:
         from src.database.connection import db_manager
@@ -897,12 +972,12 @@ def _create_broker_adapter(req: LiveTradingRequest):
             if not cfg:
                 raise ValueError(f"Approved broker config {req.broker_config_id} not found")
             creds = decrypt_credentials(cfg.encrypted_credentials)
+            account_number = cfg.account_number
         from broker.tastytrade_adapter import TastyTradeBrokerAdapter
         return TastyTradeBrokerAdapter(
             provider_secret=creds["provider_secret"],
             refresh_token=creds["refresh_token"],
-            account_number=cfg.account_number,
-            is_paper=cfg.is_paper,
+            account_number=account_number,
         )
 
     if req.broker == BrokerEnum.TASTYTRADE:
@@ -912,7 +987,6 @@ def _create_broker_adapter(req: LiveTradingRequest):
             provider_secret=cfg.provider_secret,
             refresh_token=cfg.refresh_token,
             account_number=cfg.account_number,
-            is_paper=cfg.is_paper,
         )
     # Default: IBKR
     from broker.ibkr_adapter import IBKRBrokerAdapter

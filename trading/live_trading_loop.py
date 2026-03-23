@@ -79,12 +79,23 @@ class TradingDayConfig:
     min_improvement:        float = 0.05
     skip_indicators:        bool  = True
     # ── Debit spread parameters ──────────────────────────────────────────
-    target_debit:           float = 1.00
-    debit_take_profit_pct:  float = 0.60
-    debit_stop_loss_pct:    float = 0.50
-    debit_last_entry_time:  str   = "14:00:00"
-    debit_time_stop:        str   = "15:30:00"
-    debit_min_trend_points: float = 10.0
+    target_debit:               float = 1.00
+    debit_take_profit_pct:      float = 0.60
+    debit_stop_loss_pct:        float = 0.50
+    debit_last_entry_time:      str   = "15:00:00"
+    debit_time_stop:            str   = "15:30:00"
+    debit_min_trend_points:     float = 10.0
+    # Entry time windows (skip 09:30-10:15 opening volatility and 11:30-13:45 lunch chop)
+    debit_entry_window1_start:  str   = "10:15:00"
+    debit_entry_window1_end:    str   = "11:30:00"
+    debit_entry_window2_start:  str   = "13:45:00"
+    debit_entry_window2_end:    str   = "15:00:00"
+    # Opening Range Breakout (ORB) — first N bars define day's initial range
+    debit_max_orb_width:        float = 20.0   # skip day if ORB wider than this (chaotic open)
+    debit_orb_minutes:          int   = 30     # number of bars defining the ORB
+    # EMA stack for trend confirmation
+    debit_ema_fast:             int   = 9
+    debit_ema_slow:             int   = 21
 
 
 def _live_request_to_config(req) -> TradingDayConfig:
@@ -105,12 +116,20 @@ def _live_request_to_config(req) -> TradingDayConfig:
         stagnation_window      = req.stagnation_window,
         min_improvement        = req.min_improvement,
         skip_indicators        = req.skip_indicators,
-        target_debit           = getattr(req, 'target_debit',           1.00),
-        debit_take_profit_pct  = getattr(req, 'debit_take_profit_pct',  0.60),
-        debit_stop_loss_pct    = getattr(req, 'debit_stop_loss_pct',    0.50),
-        debit_last_entry_time  = getattr(req, 'debit_last_entry_time',  "14:00:00"),
-        debit_time_stop        = getattr(req, 'debit_time_stop',        "15:30:00"),
-        debit_min_trend_points = getattr(req, 'debit_min_trend_points', 10.0),
+        target_debit                = getattr(req, 'target_debit',               1.00),
+        debit_take_profit_pct       = getattr(req, 'debit_take_profit_pct',     0.60),
+        debit_stop_loss_pct         = getattr(req, 'debit_stop_loss_pct',       0.50),
+        debit_last_entry_time       = getattr(req, 'debit_last_entry_time',     "15:00:00"),
+        debit_time_stop             = getattr(req, 'debit_time_stop',           "15:30:00"),
+        debit_min_trend_points      = getattr(req, 'debit_min_trend_points',    10.0),
+        debit_entry_window1_start   = getattr(req, 'debit_entry_window1_start', "10:15:00"),
+        debit_entry_window1_end     = getattr(req, 'debit_entry_window1_end',   "11:30:00"),
+        debit_entry_window2_start   = getattr(req, 'debit_entry_window2_start', "13:45:00"),
+        debit_entry_window2_end     = getattr(req, 'debit_entry_window2_end',   "15:00:00"),
+        debit_max_orb_width         = getattr(req, 'debit_max_orb_width',       20.0),
+        debit_orb_minutes           = getattr(req, 'debit_orb_minutes',         30),
+        debit_ema_fast              = getattr(req, 'debit_ema_fast',            9),
+        debit_ema_slow              = getattr(req, 'debit_ema_slow',            21),
     )
 
 
@@ -193,6 +212,26 @@ class _DriftGuards:
     call_blocked_latch_time: Optional[str] = None
     intraday_max_drift: float = 0.0
     intraday_min_drift: float = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Debit spread indicator helpers
+# ---------------------------------------------------------------------------
+
+def _compute_ema(prices: List[float], period: int) -> float:
+    """
+    Exponential Moving Average over the full price history list.
+
+    Uses prices[0] as the seed and applies k = 2/(period+1) smoothing across
+    all subsequent prices, so the result is stable even when len(prices) >> period.
+    """
+    if not prices:
+        return 0.0
+    k = 2.0 / (period + 1)
+    ema = prices[0]
+    for p in prices[1:]:
+        ema = p * k + ema * (1.0 - k)
+    return ema
 
 
 # ---------------------------------------------------------------------------
@@ -1418,45 +1457,101 @@ class LiveTradingLoop:
         skip_ind: bool,
     ) -> Tuple[Optional[Any], Optional[StrategyType], dict]:
         """
-        Evaluate and build a debit spread entry if conditions are met.
+        Evaluate and build a debit spread entry using a multi-factor framework.
 
-        Entry rules:
-          Debit call (bullish):
-            - day_drift >= +debit_min_trend_points (market trending up)
-            - RSI >= 55 (momentum confirming) OR skip_ind
-            - No open debit call spread already
+        All of the following must be satisfied before an entry is considered:
 
-          Debit put (bearish):
-            - day_drift <= -debit_min_trend_points (market trending down)
-            - RSI <= 45 (momentum confirming) OR skip_ind
-            - No open debit put spread already
+          1. bar_time is within an allowed trading window:
+               10:15–11:30 (morning momentum) or 13:45–15:00 (afternoon trend)
+             These windows avoid the chaotic open (09:30–10:15) and the midday
+             chop (11:30–13:45) that erode debit-spread profitability.
 
-          In both cases: intraday reversal guard (market not already reversing
-          strongly against the entry direction).
+          2. We have enough price history to compute the EMA slow period.
+
+          3. Opening Range width check:
+             ORB = high/low of the first debit_orb_minutes bars.
+             If ORB width > debit_max_orb_width the open was chaotic (news,
+             gap-and-reverse) — skip ALL entries for the day.
+
+          4. Directional ORB breakout:
+             Price must break above ORB high (call) or below ORB low (put).
+             Confirms the market has committed to a direction beyond the early range.
+
+          5. Price vs intraday TWAP:
+             spx > TWAP for calls; spx < TWAP for puts.
+             TWAP (time-weighted) is a volume-weighted proxy given no volume data.
+
+          6. EMA stack alignment (debit_ema_fast / debit_ema_slow):
+             EMA fast > EMA slow (call) or EMA fast < EMA slow (put).
+             Confirms multi-timeframe uptrend / downtrend structure.
+
+          7. RSI momentum confirmation (>= 55 call, <= 45 put), unless skip_ind.
+
+          8. Existing drift + reversal guard (same as before):
+             day_drift >= +debit_min_trend_points for calls.
+             Reversal from intraday extreme < 5 pts.
         """
+        history = self._spx_history   # prices from session start to current bar
+
+        # ── 1. Time window ─────────────────────────────────────────────────
+        in_window = (
+            (config.debit_entry_window1_start <= bar_time < config.debit_entry_window1_end) or
+            (config.debit_entry_window2_start <= bar_time < config.debit_entry_window2_end)
+        )
+        if not in_window:
+            return None, None, {}
+
+        # ── 2. Minimum history for EMA computation ──────────────────────────
+        if len(history) < config.debit_ema_slow:
+            return None, None, {}
+
+        # ── 3 & 4. Opening Range (ORB) ──────────────────────────────────────
+        orb_bars  = history[:config.debit_orb_minutes] if len(history) >= config.debit_orb_minutes else history
+        orb_high  = max(orb_bars)
+        orb_low   = min(orb_bars)
+        orb_width = orb_high - orb_low
+
+        if orb_width > config.debit_max_orb_width:
+            logger.debug(
+                f"STEP 4 | {bar_time} | debit blocked: ORB width {orb_width:.1f} pts"
+                f" > max {config.debit_max_orb_width}"
+            )
+            return None, None, {}
+
+        # ── 5. TWAP ─────────────────────────────────────────────────────────
+        twap = sum(history) / len(history)
+
+        # ── 6. EMA stack ─────────────────────────────────────────────────────
+        ema_fast = _compute_ema(history, config.debit_ema_fast)
+        ema_slow = _compute_ema(history, config.debit_ema_slow)
+
         min_pts = config.debit_min_trend_points
 
-        # ── Debit call spread (bullish) ─────────────────────────────────
+        # ── Debit call spread (bullish) ─────────────────────────────────────
         if open_debit_call_spread is None and day_drift >= min_pts:
-            # Reversal guard: if market has pulled back from its high by >= 5 pts, skip
             reversal = guards.intraday_max_drift - day_drift
             if reversal >= 5.0:
                 logger.debug(
                     f"STEP 4 | {bar_time} | debit call blocked: reversal {reversal:.1f} >= 5pts"
                 )
             else:
-                rsi_ok = skip_ind or indicators.rsi >= 55.0
-                if rsi_ok:
+                orb_ok  = spx > orb_high
+                twap_ok = spx > twap
+                ema_ok  = ema_fast > ema_slow
+                rsi_ok  = skip_ind or indicators.rsi >= 55.0
+                if all((orb_ok, twap_ok, ema_ok, rsi_ok)):
                     logger.info(
                         f"STEP 4 | {bar_time} | signal=Debit Call Spread "
-                        f"drift={day_drift:+.1f} rsi={indicators.rsi:.1f}"
+                        f"drift={day_drift:+.1f} rsi={indicators.rsi:.1f} "
+                        f"orb_w={orb_width:.1f} ema9={ema_fast:.1f} ema21={ema_slow:.1f} "
+                        f"twap={twap:.1f} spx={spx:.1f}"
                     )
                     selection = self._strike_selector.select_strikes(
                         date=date,
                         timestamp=bar_time,
                         strategy_type=StrategyType.DEBIT_CALL_SPREAD,
                         min_spread_width=config.spread_width,
-                        target_credit=config.target_credit,  # not used for debit
+                        target_credit=config.target_credit,
                         target_debit=config.target_debit,
                     )
                     if selection is not None:
@@ -1482,25 +1577,39 @@ class LiveTradingLoop:
                                     "day_drift_pts":     round(day_drift, 2),
                                     "rsi":               round(indicators.rsi, 2),
                                     "reversal_pts":      round(reversal, 2),
+                                    "orb_width":         round(orb_width, 2),
+                                    "orb_high":          round(orb_high, 2),
+                                    "twap":              round(twap, 2),
+                                    "ema_fast":          round(ema_fast, 2),
+                                    "ema_slow":          round(ema_slow, 2),
                                     "entry_debit":       round(entry_debit, 3),
                                 },
                             }
                             return strategy, StrategyType.DEBIT_CALL_SPREAD, meta
+                else:
+                    logger.debug(
+                        f"STEP 4 | {bar_time} | debit call blocked: "
+                        f"orb_ok={orb_ok} twap_ok={twap_ok} ema_ok={ema_ok} rsi_ok={rsi_ok}"
+                    )
 
-        # ── Debit put spread (bearish) ──────────────────────────────────
+        # ── Debit put spread (bearish) ──────────────────────────────────────
         if open_debit_put_spread is None and day_drift <= -min_pts:
-            # Reversal guard: if market has bounced from its low by >= 5 pts, skip
             reversal = day_drift - guards.intraday_min_drift
             if reversal >= 5.0:
                 logger.debug(
                     f"STEP 4 | {bar_time} | debit put blocked: reversal {reversal:.1f} >= 5pts"
                 )
             else:
-                rsi_ok = skip_ind or indicators.rsi <= 45.0
-                if rsi_ok:
+                orb_ok  = spx < orb_low
+                twap_ok = spx < twap
+                ema_ok  = ema_fast < ema_slow
+                rsi_ok  = skip_ind or indicators.rsi <= 45.0
+                if all((orb_ok, twap_ok, ema_ok, rsi_ok)):
                     logger.info(
                         f"STEP 4 | {bar_time} | signal=Debit Put Spread "
-                        f"drift={day_drift:+.1f} rsi={indicators.rsi:.1f}"
+                        f"drift={day_drift:+.1f} rsi={indicators.rsi:.1f} "
+                        f"orb_w={orb_width:.1f} ema9={ema_fast:.1f} ema21={ema_slow:.1f} "
+                        f"twap={twap:.1f} spx={spx:.1f}"
                     )
                     selection = self._strike_selector.select_strikes(
                         date=date,
@@ -1533,10 +1642,20 @@ class LiveTradingLoop:
                                     "day_drift_pts":     round(day_drift, 2),
                                     "rsi":               round(indicators.rsi, 2),
                                     "reversal_pts":      round(reversal, 2),
+                                    "orb_width":         round(orb_width, 2),
+                                    "orb_low":           round(orb_low, 2),
+                                    "twap":              round(twap, 2),
+                                    "ema_fast":          round(ema_fast, 2),
+                                    "ema_slow":          round(ema_slow, 2),
                                     "entry_debit":       round(entry_debit, 3),
                                 },
                             }
                             return strategy, StrategyType.DEBIT_PUT_SPREAD, meta
+                else:
+                    logger.debug(
+                        f"STEP 4 | {bar_time} | debit put blocked: "
+                        f"orb_ok={orb_ok} twap_ok={twap_ok} ema_ok={ema_ok} rsi_ok={rsi_ok}"
+                    )
 
         return None, None, {}
 

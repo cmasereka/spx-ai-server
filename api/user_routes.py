@@ -42,7 +42,6 @@ class BrokerConfigRequest(BaseModel):
     broker_type: str = "tastytrade"
     label: Optional[str] = None
     account_number: str
-    is_paper: bool = True
     provider_secret: str
     refresh_token: str
 
@@ -52,7 +51,6 @@ class BrokerConfigResponse(BaseModel):
     broker_type: str
     label: Optional[str]
     account_number: str
-    is_paper: bool
     status: str
     created_at: Optional[str]
 
@@ -117,7 +115,6 @@ def list_broker_configs(
             broker_type=c.broker_type,
             label=c.label,
             account_number=c.account_number,
-            is_paper=c.is_paper,
             status=c.status,
             created_at=c.created_at.isoformat() if c.created_at else None,
         )
@@ -140,7 +137,6 @@ def add_broker_config(
         broker_type=payload.broker_type,
         label=payload.label,
         account_number=payload.account_number,
-        is_paper=payload.is_paper,
         encrypted_credentials=encrypted,
         status="pending_approval",
     )

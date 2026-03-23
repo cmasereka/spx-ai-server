@@ -57,7 +57,6 @@ class UserBrokerConfig(Base):
     broker_type           = Column(String(20), nullable=False)   # 'tastytrade'
     label                 = Column(String(100), nullable=True)
     account_number        = Column(String(50),  nullable=False)
-    is_paper              = Column(Boolean, nullable=False, default=True)
     encrypted_credentials = Column(Text, nullable=False)         # Fernet JSON blob
     status                = Column(String(20), nullable=False, default='pending_approval')
     # 'pending_approval' | 'approved' | 'rejected'
@@ -238,12 +237,12 @@ class OptionData(Base):
     def __repr__(self):
         return f"<OptionData(symbol={self.symbol}, strike={self.strike}, exp={self.expiration_date})>"
 
-class PaperTradingRun(Base):
-    __tablename__ = 'paper_trading_runs'
+class LiveTradingRun(Base):
+    __tablename__ = 'live_trading_runs'
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     session_id = Column(String(50), unique=True, nullable=False, index=True)
-    mode = Column(String(20), nullable=False)        # 'simulation' | 'live'
+    mode = Column(String(20), nullable=False)        # 'live'
     trade_date = Column(Date, nullable=False)
     strategy_type = Column(String(20), nullable=False)
 
@@ -269,7 +268,11 @@ class PaperTradingRun(Base):
     user_id = Column(UUID(as_uuid=True), nullable=True, index=True)
 
     def __repr__(self):
-        return f"<PaperTradingRun(session_id={self.session_id}, date={self.trade_date}, status={self.status}, broker={self.broker_type})>"
+        return f"<LiveTradingRun(session_id={self.session_id}, date={self.trade_date}, status={self.status}, broker={self.broker_type})>"
+
+
+# Backward-compat alias so any remaining import of PaperTradingRun still resolves.
+PaperTradingRun = LiveTradingRun
 
 
 class BrokerOrder(Base):
