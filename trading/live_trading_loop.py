@@ -399,6 +399,13 @@ class LiveTradingLoop:
             min_improvement       = config.min_improvement,
         )
 
+        # Per-bar SPX history for indicator computation (full mode only).
+        # Stored as instance variable so _get_spx_series() can access it for
+        # live mode without needing a parameter.  Initialised HERE so that the
+        # buffer-seeding block below can populate it before the main loop resets
+        # it (the old reset further down has been removed).
+        self._spx_history: List[float] = []
+
         # Fetch SPX opening price for drift guards
         spx_open: Optional[float] = None
         for _t0 in ("09:30:00", "09:31:00", "09:32:00", "09:35:00"):
@@ -499,11 +506,6 @@ class LiveTradingLoop:
         _had_call_spread_today     = False
         _had_call_spread_win_today = False
         _had_put_spread_win_today  = False
-
-        # Per-bar SPX history for indicator computation (full mode only).
-        # Stored as instance variable so _get_spx_series() can access it for
-        # live mode without needing a parameter.  Reset at start of each day.
-        self._spx_history: List[float] = []
 
         trades: List[EnhancedBacktestResult] = []
         scan_times = _build_minute_grid(date, entry_start, FINAL_EXIT_TIME)
