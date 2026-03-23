@@ -427,6 +427,46 @@ class LiveTradingLoop:
                 f"ic_blocked={guards.ic_ever_blocked}"
             )
 
+        # For live sessions the realtime provider only contains bars buffered
+        # since it connected (no historical data).  Pre-scan lookups for early
+        # morning times therefore return None, leaving spx_open unset and
+        # _spx_history empty.  Supplement from whatever the provider has
+        # buffered so that BB warmup and drift guards work correctly.
+        if self._is_live and hasattr(self._data_src, 'get_spx_data'):
+            hist_df = self._data_src.get_spx_data(date)
+            if hist_df is not None and len(hist_df) > 0:
+                buffered = [float(p) for p in hist_df['close'] if p and p > 0]
+                if buffered:
+                    # Merge: keep existing history (from pre-scan), add any new
+                    existing_len = len(self._spx_history)
+                    for p in buffered:
+                        if p not in self._spx_history:
+                            self._spx_history.insert(existing_len, p)
+                    if spx_open is None:
+                        spx_open = buffered[0]
+                        guards.spx_open = spx_open
+                    logger.info(
+                        f"Live: seeded {len(buffered)} bars from provider buffer "
+                        f"(total history={len(self._spx_history)}, spx_open={spx_open})"
+                    )
+
+        # Last resort for live sessions: use the most recent available price as
+        # spx_open so drift guards are not latched at the wrong bar.
+        if self._is_live and spx_open is None:
+            for _fallback_t in (
+                "15:45:00", "15:30:00", "15:00:00",
+                "14:00:00", "13:00:00", "12:00:00", "11:00:00", "10:00:00",
+            ):
+                _fp = self._data_src.get_fastest_spx_price(date, _fallback_t)
+                if _fp and _fp > 0:
+                    spx_open = float(_fp)
+                    guards.spx_open = spx_open
+                    logger.info(
+                        f"Live: fallback spx_open={spx_open:.2f} "
+                        f"(first available price near {_fallback_t})"
+                    )
+                    break
+
         # Open-position slots
         open_put_spread:  Optional[Any] = None
         open_call_spread: Optional[Any] = None
